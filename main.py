@@ -394,7 +394,6 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
 
 
 if __name__ == '__main__':
-    app = QApplication(sys.argv)
-    window = MapScraperGUI()
-    window.show()
-    sys.exit(app.exec_())
+    from mapharvest.ui.app import run
+    run()
+
