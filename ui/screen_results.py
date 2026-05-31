@@ -1,5 +1,3 @@
-import os
-
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (
     QWidget, QLabel, QPushButton,
@@ -24,6 +22,7 @@ class ResultsScreen(QWidget):
         self.domain = ""
         self.area = ""
         self._domains = []
+        self._headless = False
         self._build()
 
     def _build(self):
@@ -31,12 +30,11 @@ class ResultsScreen(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # ── Top bar
         topbar = QFrame()
         topbar.setObjectName("topbar")
         topbar.setFixedHeight(48)
         top_row = QHBoxLayout(topbar)
-        top_row.setContentsMargins(16, 0, 16, 0)
+        top_row.setContentsMargins(20, 0, 20, 0)
         top_row.setSpacing(8)
 
         name_lbl = QLabel("MapHarvest")
@@ -59,54 +57,63 @@ class ResultsScreen(QWidget):
         top_row.addWidget(self.stop_btn)
         root.addWidget(topbar)
 
-        # ── Body
         body = QWidget()
         body_layout = QVBoxLayout(body)
-        body_layout.setContentsMargins(16, 12, 16, 14)
-        body_layout.setSpacing(8)
+        body_layout.setContentsMargins(20, 16, 20, 16)
+        body_layout.setSpacing(12)
 
-        # Status strip
-        status_frame = QFrame()
-        status_frame.setObjectName("status_card")
-        status_layout = QHBoxLayout(status_frame)
-        status_layout.setContentsMargins(16, 12, 16, 12)
-        status_layout.setSpacing(16)
+        # Status area — flat, no card
+        status_block = QVBoxLayout()
+        status_block.setSpacing(6)
+        status_block.setContentsMargins(0, 0, 0, 0)
 
-        count_block = QVBoxLayout()
-        count_block.setSpacing(0)
+        top_line = QHBoxLayout()
+        top_line.setSpacing(16)
+        top_line.setContentsMargins(0, 0, 0, 0)
+
+        count_wrap = QHBoxLayout()
+        count_wrap.setSpacing(6)
+        count_wrap.setContentsMargins(0, 0, 0, 0)
+        count_wrap.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.count_label = QLabel("0")
         self.count_label.setObjectName("count_label")
         self.count_sub = QLabel("collected")
         self.count_sub.setObjectName("count_sub")
-        count_block.addWidget(self.count_label)
-        count_block.addWidget(self.count_sub)
-        status_layout.addLayout(count_block)
+        count_wrap.addWidget(self.count_label)
+        count_wrap.addWidget(self.count_sub)
+        top_line.addLayout(count_wrap)
+        top_line.addStretch()
 
-        divider = QFrame()
-        divider.setObjectName("divider")
-        divider.setFixedWidth(1)
-        divider.setFixedHeight(36)
-        status_layout.addWidget(divider)
-
-        status_text_block = QVBoxLayout()
-        status_text_block.setSpacing(2)
         self.status_label = QLabel("Ready")
         self.status_label.setObjectName("status_text")
+        self.status_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        top_line.addWidget(self.status_label)
+        status_block.addLayout(top_line)
+
         self.area_label = QLabel("")
         self.area_label.setObjectName("muted")
-        status_text_block.addWidget(self.status_label)
-        status_text_block.addWidget(self.area_label)
-        status_layout.addLayout(status_text_block, stretch=1)
-
-        body_layout.addWidget(status_frame)
+        self.area_label.setAlignment(Qt.AlignLeft)
+        status_block.addWidget(self.area_label)
 
         self.progress_bar = QProgressBar()
-        self.progress_bar.setFixedHeight(4)
+        self.progress_bar.setFixedHeight(2)
         self.progress_bar.setValue(0)
         self.progress_bar.setTextVisible(False)
-        body_layout.addWidget(self.progress_bar)
+        status_block.addWidget(self.progress_bar)
 
-        # Table
+        body_layout.addLayout(status_block)
+
+        table_header = QHBoxLayout()
+        table_header.setContentsMargins(0, 4, 0, 0)
+        table_title = QLabel("Results")
+        table_title.setObjectName("section_label")
+        self.row_count_label = QLabel("")
+        self.row_count_label.setObjectName("muted")
+        table_header.addWidget(table_title)
+        table_header.addStretch()
+        table_header.addWidget(self.row_count_label)
+        body_layout.addLayout(table_header)
+
         self.table = QTableWidget(0, 0)
         self.table.setObjectName("results_table")
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -117,7 +124,7 @@ class ResultsScreen(QWidget):
         self.table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.table.verticalHeader().setVisible(False)
-        self.table.verticalHeader().setDefaultSectionSize(38)
+        self.table.verticalHeader().setDefaultSectionSize(36)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.horizontalHeader().setMinimumSectionSize(80)
@@ -127,10 +134,11 @@ class ResultsScreen(QWidget):
 
         root.addWidget(body)
 
-    def setup(self, domains: list, area: str, fields: list):
+    def setup(self, domains: list, area: str, fields: list, headless: bool = False):
         self.results = []
         self.area = area
         self._domains = domains
+        self._headless = headless
         self.domain = domains[0] if domains else ""
 
         self.fields = list(fields)
@@ -150,14 +158,17 @@ class ResultsScreen(QWidget):
         self.progress_bar.setMaximum(100)
         self.count_label.setText("0")
         self.count_sub.setText("collected")
-        self.status_label.setText("Starting scrape...")
+        self.row_count_label.setText("")
+        self.status_label.setText("Starting...")
         self.area_label.setText(f"{', '.join(domains)} · {area}")
 
         self.export_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
 
     def start_worker(self):
-        self.worker = ScrapeWorker(self._domains, self.area, self.fields)
+        self.worker = ScrapeWorker(
+            self._domains, self.area, self.fields, headless=self._headless,
+        )
         self.worker.log_signal.connect(self._on_log)
         self.worker.result_signal.connect(self.add_table_row)
         self.worker.progress_signal.connect(self.update_progress)
@@ -175,12 +186,16 @@ class ResultsScreen(QWidget):
         if status == "active":
             self.status_label.setText(message)
         elif status == "done" and message.startswith("#"):
-            self.status_label.setText(f"Saved {message}")
+            short = message.lstrip("#").strip()
+            if len(short) > 48:
+                short = short[:45] + "..."
+            self.status_label.setText(short)
 
     def update_progress(self, collected: int):
         self.count_label.setText(str(collected))
         self.progress_bar.setMaximum(max(collected, 1))
         self.progress_bar.setValue(collected)
+        self.row_count_label.setText(f"{collected} row{'s' if collected != 1 else ''}")
 
     def add_table_row(self, data: dict):
         self.results.append(data)
@@ -206,6 +221,7 @@ class ResultsScreen(QWidget):
 
         self.table.scrollToBottom()
         self.export_btn.setEnabled(True)
+        self.row_count_label.setText(f"{len(self.results)} row{'s' if len(self.results) != 1 else ''}")
 
     def export_csv(self):
         path, _ = QFileDialog.getSaveFileName(
@@ -214,16 +230,18 @@ class ResultsScreen(QWidget):
             "CSV Files (*.csv)",
         )
         if path:
-            export_csv(self.results, self.domain, self.area, self.fields, os.path.dirname(path))
+            export_csv(self.results, self.domain, self.area, self.fields, path)
 
     def on_done(self):
         self.stop_btn.setEnabled(False)
         n = len(self.results)
-        self.status_label.setText(f"Complete — {n} businesses" if n else "Complete — no results")
+        self.status_label.setText(f"Done — {n} businesses" if n else "Done — no results")
         self.count_sub.setText("total")
+        if n:
+            self.row_count_label.setText(f"{n} row{'s' if n != 1 else ''}")
 
     def on_error(self, message: str):
-        self.status_label.setText(f"Error: {message[:80]}")
+        self.status_label.setText(f"Error: {message[:60]}")
         self.stop_btn.setEnabled(False)
 
     def _on_stop_clicked(self):

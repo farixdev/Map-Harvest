@@ -3,14 +3,14 @@ from PyQt5.QtWidgets import (
     QWidget, QLabel, QLineEdit,
     QPushButton, QCheckBox, QGridLayout,
     QHBoxLayout, QVBoxLayout, QFrame,
-    QScrollArea,
+    QScrollArea, QStackedWidget, QButtonGroup,
 )
 
 from ui.domain_list_dialog import DomainListDialog
 
 
 class InputScreen(QWidget):
-    start_signal = pyqtSignal(list, str, list)
+    start_signal = pyqtSignal(list, str, list, bool)
 
     FIELD_KEYS = [
         "name", "category", "rating", "review_count", "status", "hours",
@@ -31,30 +31,53 @@ class InputScreen(QWidget):
 
     def _build(self):
         root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
+        root.setContentsMargins(24, 20, 24, 20)
         root.setSpacing(0)
 
-        topbar = QFrame()
-        topbar.setObjectName("topbar")
-        topbar.setFixedHeight(52)
-        top_row = QHBoxLayout(topbar)
-        top_row.setContentsMargins(20, 0, 20, 0)
+        # Header row: title + tabs
+        header = QHBoxLayout()
+        header.setSpacing(12)
         app_name = QLabel("MapHarvest")
         app_name.setObjectName("app_name")
-        top_row.addWidget(app_name)
-        top_row.addStretch()
-        root.addWidget(topbar)
+        header.addWidget(app_name)
+        header.addStretch()
 
+        self.tab_group = QButtonGroup(self)
+        self.tab_group.setExclusive(True)
+        tab_row = QHBoxLayout()
+        tab_row.setSpacing(4)
+        self.scrape_tab_btn = QPushButton("Scrape")
+        self.scrape_tab_btn.setObjectName("tab")
+        self.scrape_tab_btn.setCheckable(True)
+        self.scrape_tab_btn.setChecked(True)
+        self.settings_tab_btn = QPushButton("Settings")
+        self.settings_tab_btn.setObjectName("tab")
+        self.settings_tab_btn.setCheckable(True)
+        self.tab_group.addButton(self.scrape_tab_btn, 0)
+        self.tab_group.addButton(self.settings_tab_btn, 1)
+        tab_row.addWidget(self.scrape_tab_btn)
+        tab_row.addWidget(self.settings_tab_btn)
+        header.addLayout(tab_row)
+        root.addLayout(header)
+        root.addSpacing(20)
+
+        self.pages = QStackedWidget()
+        self.pages.addWidget(self._build_scrape_page())
+        self.pages.addWidget(self._build_settings_page())
+        root.addWidget(self.pages, stretch=1)
+
+        self.tab_group.idClicked.connect(self.pages.setCurrentIndex)
+
+    def _build_scrape_page(self) -> QWidget:
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
 
         body = QWidget()
         layout = QVBoxLayout(body)
-        layout.setContentsMargins(28, 28, 28, 28)
+        layout.setContentsMargins(0, 0, 4, 0)
         layout.setSpacing(0)
 
-        # Domain
         domain_header = QHBoxLayout()
         domain_header.addWidget(self._section_label("Domain"))
         domain_header.addStretch()
@@ -66,47 +89,42 @@ class InputScreen(QWidget):
 
         domain_row = QHBoxLayout()
         domain_row.setSpacing(8)
-
         self.domain_input = QLineEdit()
-        self.domain_input.setPlaceholderText("e.g. restaurants")
+        self.domain_input.setPlaceholderText("e.g. car dealers")
         self.domain_input.setFixedHeight(38)
-
         self.list_btn = QPushButton("List")
         self.list_btn.setObjectName("outlined")
-        self.list_btn.setFixedSize(72, 38)
+        self.list_btn.setFixedSize(68, 38)
         self.list_btn.setToolTip("Add multiple domains to scrape")
         self.list_btn.clicked.connect(self._open_domain_list)
-
         domain_row.addWidget(self.domain_input)
         domain_row.addWidget(self.list_btn)
         layout.addLayout(domain_row)
-        layout.addSpacing(20)
+        layout.addSpacing(18)
 
-        # Area
         layout.addWidget(self._section_label("Area"))
         layout.addSpacing(6)
         self.area_input = QLineEdit()
         self.area_input.setPlaceholderText("e.g. Lahore")
         self.area_input.setFixedHeight(38)
         layout.addWidget(self.area_input)
-        layout.addSpacing(20)
+        layout.addSpacing(18)
 
-        # Data to scrape
         self.fields_section_label = self._section_label("Data to Scrape")
         layout.addWidget(self.fields_section_label)
         layout.addSpacing(8)
 
         self.checkboxes = {}
         grid = QGridLayout()
-        grid.setHorizontalSpacing(8)
-        grid.setVerticalSpacing(8)
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(6)
         for i, (key, name) in enumerate(zip(self.FIELD_KEYS, self.FIELD_NAMES)):
             cb = QCheckBox(name)
             cb.setChecked(True)
             self.checkboxes[key] = cb
             grid.addWidget(cb, i // 2, i % 2)
         layout.addLayout(grid)
-        layout.addSpacing(28)
+        layout.addSpacing(24)
 
         self.start_btn = QPushButton("Start Scraping")
         self.start_btn.setFixedHeight(40)
@@ -115,9 +133,30 @@ class InputScreen(QWidget):
         layout.addStretch()
 
         scroll.setWidget(body)
-        root.addWidget(scroll)
-
         self._update_domain_count_label()
+        return scroll
+
+    def _build_settings_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 4, 0)
+        layout.setSpacing(0)
+
+        layout.addWidget(self._section_label("Browser"))
+        layout.addSpacing(10)
+
+        self.headless_cb = QCheckBox("Run headless")
+        self.headless_cb.setChecked(False)
+        self.headless_cb.setToolTip("Hide the Chrome window while scraping")
+        layout.addWidget(self.headless_cb)
+
+        hint = QLabel("When off, Chrome opens visibly so you can watch progress.")
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        layout.addSpacing(6)
+        layout.addWidget(hint)
+        layout.addStretch()
+        return page
 
     def _section_label(self, text: str) -> QLabel:
         lbl = QLabel(text.upper())
@@ -152,18 +191,27 @@ class InputScreen(QWidget):
     def get_checked_fields(self) -> list:
         return [key for key, cb in self.checkboxes.items() if cb.isChecked()]
 
+    def is_headless(self) -> bool:
+        return self.headless_cb.isChecked()
+
     def validate(self):
         domains = self._get_domains()
         area = self.area_input.text().strip()
         fields = self.get_checked_fields()
 
         if not domains:
+            self.pages.setCurrentIndex(0)
+            self.scrape_tab_btn.setChecked(True)
             self.shake(self.domain_input)
             return None, None, None
         if not area:
+            self.pages.setCurrentIndex(0)
+            self.scrape_tab_btn.setChecked(True)
             self.shake(self.area_input)
             return None, None, None
         if not fields:
+            self.pages.setCurrentIndex(0)
+            self.scrape_tab_btn.setChecked(True)
             self._flash_fields_label()
             return None, None, None
 
@@ -189,4 +237,4 @@ class InputScreen(QWidget):
     def _on_start(self):
         domains, area, fields = self.validate()
         if domains is not None:
-            self.start_signal.emit(domains, area, fields)
+            self.start_signal.emit(domains, area, fields, self.is_headless())

@@ -24,12 +24,16 @@ def export_csv(
     domain: str,
     area: str,
     fields: list,
-    output_dir: str = ".",
+    output_path: str = "",
 ) -> str:
-    safe_domain = domain.strip().lower().replace(" ", "_")
-    safe_area = area.strip().lower().replace(" ", "_")
-    filename = f"{safe_domain}_in_{safe_area}.csv"
-    filepath = os.path.join(output_dir, filename)
+    if output_path and output_path.lower().endswith(".csv"):
+        filepath = output_path
+    else:
+        output_dir = output_path or "."
+        safe_domain = domain.strip().lower().replace(" ", "_")
+        safe_area = area.strip().lower().replace(" ", "_")
+        filename = f"{safe_domain}_in_{safe_area}.csv"
+        filepath = os.path.join(output_dir, filename)
 
     headers = [FIELD_LABELS[f] for f in fields if f in FIELD_LABELS]
 

@@ -15,10 +15,10 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 # ── Timing (seconds) ─────────────────────────────────────────────────────────
-T_SEARCH_LOAD = 2.0
-T_DETAIL_LOAD = 0.9
-T_AFTER_BACK = 0.5
-T_SCROLL = 0.55
+T_SEARCH_LOAD = 1.0
+T_DETAIL_LOAD = 0.35
+T_AFTER_BACK = 0.25
+T_SCROLL = 0.3
 
 
 def _chrome_major_version() -> int:
@@ -56,6 +56,7 @@ def get_driver(headless: bool = False):
     options.add_argument("--no-first-run")
     options.add_argument("--no-default-browser-check")
     options.add_argument("--disable-popup-blocking")
+    options.page_load_strategy = "eager"
 
     major = _chrome_major_version()
     kwargs = {"options": options, "use_subprocess": True}
@@ -64,7 +65,7 @@ def get_driver(headless: bool = False):
 
     driver = uc.Chrome(**kwargs)
     driver.set_window_size(1200, 800)
-    driver.set_page_load_timeout(30)
+    driver.set_page_load_timeout(25)
     return driver
 
 
@@ -86,7 +87,7 @@ def _place_key(href: str) -> str:
 
 def _get_feed(driver):
     try:
-        return WebDriverWait(driver, 10).until(
+        return WebDriverWait(driver, 6).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, 'div[role="feed"]'))
         )
     except Exception:
@@ -235,11 +236,121 @@ def _open_reviews_tab(driver) -> bool:
                 label = (tab.get_attribute("aria-label") or tab.text or "").lower()
                 if "review" in label:
                     driver.execute_script("arguments[0].click();", tab)
-                    time.sleep(0.7)
+                    time.sleep(0.35)
                     return True
         except Exception:
             continue
     return False
+
+
+def _element_text(el) -> str:
+    text = (el.text or el.get_attribute("textContent") or "").strip()
+    return " ".join(text.split()) if text else ""
+
+
+def _extract_category(driver) -> str:
+    """Category lives on the button itself (class DkEaL), not a child span."""
+    selectors = (
+        "button[jsaction*='category']",
+        "button.DkEaL[jsaction*='category']",
+        "button[jsaction*='.category']",
+    )
+    for sel in selectors:
+        try:
+            for btn in driver.find_elements(By.CSS_SELECTOR, sel):
+                text = _element_text(btn)
+                if text and len(text) < 80:
+                    return text
+                label = (btn.get_attribute("aria-label") or "").strip()
+                if label and len(label) < 80:
+                    return label
+        except Exception:
+            continue
+
+    for xp in (
+        "//button[contains(@jsaction,'category')]",
+        "//h1[contains(@class,'fontHeadline')]/following::button[1]",
+    ):
+        text = _xpath_text(driver, [xp])
+        if text and len(text) < 80:
+            return text
+    return ""
+
+
+def _find_hours_button(driver):
+    for sel in (
+        "button[data-item-id='oh']",
+        "button[aria-label*='Hours']",
+        "button[data-tooltip*='hours']",
+        "button[data-tooltip*='Hours']",
+    ):
+        try:
+            btn = driver.find_element(By.CSS_SELECTOR, sel)
+            if btn:
+                return btn
+        except Exception:
+            continue
+    return None
+
+
+def _parse_hours_from_label(label: str) -> tuple[str, str]:
+    """Split aria-label into status snippet and hours text when possible."""
+    if not label:
+        return "", ""
+    label = label.strip()
+    for prefix in ("Hours:", "Opening hours:", "Hours "):
+        if label.lower().startswith(prefix.lower()):
+            label = label[len(prefix):].strip()
+            break
+    if "·" in label:
+        parts = [p.strip() for p in label.split("·") if p.strip()]
+        if len(parts) >= 2:
+            return parts[0], " · ".join(parts)
+    return "", label
+
+
+def _extract_hours_and_status(driver) -> tuple[str, str]:
+    btn = _find_hours_button(driver)
+    if btn is None:
+        status = _first_text(
+            driver, "span.ZDuVE, span.fCEvkb, button[data-item-id='oh'] .ZDuVE"
+        )
+        hours = _first_text(
+            driver, "button[data-item-id='oh'] div.Io6YTe, div[aria-label*='Hours']"
+        )
+        return status, hours
+
+    aria = (btn.get_attribute("aria-label") or "").strip()
+    collapsed = _element_text(btn) or aria
+    status_from_label, hours_from_label = _parse_hours_from_label(aria)
+
+    status = status_from_label or collapsed
+    hours = hours_from_label or collapsed
+
+    try:
+        driver.execute_script("arguments[0].click();", btn)
+        time.sleep(0.25)
+        rows = []
+        for row in driver.find_elements(By.CSS_SELECTOR, "table.eK4R0e tr, tr.y0skZc"):
+            cells = [_element_text(c) for c in row.find_elements(By.CSS_SELECTOR, "td, th")]
+            cells = [c for c in cells if c]
+            if cells:
+                rows.append(": ".join(cells) if len(cells) > 1 else cells[0])
+        if rows:
+            hours = "; ".join(rows)
+        else:
+            expanded = _xpath_text(driver, [
+                "//div[contains(@aria-label,'Monday')]",
+                "//div[contains(@aria-label,'Sunday')]",
+            ])
+            if expanded:
+                hours = expanded
+    except Exception:
+        pass
+
+    if not status and hours:
+        status = hours.split("·")[0].strip() if "·" in hours else ""
+    return status, hours
 
 
 def _extract_reviews(driver, count: int = 3) -> list[str]:
@@ -300,7 +411,7 @@ def extract_business_data(driver, listing_href: str, fields: list) -> dict:
 
     try:
         driver.get(listing_href)
-        wait = WebDriverWait(driver, 10)
+        wait = WebDriverWait(driver, 6)
         wait.until(EC.presence_of_element_located((
             By.CSS_SELECTOR,
             "h1.DUwDvf, h1.fontHeadlineLarge, h1[class*='fontHeadline']",
@@ -313,10 +424,7 @@ def extract_business_data(driver, listing_href: str, fields: list) -> dict:
             ) or _xpath_text(driver, ["//h1[contains(@class,'fontHeadline')]"])
 
         if "category" in fields:
-            data["category"] = (
-                _first_text(driver, "button[jsaction*='category'] .DkEaL, span.DkEaL")
-                or _xpath_text(driver, ["//button[contains(@jsaction,'category')]//span"])
-            )
+            data["category"] = _extract_category(driver)
 
         if "rating" in fields or "review_count" in fields:
             rating, count = _extract_rating_and_count(driver)
@@ -325,15 +433,12 @@ def extract_business_data(driver, listing_href: str, fields: list) -> dict:
             if "review_count" in fields:
                 data["review_count"] = count
 
-        if "status" in fields:
-            data["status"] = _first_text(
-                driver, "span.ZDuVE, span.fCEvkb, button[data-item-id='oh'] .ZDuVE"
-            )
-
-        if "hours" in fields:
-            data["hours"] = _first_text(
-                driver, "button[data-item-id='oh'] div.Io6YTe, div[aria-label*='Hours']"
-            )
+        if "status" in fields or "hours" in fields:
+            status, hours = _extract_hours_and_status(driver)
+            if "status" in fields:
+                data["status"] = status
+            if "hours" in fields:
+                data["hours"] = hours
 
         if "address" in fields:
             data["address"] = _first_text(
@@ -443,11 +548,12 @@ class ScrapeWorker(QThread):
     done_signal = pyqtSignal()
     error_signal = pyqtSignal(str)
 
-    def __init__(self, domains: list, area: str, fields: list):
+    def __init__(self, domains: list, area: str, fields: list, headless: bool = False):
         super().__init__()
         self.domains = domains
         self.area = area
         self.fields = fields
+        self.headless = headless
         self._running = True
 
     def stop(self):
@@ -456,7 +562,7 @@ class ScrapeWorker(QThread):
     def run(self):
         driver = None
         try:
-            driver = get_driver(headless=False)
+            driver = get_driver(headless=self.headless)
 
             for domain in self.domains:
                 if not self._running:
