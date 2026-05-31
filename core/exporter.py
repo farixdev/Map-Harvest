@@ -6,7 +6,6 @@ FIELD_LABELS = {
     "category": "Category",
     "rating": "Rating",
     "review_count": "Review Count",
-    "status": "Status",
     "hours": "Hours",
     "address": "Address",
     "website": "Website",

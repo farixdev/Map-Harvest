@@ -2,7 +2,7 @@ from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (
     QWidget, QLabel, QPushButton,
     QProgressBar, QTableWidget, QTableWidgetItem,
-    QHBoxLayout, QVBoxLayout, QFrame,
+    QHBoxLayout, QVBoxLayout,
     QHeaderView, QFileDialog, QAbstractItemView,
     QSizePolicy,
 )
@@ -13,6 +13,7 @@ from core.scraper import ScrapeWorker
 
 class ResultsScreen(QWidget):
     stop_signal = pyqtSignal()
+    home_signal = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -23,6 +24,9 @@ class ResultsScreen(QWidget):
         self.area = ""
         self._domains = []
         self._headless = False
+        self._max_results = 50
+        self._is_running = False
+        self._is_paused = False
         self._build()
 
     def _build(self):
@@ -30,11 +34,10 @@ class ResultsScreen(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        topbar = QFrame()
-        topbar.setObjectName("topbar")
-        topbar.setFixedHeight(48)
-        top_row = QHBoxLayout(topbar)
-        top_row.setContentsMargins(20, 0, 20, 0)
+        header = QWidget()
+        header.setObjectName("results_header")
+        top_row = QHBoxLayout(header)
+        top_row.setContentsMargins(20, 12, 20, 12)
         top_row.setSpacing(8)
 
         name_lbl = QLabel("MapHarvest")
@@ -46,23 +49,28 @@ class ResultsScreen(QWidget):
         self.export_btn.setEnabled(False)
         self.export_btn.clicked.connect(self.export_csv)
 
-        self.stop_btn = QPushButton("Stop")
-        self.stop_btn.setObjectName("danger")
-        self.stop_btn.setFixedHeight(30)
-        self.stop_btn.clicked.connect(self._on_stop_clicked)
+        self.pause_btn = QPushButton("Pause")
+        self.pause_btn.setObjectName("outlined")
+        self.pause_btn.setFixedHeight(30)
+        self.pause_btn.clicked.connect(self._on_pause_clicked)
+
+        self.action_btn = QPushButton("Stop")
+        self.action_btn.setObjectName("danger")
+        self.action_btn.setFixedHeight(30)
+        self.action_btn.clicked.connect(self._on_action_clicked)
 
         top_row.addWidget(name_lbl)
         top_row.addStretch()
         top_row.addWidget(self.export_btn)
-        top_row.addWidget(self.stop_btn)
-        root.addWidget(topbar)
+        top_row.addWidget(self.pause_btn)
+        top_row.addWidget(self.action_btn)
+        root.addWidget(header)
 
         body = QWidget()
         body_layout = QVBoxLayout(body)
-        body_layout.setContentsMargins(20, 16, 20, 16)
+        body_layout.setContentsMargins(20, 8, 20, 16)
         body_layout.setSpacing(12)
 
-        # Status area — flat, no card
         status_block = QVBoxLayout()
         status_block.setSpacing(6)
         status_block.setContentsMargins(0, 0, 0, 0)
@@ -134,11 +142,37 @@ class ResultsScreen(QWidget):
 
         root.addWidget(body)
 
-    def setup(self, domains: list, area: str, fields: list, headless: bool = False):
+    def _restyle(self, widget):
+        widget.style().unpolish(widget)
+        widget.style().polish(widget)
+        widget.update()
+
+    def _set_running_mode(self):
+        self._is_running = True
+        self._is_paused = False
+        self.pause_btn.setText("Pause")
+        self.pause_btn.setEnabled(True)
+        self.pause_btn.show()
+        self.action_btn.setText("Stop")
+        self.action_btn.setObjectName("danger")
+        self._restyle(self.action_btn)
+        self.action_btn.setEnabled(True)
+
+    def _set_idle_mode(self):
+        self._is_running = False
+        self._is_paused = False
+        self.pause_btn.hide()
+        self.action_btn.setText("Scrape Another")
+        self.action_btn.setObjectName("outlined")
+        self._restyle(self.action_btn)
+        self.action_btn.setEnabled(True)
+
+    def setup(self, domains: list, area: str, fields: list, headless: bool = False, max_results: int = 50):
         self.results = []
         self.area = area
         self._domains = domains
         self._headless = headless
+        self._max_results = max_results
         self.domain = domains[0] if domains else ""
 
         self.fields = list(fields)
@@ -155,32 +189,55 @@ class ResultsScreen(QWidget):
             self.table.setColumnWidth(0, 180)
 
         self.progress_bar.setValue(0)
-        self.progress_bar.setMaximum(100)
+        self.progress_bar.setMaximum(max(self._max_results, 1))
         self.count_label.setText("0")
-        self.count_sub.setText("collected")
+        self.count_sub.setText(f"of {self._max_results}")
         self.row_count_label.setText("")
         self.status_label.setText("Starting...")
         self.area_label.setText(f"{', '.join(domains)} · {area}")
 
         self.export_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
+        self._set_running_mode()
 
     def start_worker(self):
         self.worker = ScrapeWorker(
-            self._domains, self.area, self.fields, headless=self._headless,
+            self._domains,
+            self.area,
+            self.fields,
+            headless=self._headless,
+            max_results=self._max_results,
         )
         self.worker.log_signal.connect(self._on_log)
         self.worker.result_signal.connect(self.add_table_row)
         self.worker.progress_signal.connect(self.update_progress)
         self.worker.done_signal.connect(self.on_done)
         self.worker.error_signal.connect(self.on_error)
+        self.worker.paused_signal.connect(self._on_paused)
         self.worker.start()
 
     def stop_worker(self):
         if self.worker and self.worker.isRunning():
             self.worker.stop()
-        self.stop_btn.setEnabled(False)
+        self.pause_btn.setEnabled(False)
+        self.action_btn.setEnabled(False)
         self.status_label.setText("Stopping...")
+
+    def _on_pause_clicked(self):
+        if not self.worker or not self.worker.isRunning():
+            return
+        if self._is_paused:
+            self.worker.resume()
+        else:
+            self.worker.pause()
+
+    def _on_paused(self, paused: bool):
+        self._is_paused = paused
+        if paused:
+            self.pause_btn.setText("Resume")
+            self.status_label.setText("Paused")
+        else:
+            self.pause_btn.setText("Pause")
+            self.status_label.setText("Resuming...")
 
     def _on_log(self, message: str, status: str):
         if status == "active":
@@ -193,8 +250,8 @@ class ResultsScreen(QWidget):
 
     def update_progress(self, collected: int):
         self.count_label.setText(str(collected))
-        self.progress_bar.setMaximum(max(collected, 1))
-        self.progress_bar.setValue(collected)
+        self.progress_bar.setMaximum(max(self._max_results, 1))
+        self.progress_bar.setValue(min(collected, self._max_results))
         self.row_count_label.setText(f"{collected} row{'s' if collected != 1 else ''}")
 
     def add_table_row(self, data: dict):
@@ -233,16 +290,19 @@ class ResultsScreen(QWidget):
             export_csv(self.results, self.domain, self.area, self.fields, path)
 
     def on_done(self):
-        self.stop_btn.setEnabled(False)
         n = len(self.results)
         self.status_label.setText(f"Done — {n} businesses" if n else "Done — no results")
-        self.count_sub.setText("total")
+        self.count_sub.setText(f"of {self._max_results}")
         if n:
             self.row_count_label.setText(f"{n} row{'s' if n != 1 else ''}")
+        self._set_idle_mode()
 
     def on_error(self, message: str):
         self.status_label.setText(f"Error: {message[:60]}")
-        self.stop_btn.setEnabled(False)
+        self._set_idle_mode()
 
-    def _on_stop_clicked(self):
-        self.stop_signal.emit()
+    def _on_action_clicked(self):
+        if self._is_running:
+            self.stop_signal.emit()
+        else:
+            self.home_signal.emit()

@@ -2,6 +2,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 
@@ -293,39 +294,26 @@ def _find_hours_button(driver):
     return None
 
 
-def _parse_hours_from_label(label: str) -> tuple[str, str]:
-    """Split aria-label into status snippet and hours text when possible."""
+def _hours_from_label(label: str) -> str:
     if not label:
-        return "", ""
+        return ""
     label = label.strip()
     for prefix in ("Hours:", "Opening hours:", "Hours "):
         if label.lower().startswith(prefix.lower()):
-            label = label[len(prefix):].strip()
-            break
-    if "·" in label:
-        parts = [p.strip() for p in label.split("·") if p.strip()]
-        if len(parts) >= 2:
-            return parts[0], " · ".join(parts)
-    return "", label
+            return label[len(prefix):].strip()
+    return label
 
 
-def _extract_hours_and_status(driver) -> tuple[str, str]:
+def _extract_hours(driver) -> str:
     btn = _find_hours_button(driver)
     if btn is None:
-        status = _first_text(
-            driver, "span.ZDuVE, span.fCEvkb, button[data-item-id='oh'] .ZDuVE"
-        )
-        hours = _first_text(
+        return _first_text(
             driver, "button[data-item-id='oh'] div.Io6YTe, div[aria-label*='Hours']"
         )
-        return status, hours
 
     aria = (btn.get_attribute("aria-label") or "").strip()
-    collapsed = _element_text(btn) or aria
-    status_from_label, hours_from_label = _parse_hours_from_label(aria)
-
-    status = status_from_label or collapsed
-    hours = hours_from_label or collapsed
+    collapsed = _element_text(btn) or _hours_from_label(aria)
+    hours = collapsed
 
     try:
         driver.execute_script("arguments[0].click();", btn)
@@ -348,9 +336,7 @@ def _extract_hours_and_status(driver) -> tuple[str, str]:
     except Exception:
         pass
 
-    if not status and hours:
-        status = hours.split("·")[0].strip() if "·" in hours else ""
-    return status, hours
+    return hours
 
 
 def _extract_reviews(driver, count: int = 3) -> list[str]:
@@ -433,12 +419,8 @@ def extract_business_data(driver, listing_href: str, fields: list) -> dict:
             if "review_count" in fields:
                 data["review_count"] = count
 
-        if "status" in fields or "hours" in fields:
-            status, hours = _extract_hours_and_status(driver)
-            if "status" in fields:
-                data["status"] = status
-            if "hours" in fields:
-                data["hours"] = hours
+        if "hours" in fields:
+            data["hours"] = _extract_hours(driver)
 
         if "address" in fields:
             data["address"] = _first_text(
@@ -475,9 +457,12 @@ def extract_business_data(driver, listing_href: str, fields: list) -> dict:
     return data
 
 
-def scrape_domain_progressive(driver, domain: str, area: str, fields: list, worker) -> int:
+def scrape_domain_progressive(
+    driver, domain: str, area: str, fields: list, worker, max_results: int = 0,
+) -> int:
     """
     Open cards one-by-one from the visible feed, extract, return to list, scroll for more.
+    max_results: stop after this many listings for this domain pass (0 = no limit).
     """
     search_url = _search_url(domain, area)
     driver.get(search_url)
@@ -494,6 +479,13 @@ def scrape_domain_progressive(driver, domain: str, area: str, fields: list, work
     worker.log_signal.emit(f'Scanning "{domain} in {area}"...', "active")
 
     while worker._running and idle_rounds < 10:
+        worker._wait_if_paused()
+        if not worker._running:
+            break
+
+        if max_results > 0 and collected >= max_results:
+            break
+
         hrefs = get_visible_listings(driver)
         next_href = None
         for href in hrefs:
@@ -504,6 +496,10 @@ def scrape_domain_progressive(driver, domain: str, area: str, fields: list, work
         if next_href:
             idle_rounds = 0
             processed.add(_place_key(next_href))
+
+            worker._wait_if_paused()
+            if not worker._running:
+                break
 
             data = extract_business_data(driver, next_href, fields)
             _return_to_results(driver, search_url)
@@ -516,10 +512,13 @@ def scrape_domain_progressive(driver, domain: str, area: str, fields: list, work
 
             collected += 1
             worker.result_signal.emit(data)
-            worker.progress_signal.emit(collected)
+            worker.progress_signal.emit(worker._total_collected + collected)
 
             name = (data.get("name") or "Unknown")[:50]
-            worker.log_signal.emit(f"#{collected}  {name}", "done")
+            worker.log_signal.emit(f"#{worker._total_collected + collected}  {name}", "done")
+
+            if max_results > 0 and collected >= max_results:
+                break
             continue
 
         if _is_end_of_list(driver):
@@ -547,33 +546,75 @@ class ScrapeWorker(QThread):
     result_signal = pyqtSignal(dict)
     done_signal = pyqtSignal()
     error_signal = pyqtSignal(str)
+    paused_signal = pyqtSignal(bool)
 
-    def __init__(self, domains: list, area: str, fields: list, headless: bool = False):
+    def __init__(
+        self,
+        domains: list,
+        area: str,
+        fields: list,
+        headless: bool = False,
+        max_results: int = 0,
+    ):
         super().__init__()
         self.domains = domains
         self.area = area
         self.fields = fields
         self.headless = headless
+        self.max_results = max(0, max_results)
         self._running = True
+        self._paused = False
+        self._pause_lock = threading.Event()
+        self._pause_lock.set()
+        self._total_collected = 0
 
     def stop(self):
         self._running = False
+        self._pause_lock.set()
+
+    def pause(self):
+        self._paused = True
+        self._pause_lock.clear()
+        self.paused_signal.emit(True)
+
+    def resume(self):
+        self._paused = False
+        self._pause_lock.set()
+        self.paused_signal.emit(False)
+
+    def _wait_if_paused(self):
+        while self._running and not self._pause_lock.is_set():
+            time.sleep(0.15)
 
     def run(self):
         driver = None
         try:
             driver = get_driver(headless=self.headless)
+            self._total_collected = 0
 
             for domain in self.domains:
                 if not self._running:
                     break
 
-                count = scrape_domain_progressive(driver, domain, self.area, self.fields, self)
+                remaining = 0
+                if self.max_results > 0:
+                    remaining = self.max_results - self._total_collected
+                    if remaining <= 0:
+                        break
+
+                count = scrape_domain_progressive(
+                    driver, domain, self.area, self.fields, self,
+                    max_results=remaining,
+                )
+                self._total_collected += count
 
                 if count == 0:
                     self.log_signal.emit(f'No results for "{domain}"', "done")
                 else:
                     self.log_signal.emit(f'"{domain}" done — {count} total', "done")
+
+                if self.max_results > 0 and self._total_collected >= self.max_results:
+                    break
 
         except Exception as e:
             self.error_signal.emit(str(e))

@@ -266,8 +266,8 @@ QTableWidget#results_table {
     border-radius: 8px;
 }
 
-QFrame#topbar {
-    background-color: #242426;
+QWidget#results_header {
+    background-color: transparent;
     border-bottom: 1px solid #3A3A3C;
 }
 
@@ -288,6 +288,67 @@ QScrollArea > QWidget > QWidget {
 
 QDialog {
     background-color: #1C1C1E;
+}
+
+QSlider::groove:horizontal {
+    border: none;
+    height: 4px;
+    background: #3A3A3C;
+    border-radius: 2px;
+}
+
+QSlider::handle:horizontal {
+    background: #E5E5E7;
+    width: 14px;
+    height: 14px;
+    margin: -5px 0;
+    border-radius: 7px;
+}
+
+QSlider::handle:horizontal:hover {
+    background: #FFFFFF;
+}
+
+QSlider::sub-page:horizontal {
+    background: #636366;
+    border-radius: 2px;
+}
+
+QSpinBox#spin {
+    background-color: #2C2C2E;
+    border: 1px solid #3A3A3C;
+    border-radius: 6px;
+    padding: 4px 8px;
+    color: #E5E5E7;
+}
+
+QSpinBox#spin::up-button, QSpinBox#spin::down-button {
+    width: 16px;
+    border: none;
+    background: transparent;
+}
+
+QListWidget#saved_list {
+    background-color: #242426;
+    border: 1px solid #3A3A3C;
+    border-radius: 8px;
+    padding: 4px;
+    font-size: 12px;
+    color: #AEAEB2;
+}
+
+QListWidget#saved_list::item {
+    padding: 6px 8px;
+    border-radius: 4px;
+}
+
+QListWidget#saved_list::item:selected {
+    background-color: #3A3A3C;
+    color: #E5E5E7;
+}
+
+QListWidget#saved_list::item:hover {
+    background-color: #2C2C2E;
 }
 """
 
@@ -319,15 +380,20 @@ class MainWindow(QMainWindow):
 
         self.input_screen.start_signal.connect(self.on_start)
         self.results_screen.stop_signal.connect(self.on_stop)
+        self.results_screen.home_signal.connect(self.on_home)
 
-    def on_start(self, domains, area, fields, headless=False):
-        self.results_screen.setup(domains, area, fields, headless)
+    def on_start(self, domains, area, fields, headless=False, max_results=50):
+        self.results_screen.setup(domains, area, fields, headless, max_results)
         self.setFixedSize(QSize(960, 720))
         self.stack.setCurrentIndex(1)
         self.results_screen.start_worker()
 
     def on_stop(self):
         self.results_screen.stop_worker()
+
+    def on_home(self):
+        self.setFixedSize(QSize(520, 640))
+        self.stack.setCurrentIndex(0)
 
 
 def run():

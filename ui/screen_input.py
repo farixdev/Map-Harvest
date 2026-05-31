@@ -4,21 +4,23 @@ from PyQt5.QtWidgets import (
     QPushButton, QCheckBox, QGridLayout,
     QHBoxLayout, QVBoxLayout, QFrame,
     QScrollArea, QStackedWidget, QButtonGroup,
+    QSlider, QSpinBox, QListWidget, QListWidgetItem,
 )
 
+from core.settings import load_settings, save_settings, add_saved_search
 from ui.domain_list_dialog import DomainListDialog
 
 
 class InputScreen(QWidget):
-    start_signal = pyqtSignal(list, str, list, bool)
+    start_signal = pyqtSignal(list, str, list, bool, int)
 
     FIELD_KEYS = [
-        "name", "category", "rating", "review_count", "status", "hours",
+        "name", "category", "rating", "review_count", "hours",
         "address", "website", "phone", "maps_link",
         "review_1", "review_2", "review_3",
     ]
     FIELD_NAMES = [
-        "Business Name", "Category", "Rating", "Review Count", "Status", "Hours",
+        "Business Name", "Category", "Rating", "Review Count", "Hours",
         "Address", "Website", "Phone Number", "Maps Link",
         "Review 1", "Review 2", "Review 3",
     ]
@@ -27,14 +29,15 @@ class InputScreen(QWidget):
         super().__init__()
         self._extra_domains: list[str] = []
         self._anim = None
+        self.settings = load_settings()
         self._build()
+        self._apply_settings_to_ui()
 
     def _build(self):
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 20, 24, 20)
         root.setSpacing(0)
 
-        # Header row: title + tabs
         header = QHBoxLayout()
         header.setSpacing(12)
         app_name = QLabel("MapHarvest")
@@ -110,6 +113,39 @@ class InputScreen(QWidget):
         layout.addWidget(self.area_input)
         layout.addSpacing(18)
 
+        limit_header = QHBoxLayout()
+        limit_header.addWidget(self._section_label("Max Results"))
+        limit_header.addStretch()
+        self.max_results_label = QLabel("50")
+        self.max_results_label.setObjectName("muted")
+        limit_header.addWidget(self.max_results_label)
+        layout.addLayout(limit_header)
+        layout.addSpacing(8)
+
+        self.max_results_slider = QSlider(Qt.Horizontal)
+        self.max_results_slider.setObjectName("limit_slider")
+        self.max_results_slider.setMinimum(5)
+        self.max_results_slider.setMaximum(100)
+        self.max_results_slider.setValue(50)
+        self.max_results_slider.setTickPosition(QSlider.TicksBelow)
+        self.max_results_slider.setTickInterval(25)
+        self.max_results_slider.valueChanged.connect(self._on_max_slider_changed)
+        layout.addWidget(self.max_results_slider)
+        layout.addSpacing(18)
+
+        saved_header = QHBoxLayout()
+        saved_header.addWidget(self._section_label("Recent Searches"))
+        saved_header.addStretch()
+        layout.addLayout(saved_header)
+        layout.addSpacing(6)
+
+        self.saved_list = QListWidget()
+        self.saved_list.setObjectName("saved_list")
+        self.saved_list.setFixedHeight(88)
+        self.saved_list.itemClicked.connect(self._load_saved_search)
+        layout.addWidget(self.saved_list)
+        layout.addSpacing(18)
+
         self.fields_section_label = self._section_label("Data to Scrape")
         layout.addWidget(self.fields_section_label)
         layout.addSpacing(8)
@@ -137,6 +173,10 @@ class InputScreen(QWidget):
         return scroll
 
     def _build_settings_page(self) -> QWidget:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 4, 0)
@@ -144,24 +184,114 @@ class InputScreen(QWidget):
 
         layout.addWidget(self._section_label("Browser"))
         layout.addSpacing(10)
-
         self.headless_cb = QCheckBox("Run headless")
         self.headless_cb.setChecked(False)
         self.headless_cb.setToolTip("Hide the Chrome window while scraping")
+        self.headless_cb.toggled.connect(self._persist_settings)
         layout.addWidget(self.headless_cb)
-
         hint = QLabel("When off, Chrome opens visibly so you can watch progress.")
         hint.setObjectName("hint")
         hint.setWordWrap(True)
         layout.addSpacing(6)
         layout.addWidget(hint)
+        layout.addSpacing(22)
+
+        layout.addWidget(self._section_label("Result Limit"))
+        layout.addSpacing(10)
+        cap_row = QHBoxLayout()
+        cap_row.addWidget(QLabel("Slider maximum"))
+        cap_row.addStretch()
+        self.limit_cap_spin = QSpinBox()
+        self.limit_cap_spin.setObjectName("spin")
+        self.limit_cap_spin.setRange(25, 1000)
+        self.limit_cap_spin.setSingleStep(25)
+        self.limit_cap_spin.setValue(100)
+        self.limit_cap_spin.setFixedWidth(80)
+        self.limit_cap_spin.valueChanged.connect(self._on_limit_cap_changed)
+        cap_row.addWidget(self.limit_cap_spin)
+        layout.addLayout(cap_row)
+        cap_hint = QLabel("Raise this to allow the scrape slider to go above 100.")
+        cap_hint.setObjectName("hint")
+        cap_hint.setWordWrap(True)
+        layout.addSpacing(6)
+        layout.addWidget(cap_hint)
         layout.addStretch()
-        return page
+
+        scroll.setWidget(page)
+        return scroll
 
     def _section_label(self, text: str) -> QLabel:
         lbl = QLabel(text.upper())
         lbl.setObjectName("section_label")
         return lbl
+
+    def _apply_settings_to_ui(self):
+        cap = int(self.settings.get("max_limit_cap", 100))
+        default_max = int(self.settings.get("default_max_results", 50))
+        self.limit_cap_spin.blockSignals(True)
+        self.limit_cap_spin.setValue(cap)
+        self.limit_cap_spin.blockSignals(False)
+        self._update_slider_cap(cap)
+        self.max_results_slider.blockSignals(True)
+        self.max_results_slider.setValue(min(default_max, cap))
+        self.max_results_slider.blockSignals(False)
+        self._on_max_slider_changed(self.max_results_slider.value())
+        self.headless_cb.blockSignals(True)
+        self.headless_cb.setChecked(bool(self.settings.get("headless", False)))
+        self.headless_cb.blockSignals(False)
+        self._refresh_saved_list()
+
+    def _update_slider_cap(self, cap: int):
+        value = self.max_results_slider.value()
+        self.max_results_slider.setMaximum(cap)
+        if value > cap:
+            self.max_results_slider.setValue(cap)
+
+    def _on_limit_cap_changed(self, cap: int):
+        self.settings["max_limit_cap"] = cap
+        self._update_slider_cap(cap)
+        self._persist_settings()
+
+    def _on_max_slider_changed(self, value: int):
+        self.max_results_label.setText(str(value))
+        self.settings["default_max_results"] = value
+
+    def _persist_settings(self):
+        self.settings["headless"] = self.headless_cb.isChecked()
+        self.settings["max_limit_cap"] = self.limit_cap_spin.value()
+        self.settings["default_max_results"] = self.max_results_slider.value()
+        save_settings(self.settings)
+
+    def _format_saved_search(self, entry: dict) -> str:
+        domains = ", ".join(entry.get("domains") or [])
+        area = entry.get("area", "")
+        limit = entry.get("max_results", 50)
+        return f"{domains} · {area} · max {limit}"
+
+    def _refresh_saved_list(self):
+        self.saved_list.clear()
+        for entry in self.settings.get("saved_searches") or []:
+            item = QListWidgetItem(self._format_saved_search(entry))
+            item.setData(Qt.UserRole, entry)
+            self.saved_list.addItem(item)
+        if self.saved_list.count() == 0:
+            item = QListWidgetItem("No recent searches yet")
+            item.setFlags(Qt.NoItemFlags)
+            self.saved_list.addItem(item)
+
+    def _load_saved_search(self, item: QListWidgetItem):
+        entry = item.data(Qt.UserRole)
+        if not entry:
+            return
+        domains = entry.get("domains") or []
+        if domains:
+            self.domain_input.setText(domains[0])
+            self._extra_domains = domains[1:]
+            self._update_domain_count_label()
+        self.area_input.setText(entry.get("area", ""))
+        limit = int(entry.get("max_results", 50))
+        cap = self.max_results_slider.maximum()
+        self.max_results_slider.setValue(min(limit, cap))
 
     def _open_domain_list(self):
         dialog = DomainListDialog(self._extra_domains, self)
@@ -193,6 +323,9 @@ class InputScreen(QWidget):
 
     def is_headless(self) -> bool:
         return self.headless_cb.isChecked()
+
+    def max_results(self) -> int:
+        return self.max_results_slider.value()
 
     def validate(self):
         domains = self._get_domains()
@@ -237,4 +370,8 @@ class InputScreen(QWidget):
     def _on_start(self):
         domains, area, fields = self.validate()
         if domains is not None:
-            self.start_signal.emit(domains, area, fields, self.is_headless())
+            limit = self.max_results()
+            self.settings = add_saved_search(self.settings, domains, area, limit)
+            self._refresh_saved_list()
+            self._persist_settings()
+            self.start_signal.emit(domains, area, fields, self.is_headless(), limit)
