@@ -1,7 +1,5 @@
 <div align="center">
 
-
-=======
 # 🗺️ MapHarvest
 
 > *Every business. One click.*
