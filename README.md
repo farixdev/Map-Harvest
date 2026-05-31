@@ -1,40 +1,6 @@
 <div align="center">
 
-<<<<<<< HEAD
-A local desktop app for scraping business listings from Google Maps and exporting them to CSV. Built with **PyQt5**, **Selenium**, and **undetected-chromedriver**.
 
-No external APIs. No cloud. Everything runs on your machine with a visible (or headless) Chrome browser.
-
----
-
-## Features
-
-### Scraping
-- Search by **business type** (domain) and **location** (area)
-- **Multi-domain** searches — run several categories in one session via the List dialog
-- **Configurable fields** — choose exactly which data points to collect
-- **Sponsored listings skipped** automatically
-- **Max results limit** — horizontal slider caps how many businesses are collected per run
-- **Pause / Resume** — pause mid-scrape without losing progress
-- Progressive scrolling — loads more Maps results as needed until the limit or end of list is reached
-
-### Data export
-- Live results table during scraping
-- **Export CSV** with UTF-8 BOM (Excel-friendly)
-- Custom save path and filename
-
-### Settings & convenience
-- **Headless mode** — hide Chrome while scraping (Settings tab)
-- **Adjustable result cap** — raise the slider maximum beyond 100 (up to 1000) in Settings
-- **Recent searches** — last 12 domain + area + limit combos saved and reloadable with one click
-- Settings persist in `~/.mapharvest/settings.json`
-
-### UI
-- Two-screen flow: input → live results
-- **Scrape Another** returns to the home screen after a run finishes or is stopped
-- Dark, minimal interface
-
----
 =======
 # 🗺️ MapHarvest
 
