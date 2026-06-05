@@ -6,6 +6,7 @@ DEFAULT_SETTINGS = {
     "headless": False,
     "max_limit_cap": 100,
     "default_max_results": 50,
+    "export_dir": "",
     "saved_searches": [],
 }
 

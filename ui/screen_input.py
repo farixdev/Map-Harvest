@@ -1,3 +1,5 @@
+import os
+
 from PyQt5.QtCore import QPoint, QPropertyAnimation, QTimer, pyqtSignal, Qt
 from PyQt5.QtWidgets import (
     QWidget, QLabel, QLineEdit,
@@ -5,6 +7,7 @@ from PyQt5.QtWidgets import (
     QHBoxLayout, QVBoxLayout, QFrame,
     QScrollArea, QStackedWidget, QButtonGroup,
     QSlider, QSpinBox, QListWidget, QListWidgetItem,
+    QFileDialog,
 )
 
 from core.settings import load_settings, save_settings, add_saved_search
@@ -12,7 +15,7 @@ from ui.domain_list_dialog import DomainListDialog
 
 
 class InputScreen(QWidget):
-    start_signal = pyqtSignal(list, str, list, bool, int)
+    start_signal = pyqtSignal(list, str, list, bool, int, str)
 
     FIELD_KEYS = [
         "name", "category", "rating", "review_count", "hours",
@@ -72,14 +75,16 @@ class InputScreen(QWidget):
         self.tab_group.idClicked.connect(self.pages.setCurrentIndex)
 
     def _build_scrape_page(self) -> QWidget:
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
+        page = QWidget()
+        root = QVBoxLayout(page)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        body = QWidget()
-        layout = QVBoxLayout(body)
-        layout.setContentsMargins(0, 0, 4, 0)
-        layout.setSpacing(0)
+        columns = QHBoxLayout()
+        columns.setSpacing(40)
+
+        left = QVBoxLayout()
+        left.setSpacing(0)
 
         domain_header = QHBoxLayout()
         domain_header.addWidget(self._section_label("Domain"))
@@ -87,31 +92,31 @@ class InputScreen(QWidget):
         self.domain_count_label = QLabel("")
         self.domain_count_label.setObjectName("muted")
         domain_header.addWidget(self.domain_count_label)
-        layout.addLayout(domain_header)
-        layout.addSpacing(6)
+        left.addLayout(domain_header)
+        left.addSpacing(8)
 
         domain_row = QHBoxLayout()
-        domain_row.setSpacing(8)
+        domain_row.setSpacing(10)
         self.domain_input = QLineEdit()
         self.domain_input.setPlaceholderText("e.g. car dealers")
-        self.domain_input.setFixedHeight(38)
+        self.domain_input.setFixedHeight(40)
         self.list_btn = QPushButton("List")
         self.list_btn.setObjectName("outlined")
-        self.list_btn.setFixedSize(68, 38)
+        self.list_btn.setFixedSize(72, 40)
         self.list_btn.setToolTip("Add multiple domains to scrape")
         self.list_btn.clicked.connect(self._open_domain_list)
-        domain_row.addWidget(self.domain_input)
+        domain_row.addWidget(self.domain_input, stretch=1)
         domain_row.addWidget(self.list_btn)
-        layout.addLayout(domain_row)
-        layout.addSpacing(18)
+        left.addLayout(domain_row)
+        left.addSpacing(20)
 
-        layout.addWidget(self._section_label("Area"))
-        layout.addSpacing(6)
+        left.addWidget(self._section_label("Area"))
+        left.addSpacing(8)
         self.area_input = QLineEdit()
         self.area_input.setPlaceholderText("e.g. Lahore")
-        self.area_input.setFixedHeight(38)
-        layout.addWidget(self.area_input)
-        layout.addSpacing(18)
+        self.area_input.setFixedHeight(40)
+        left.addWidget(self.area_input)
+        left.addSpacing(20)
 
         limit_header = QHBoxLayout()
         limit_header.addWidget(self._section_label("Max Results"))
@@ -119,8 +124,8 @@ class InputScreen(QWidget):
         self.max_results_label = QLabel("50")
         self.max_results_label.setObjectName("muted")
         limit_header.addWidget(self.max_results_label)
-        layout.addLayout(limit_header)
-        layout.addSpacing(8)
+        left.addLayout(limit_header)
+        left.addSpacing(10)
 
         self.max_results_slider = QSlider(Qt.Horizontal)
         self.max_results_slider.setObjectName("limit_slider")
@@ -130,47 +135,70 @@ class InputScreen(QWidget):
         self.max_results_slider.setTickPosition(QSlider.TicksBelow)
         self.max_results_slider.setTickInterval(25)
         self.max_results_slider.valueChanged.connect(self._on_max_slider_changed)
-        layout.addWidget(self.max_results_slider)
-        layout.addSpacing(18)
+        left.addWidget(self.max_results_slider)
+        left.addSpacing(20)
 
-        saved_header = QHBoxLayout()
-        saved_header.addWidget(self._section_label("Recent Searches"))
-        saved_header.addStretch()
-        layout.addLayout(saved_header)
-        layout.addSpacing(6)
+        left.addWidget(self._section_label("Export Folder"))
+        left.addSpacing(8)
+        export_row = QHBoxLayout()
+        export_row.setSpacing(10)
+        self.export_browse_btn = QPushButton("…")
+        self.export_browse_btn.setObjectName("outlined")
+        self.export_browse_btn.setFixedSize(40, 40)
+        self.export_browse_btn.setToolTip("Choose folder for automatic CSV exports")
+        self.export_browse_btn.clicked.connect(self._browse_export_dir)
+        self.export_dir_input = QLineEdit()
+        self.export_dir_input.setReadOnly(True)
+        self.export_dir_input.setPlaceholderText("Select a folder on your computer")
+        self.export_dir_input.setFixedHeight(40)
+        export_row.addWidget(self.export_browse_btn)
+        export_row.addWidget(self.export_dir_input, stretch=1)
+        left.addLayout(export_row)
+        left.addSpacing(20)
+
+        left.addWidget(self._section_label("Recent Searches"))
+        left.addSpacing(8)
 
         self.saved_list = QListWidget()
         self.saved_list.setObjectName("saved_list")
-        self.saved_list.setFixedHeight(88)
+        self.saved_list.setMinimumHeight(120)
         self.saved_list.itemClicked.connect(self._load_saved_search)
-        layout.addWidget(self.saved_list)
-        layout.addSpacing(18)
+        left.addWidget(self.saved_list, stretch=1)
+
+        right = QVBoxLayout()
+        right.setSpacing(0)
 
         self.fields_section_label = self._section_label("Data to Scrape")
-        layout.addWidget(self.fields_section_label)
-        layout.addSpacing(8)
+        right.addWidget(self.fields_section_label)
+        right.addSpacing(14)
 
         self.checkboxes = {}
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(12)
-        grid.setVerticalSpacing(6)
+        fields_grid = QGridLayout()
+        fields_grid.setHorizontalSpacing(24)
+        fields_grid.setVerticalSpacing(10)
+        fields_grid.setColumnStretch(0, 1)
+        fields_grid.setColumnStretch(1, 1)
         for i, (key, name) in enumerate(zip(self.FIELD_KEYS, self.FIELD_NAMES)):
             cb = QCheckBox(name)
             cb.setChecked(True)
             self.checkboxes[key] = cb
-            grid.addWidget(cb, i // 2, i % 2)
-        layout.addLayout(grid)
-        layout.addSpacing(24)
+            fields_grid.addWidget(cb, i // 2, i % 2)
+        right.addLayout(fields_grid)
+        right.addStretch(1)
 
         self.start_btn = QPushButton("Start Scraping")
-        self.start_btn.setFixedHeight(40)
+        self.start_btn.setObjectName("start_btn")
+        self.start_btn.setFixedHeight(44)
+        self.start_btn.setCursor(Qt.PointingHandCursor)
         self.start_btn.clicked.connect(self._on_start)
-        layout.addWidget(self.start_btn)
-        layout.addStretch()
+        right.addWidget(self.start_btn)
 
-        scroll.setWidget(body)
+        columns.addLayout(left, stretch=1)
+        columns.addLayout(right, stretch=1)
+        root.addLayout(columns, stretch=1)
+
         self._update_domain_count_label()
-        return scroll
+        return page
 
     def _build_settings_page(self) -> QWidget:
         scroll = QScrollArea()
@@ -239,6 +267,8 @@ class InputScreen(QWidget):
         self.headless_cb.blockSignals(True)
         self.headless_cb.setChecked(bool(self.settings.get("headless", False)))
         self.headless_cb.blockSignals(False)
+        export_dir = self.settings.get("export_dir") or ""
+        self.export_dir_input.setText(export_dir)
         self._refresh_saved_list()
 
     def _update_slider_cap(self, cap: int):
@@ -260,7 +290,19 @@ class InputScreen(QWidget):
         self.settings["headless"] = self.headless_cb.isChecked()
         self.settings["max_limit_cap"] = self.limit_cap_spin.value()
         self.settings["default_max_results"] = self.max_results_slider.value()
+        self.settings["export_dir"] = self.export_dir_input.text().strip()
         save_settings(self.settings)
+
+    def _browse_export_dir(self):
+        start = self.export_dir_input.text().strip() or os.path.expanduser("~")
+        path = QFileDialog.getExistingDirectory(self, "Select export folder", start)
+        if path:
+            self.export_dir_input.setText(path)
+            self.settings["export_dir"] = path
+            save_settings(self.settings)
+
+    def export_dir(self) -> str:
+        return self.export_dir_input.text().strip()
 
     def _format_saved_search(self, entry: dict) -> str:
         domains = ", ".join(entry.get("domains") or [])
@@ -331,24 +373,30 @@ class InputScreen(QWidget):
         domains = self._get_domains()
         area = self.area_input.text().strip()
         fields = self.get_checked_fields()
+        export_dir = self.export_dir()
 
         if not domains:
             self.pages.setCurrentIndex(0)
             self.scrape_tab_btn.setChecked(True)
             self.shake(self.domain_input)
-            return None, None, None
+            return None, None, None, None
         if not area:
             self.pages.setCurrentIndex(0)
             self.scrape_tab_btn.setChecked(True)
             self.shake(self.area_input)
-            return None, None, None
+            return None, None, None, None
+        if not export_dir or not os.path.isdir(export_dir):
+            self.pages.setCurrentIndex(0)
+            self.scrape_tab_btn.setChecked(True)
+            self.shake(self.export_dir_input)
+            return None, None, None, None
         if not fields:
             self.pages.setCurrentIndex(0)
             self.scrape_tab_btn.setChecked(True)
             self._flash_fields_label()
-            return None, None, None
+            return None, None, None, None
 
-        return domains, area, fields
+        return domains, area, fields, export_dir
 
     def shake(self, widget):
         anim = QPropertyAnimation(widget, b"pos")
@@ -368,10 +416,13 @@ class InputScreen(QWidget):
         QTimer.singleShot(600, lambda: self.fields_section_label.setStyleSheet(""))
 
     def _on_start(self):
-        domains, area, fields = self.validate()
-        if domains is not None:
+        validated = self.validate()
+        if validated[0] is not None:
+            domains, area, fields, export_dir = validated
             limit = self.max_results()
             self.settings = add_saved_search(self.settings, domains, area, limit)
             self._refresh_saved_list()
             self._persist_settings()
-            self.start_signal.emit(domains, area, fields, self.is_headless(), limit)
+            self.start_signal.emit(
+                domains, area, fields, self.is_headless(), limit, export_dir,
+            )

@@ -1,9 +1,9 @@
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
     QWidget, QLabel, QPushButton,
     QProgressBar, QTableWidget, QTableWidgetItem,
     QHBoxLayout, QVBoxLayout,
-    QHeaderView, QFileDialog, QAbstractItemView,
+    QHeaderView, QAbstractItemView,
     QSizePolicy,
 )
 
@@ -15,6 +15,8 @@ class ResultsScreen(QWidget):
     stop_signal = pyqtSignal()
     home_signal = pyqtSignal()
 
+    TOAST_MS = 5000
+
     def __init__(self):
         super().__init__()
         self.worker = None
@@ -25,8 +27,11 @@ class ResultsScreen(QWidget):
         self._domains = []
         self._headless = False
         self._max_results = 50
+        self._export_dir = ""
         self._is_running = False
         self._is_paused = False
+        self._stopped_by_user = False
+        self._toast_timer = None
         self._build()
 
     def _build(self):
@@ -36,18 +41,15 @@ class ResultsScreen(QWidget):
 
         header = QWidget()
         header.setObjectName("results_header")
-        top_row = QHBoxLayout(header)
-        top_row.setContentsMargins(20, 12, 20, 12)
+        header_layout = QVBoxLayout(header)
+        header_layout.setContentsMargins(20, 10, 20, 10)
+        header_layout.setSpacing(4)
+
+        top_row = QHBoxLayout()
         top_row.setSpacing(8)
 
         name_lbl = QLabel("MapHarvest")
         name_lbl.setObjectName("app_name")
-
-        self.export_btn = QPushButton("Export CSV")
-        self.export_btn.setObjectName("outlined")
-        self.export_btn.setFixedHeight(30)
-        self.export_btn.setEnabled(False)
-        self.export_btn.clicked.connect(self.export_csv)
 
         self.pause_btn = QPushButton("Pause")
         self.pause_btn.setObjectName("outlined")
@@ -61,9 +63,15 @@ class ResultsScreen(QWidget):
 
         top_row.addWidget(name_lbl)
         top_row.addStretch()
-        top_row.addWidget(self.export_btn)
         top_row.addWidget(self.pause_btn)
         top_row.addWidget(self.action_btn)
+        header_layout.addLayout(top_row)
+
+        self.export_path_label = QLabel("")
+        self.export_path_label.setObjectName("muted")
+        self.export_path_label.setWordWrap(True)
+        header_layout.addWidget(self.export_path_label)
+
         root.addWidget(header)
 
         body = QWidget()
@@ -140,6 +148,13 @@ class ResultsScreen(QWidget):
         self.table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         body_layout.addWidget(self.table, stretch=1)
 
+        self.toast_label = QLabel("")
+        self.toast_label.setObjectName("toast")
+        self.toast_label.setWordWrap(True)
+        self.toast_label.setAlignment(Qt.AlignCenter)
+        self.toast_label.hide()
+        body_layout.addWidget(self.toast_label)
+
         root.addWidget(body)
 
     def _restyle(self, widget):
@@ -167,12 +182,22 @@ class ResultsScreen(QWidget):
         self._restyle(self.action_btn)
         self.action_btn.setEnabled(True)
 
-    def setup(self, domains: list, area: str, fields: list, headless: bool = False, max_results: int = 50):
+    def setup(
+        self,
+        domains: list,
+        area: str,
+        fields: list,
+        headless: bool = False,
+        max_results: int = 50,
+        export_dir: str = "",
+    ):
+        self._stopped_by_user = False
         self.results = []
         self.area = area
         self._domains = domains
         self._headless = headless
         self._max_results = max_results
+        self._export_dir = export_dir or ""
         self.domain = domains[0] if domains else ""
 
         self.fields = list(fields)
@@ -196,10 +221,30 @@ class ResultsScreen(QWidget):
         self.status_label.setText("Starting...")
         self.area_label.setText(f"{', '.join(domains)} · {area}")
 
-        self.export_btn.setEnabled(False)
+        if self._export_dir:
+            self.export_path_label.setText(f"Saving exports to {self._export_dir}")
+        else:
+            self.export_path_label.setText("")
+
+        self._hide_toast()
         self._set_running_mode()
 
     def start_worker(self):
+        if self.worker is not None:
+            for signal, slot in (
+                (self.worker.log_signal, self._on_log),
+                (self.worker.result_signal, self.add_table_row),
+                (self.worker.progress_signal, self.update_progress),
+                (self.worker.done_signal, self.on_done),
+                (self.worker.error_signal, self.on_error),
+                (self.worker.paused_signal, self._on_paused),
+                (self.worker.domain_finished_signal, self._on_domain_finished),
+            ):
+                try:
+                    signal.disconnect(slot)
+                except TypeError:
+                    pass
+
         self.worker = ScrapeWorker(
             self._domains,
             self.area,
@@ -213,9 +258,12 @@ class ResultsScreen(QWidget):
         self.worker.done_signal.connect(self.on_done)
         self.worker.error_signal.connect(self.on_error)
         self.worker.paused_signal.connect(self._on_paused)
+        if len(self._domains) > 1:
+            self.worker.domain_finished_signal.connect(self._on_domain_finished)
         self.worker.start()
 
     def stop_worker(self):
+        self._stopped_by_user = True
         if self.worker and self.worker.isRunning():
             self.worker.stop()
         self.pause_btn.setEnabled(False)
@@ -277,25 +325,98 @@ class ResultsScreen(QWidget):
             self.table.setItem(row, col, item)
 
         self.table.scrollToBottom()
-        self.export_btn.setEnabled(True)
         self.row_count_label.setText(f"{len(self.results)} row{'s' if len(self.results) != 1 else ''}")
 
-    def export_csv(self):
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save CSV",
-            f"{self.domain}_in_{self.area}.csv",
-            "CSV Files (*.csv)",
-        )
-        if path:
-            export_csv(self.results, self.domain, self.area, self.fields, path)
+    def _rows_for_domain(self, domain: str) -> list:
+        return [
+            r for r in self.results
+            if r.get("domain", r.get("_domain", "")) == domain
+        ]
+
+    def _export_summary(self, domain: str, count: int, hit_limit: bool) -> str:
+        if count <= 0:
+            return f'"{domain} in {self.area}" — no results found. Skipping CSV.'
+        if hit_limit:
+            summary = f"{count} of {self._max_results} collected"
+        elif self._max_results > 0 and count < self._max_results:
+            summary = (
+                f"{count} of {self._max_results} requested — "
+                "Google Maps had fewer results"
+            )
+        else:
+            summary = f"{count} collected"
+        return f'"{domain} in {self.area}" — {summary}'
+
+    def _save_domain_csv(self, domain: str, rows: list) -> str:
+        return export_csv(rows, domain, self.area, self.fields, self._export_dir)
+
+    def _show_toast(self, message: str, filepath: str | None = None):
+        if filepath:
+            text = f"{message}\nCSV saved to:\n{filepath}"
+        else:
+            text = message
+        self.toast_label.setText(text)
+        self.toast_label.show()
+        if self._toast_timer is not None:
+            self._toast_timer.stop()
+        self._toast_timer = QTimer(self)
+        self._toast_timer.setSingleShot(True)
+        self._toast_timer.timeout.connect(self._hide_toast)
+        self._toast_timer.start(self.TOAST_MS)
+
+    def _hide_toast(self):
+        self.toast_label.hide()
+        self.toast_label.clear()
+
+    def _notify_domain_export(self, domain: str, count: int, hit_limit: bool):
+        message = self._export_summary(domain, count, hit_limit)
+        filepath = None
+        if count > 0:
+            rows = self._rows_for_domain(domain)
+            if rows:
+                filepath = self._save_domain_csv(domain, rows)
+        self._show_toast(message, filepath)
+
+    def _on_domain_finished(self, domain: str, count: int, max_results: int, hit_limit: bool):
+        if not self.worker:
+            return
+
+        self._notify_domain_export(domain, count, hit_limit)
+
+        self.results = []
+        self.table.setRowCount(0)
+        self.count_label.setText("0")
+        self.progress_bar.setValue(0)
+        self.row_count_label.setText("")
+        self.domain = ""
+        self.status_label.setText("Continuing to next domain...")
+
+        self.worker.continue_next_domain()
 
     def on_done(self):
         n = len(self.results)
-        self.status_label.setText(f"Done — {n} businesses" if n else "Done — no results")
+        if self._stopped_by_user:
+            if n > 0 and self.domain:
+                self._notify_domain_export(self.domain, n, False)
+                self.status_label.setText("Stopped — partial results saved")
+            else:
+                self.status_label.setText("Stopped — no results collected")
+        else:
+            if len(self._domains) == 1 and self._domains:
+                domain = self._domains[0]
+                hit_limit = self._max_results > 0 and n >= self._max_results
+                self._notify_domain_export(domain, n, hit_limit)
+                self.status_label.setText(
+                    f"Done — {n} businesses" if n else "Done — no results"
+                )
+            else:
+                self.status_label.setText("Done — all domains scraped")
+
         self.count_sub.setText(f"of {self._max_results}")
         if n:
             self.row_count_label.setText(f"{n} row{'s' if n != 1 else ''}")
         self._set_idle_mode()
+        self._stopped_by_user = False
 
     def on_error(self, message: str):
         self.status_label.setText(f"Error: {message[:60]}")

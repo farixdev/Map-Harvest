@@ -16,10 +16,10 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 # ── Timing (seconds) ─────────────────────────────────────────────────────────
-T_SEARCH_LOAD = 1.0
-T_DETAIL_LOAD = 0.35
-T_AFTER_BACK = 0.25
-T_SCROLL = 0.3
+T_SEARCH_LOAD = 2.0
+T_DETAIL_LOAD = 0.5
+T_AFTER_BACK = 0.5
+T_SCROLL = 0.6
 
 
 def _chrome_major_version() -> int:
@@ -86,10 +86,37 @@ def _place_key(href: str) -> str:
     return href.split("?")[0]
 
 
+def _listing_selectors() -> tuple[str, ...]:
+    return (
+        'a[href*="/maps/place"]',
+        'a[href*="google.com/maps/place"]',
+        'a.hfpxzc',
+    )
+
+
 def _get_feed(driver):
+    selectors = (
+        'div[role="feed"]',
+        'div[aria-label*="Results for"]',
+        'div[aria-label*="Search results"]',
+        'div[class*="Nv2PK"]',
+        'div[class*="m6QErb"]',
+    )
+    for sel in selectors:
+        try:
+            feeds = driver.find_elements(By.CSS_SELECTOR, sel)
+            for feed in feeds:
+                if feed.is_displayed():
+                    return feed
+        except Exception:
+            continue
+
     try:
         return WebDriverWait(driver, 6).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, 'div[role="feed"]'))
+            EC.presence_of_element_located((
+                By.XPATH,
+                "//div[@role='feed' or contains(@aria-label, 'Results for') or contains(@aria-label, 'Search results')]",
+            ))
         )
     except Exception:
         return None
@@ -100,19 +127,120 @@ def _wait_for_feed(driver) -> bool:
 
 
 def _is_end_of_list(driver) -> bool:
+    """Detect end-of-results reliably.
+
+    Maps end messages are sometimes transient; require that the message exists
+    *and* the feed is not currently loading.
+    """
     try:
-        driver.find_element(By.XPATH, "//*[contains(text(), \"You've reached the end\")]")
-        return True
-    except NoSuchElementException:
+        if _is_loading(driver):
+            return False
+        return bool(driver.find_elements(By.XPATH, "//*[contains(text(), \"You've reached the end\") or contains(text(), 'end of results') or contains(text(), 'reached the end')]"))
+    except Exception:
         return False
 
 
-def _scroll_feed_step(driver, feed) -> None:
-    driver.execute_script(
-        "arguments[0].scrollTop = arguments[0].scrollTop + arguments[0].clientHeight * 0.8",
-        feed,
-    )
-    time.sleep(T_SCROLL)
+
+def _find_last_listing(feed):
+    try:
+        for sel in _listing_selectors():
+            listings = feed.find_elements(By.CSS_SELECTOR, sel)
+            if listings:
+                return listings[-1]
+    except Exception:
+        pass
+    return None
+
+
+def _scroll_feed_step(driver, feed) -> bool:
+    try:
+        driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight;", feed)
+        last_listing = _find_last_listing(feed)
+        if last_listing is not None:
+            driver.execute_script(
+                "arguments[0].scrollIntoView({behavior:'auto', block:'end'});",
+                last_listing,
+            )
+        else:
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(T_SCROLL)
+        return True
+    except (StaleElementReferenceException, Exception):
+        return False
+
+
+def _wait_for_more_results(driver, prev_count: int, timeout: float = 8.0) -> bool:
+    """Wait for Maps to actually append new listings.
+
+    The UI sometimes reports the same visible count for a while; instead of
+    only comparing counts, we compare the growth of the *unique place keys*.
+    """
+    start = time.time()
+
+    try:
+        prev_keys = {_place_key(h) for h in get_visible_listings(driver)}
+    except Exception:
+        prev_keys = set()
+
+    while time.time() - start < timeout:
+        try:
+            if _is_loading(driver):
+                time.sleep(0.3)
+                continue
+
+            hrefs = get_visible_listings(driver)
+            cur_count = len(hrefs)
+            cur_keys = {_place_key(h) for h in hrefs if h}
+
+            if cur_count > prev_count and len(cur_keys) > len(prev_keys):
+                return True
+            if len(cur_keys) > len(prev_keys):
+                return True
+
+            if _is_end_of_list(driver):
+                # only stop if we also didn't see any growth
+                return False
+
+        except Exception:
+            pass
+
+        time.sleep(0.25)
+
+    return False
+
+
+
+def _is_loading(driver) -> bool:
+    """Return True if a loading/progress indicator is *visible* on the page.
+
+    Google Maps keeps progress-bar elements in the DOM at all times; we must
+    check is_displayed() / opacity to avoid treating hidden spinners as active.
+    """
+    try:
+        loaders = [
+            'div[role="progressbar"]',
+            'div.section-loading',
+            'div.loading',
+            'span[aria-label*="Loading"]',
+        ]
+        for sel in loaders:
+            for el in driver.find_elements(By.CSS_SELECTOR, sel):
+                try:
+                    if not el.is_displayed():
+                        continue
+                    # Some Maps spinners are in the DOM but have opacity:0 or width:0
+                    style = el.get_attribute("style") or ""
+                    if "opacity: 0" in style or "opacity:0" in style:
+                        continue
+                    size = el.size
+                    if size and (size.get("width", 0) == 0 or size.get("height", 0) == 0):
+                        continue
+                    return True
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return False
 
 
 def _return_to_results(driver, search_url: str) -> None:
@@ -147,16 +275,24 @@ def _return_to_results(driver, search_url: str) -> None:
 
 
 def get_visible_listings(driver) -> list[str]:
-    if not _get_feed(driver):
-        return []
+    feed = _get_feed(driver)
+    selector = ", ".join(_listing_selectors())
+    if feed is not None:
+        try:
+            anchors = feed.find_elements(By.CSS_SELECTOR, selector)
+        except Exception:
+            anchors = []
+    else:
+        try:
+            anchors = driver.find_elements(By.CSS_SELECTOR, selector)
+        except Exception:
+            anchors = []
 
-    try:
-        anchors = driver.find_elements(
-            By.CSS_SELECTOR,
-            'div[role="feed"] a[href*="google.com/maps/place"]',
-        )
-    except Exception:
-        return []
+    if not anchors:
+        try:
+            anchors = driver.find_elements(By.CSS_SELECTOR, selector)
+        except Exception:
+            anchors = []
 
     results = []
     seen = set()
@@ -457,12 +593,105 @@ def extract_business_data(driver, listing_href: str, fields: list) -> dict:
     return data
 
 
+def _extract_business_data_in_new_tab(driver, listing_href: str, fields: list) -> dict:
+    """Open the business page in a new tab, scrape it, close the tab, and return to the search feed."""
+def _extract_business_data_in_new_tab(driver, listing_href: str, fields: list, worker=None) -> dict:
+    """Open the business page in a new tab, scrape it, close the tab, and return to the search feed.
+
+    If `worker` is provided it will be used to emit log messages for diagnostics.
+    """
+    original_handle = driver.current_window_handle
+    before_handles = set(driver.window_handles)
+    driver.execute_script("window.open(arguments[0], '_blank');", listing_href)
+
+    new_handle = None
+    start = time.time()
+    while time.time() - start < 5:
+        handles = driver.window_handles
+        new_handles = [h for h in handles if h not in before_handles]
+        if new_handles:
+            new_handle = new_handles[0]
+            break
+        time.sleep(0.1)
+
+    if new_handle is None:
+        new_handles = [h for h in driver.window_handles if h != original_handle]
+        if new_handles:
+            new_handle = new_handles[0]
+
+    if new_handle is None:
+        if worker is not None:
+            try:
+                worker.log_signal.emit("Unable to open business in new tab", "active")
+            except Exception:
+                pass
+        return {"_error": "Unable to open business in new tab"}
+
+    try:
+        driver.switch_to.window(new_handle)
+    except Exception:
+        if worker is not None:
+            try:
+                worker.log_signal.emit("Failed to switch to new tab", "active")
+            except Exception:
+                pass
+        return {"_error": "Failed to switch to new tab"}
+
+    if worker is not None:
+        try:
+            worker.log_signal.emit("Opened business in new tab", "active")
+        except Exception:
+            pass
+
+    data = extract_business_data(driver, listing_href, fields)
+
+    try:
+        driver.close()
+    except Exception:
+        pass
+
+    switched_back = False
+    try:
+        driver.switch_to.window(original_handle)
+        switched_back = True
+    except Exception:
+        # If switching back fails, try any remaining handle
+        remaining = [h for h in driver.window_handles if h != new_handle]
+        if remaining:
+            try:
+                driver.switch_to.window(remaining[0])
+                switched_back = True
+            except Exception:
+                pass
+
+    if not switched_back:
+        if worker is not None:
+            try:
+                worker.log_signal.emit("Failed to switch back to search tab", "active")
+            except Exception:
+                pass
+
+    # Give Maps time to re-render the feed panel after focus returns to the search tab.
+    # This is critical — without this wait, the feed is stale/empty and new cards are invisible.
+    time.sleep(0.5)
+
+    # Verify the feed is actually present and visible; if not, wait a bit longer.
+    feed_check_start = time.time()
+    while time.time() - feed_check_start < 5.0:
+        if _get_feed(driver) is not None:
+            break
+        time.sleep(0.3)
+
+    return data
+
+
 def scrape_domain_progressive(
     driver, domain: str, area: str, fields: list, worker, max_results: int = 0,
-) -> int:
+) -> tuple[int, bool]:
     """
     Open cards one-by-one from the visible feed, extract, return to list, scroll for more.
     max_results: stop after this many listings for this domain pass (0 = no limit).
+    Returns (count, completed). completed is True when the limit was hit or Maps has no more results.
     """
     search_url = _search_url(domain, area)
     driver.get(search_url)
@@ -470,23 +699,30 @@ def scrape_domain_progressive(
 
     feed = _get_feed(driver)
     if feed is None:
-        return 0
+        return 0, True
 
     processed: set[str] = set()
     collected = 0
-    idle_rounds = 0
+    stall_scrolls = 0
+    stall_reloads = 0
+    max_stall_scrolls = 24
+    max_stall_reloads = 6
 
     worker.log_signal.emit(f'Scanning "{domain} in {area}"...', "active")
 
-    while worker._running and idle_rounds < 10:
+    while worker._running:
         worker._wait_if_paused()
         if not worker._running:
-            break
+            return collected, False
 
         if max_results > 0 and collected >= max_results:
-            break
+            return collected, True
 
         hrefs = get_visible_listings(driver)
+        try:
+            worker.log_signal.emit(f"Visible listings: {len(hrefs)}", "active")
+        except Exception:
+            pass
         next_href = None
         for href in hrefs:
             if _place_key(href) not in processed:
@@ -494,16 +730,59 @@ def scrape_domain_progressive(
                 break
 
         if next_href:
-            idle_rounds = 0
+            stall_scrolls = 0
+            stall_reloads = 0
             processed.add(_place_key(next_href))
 
             worker._wait_if_paused()
             if not worker._running:
-                break
+                return collected, False
 
-            data = extract_business_data(driver, next_href, fields)
-            _return_to_results(driver, search_url)
+            # Prefer opening each listing in a new tab for speed, but fallback
+            # to in-page navigation if tab operations fail repeatedly.
+            use_tabs = getattr(worker, "use_tabs", True)
+            if use_tabs:
+                if "_tab_failures" not in locals():
+                    _tab_failures = 0
+                data = _extract_business_data_in_new_tab(driver, next_href, fields, worker=worker)
+                if data.get("_error"):
+                    _tab_failures += 1
+                    try:
+                        worker.log_signal.emit(f"Tab extraction error ({_tab_failures}): {data.get('_error')}", "active")
+                    except Exception:
+                        pass
+                else:
+                    _tab_failures = 0
+            else:
+                data = {"_error": "Tabs disabled"}
+
+            # If tabs failing, fallback to original navigation approach
+            if data.get("_error") and getattr(worker, "use_tabs", True):
+                try:
+                    worker.log_signal.emit("Falling back to in-page navigation for this item", "active")
+                except Exception:
+                    pass
+                try:
+                    data = extract_business_data(driver, next_href, fields)
+                except Exception as e:
+                    data = {"_error": str(e)}
+                try:
+                    _return_to_results(driver, search_url)
+                except Exception:
+                    pass
+
+            # Always re-fetch the feed after returning from a tab or back-navigation —
+            # the previous reference is stale and scrolling with it does nothing.
             feed = _get_feed(driver)
+            if feed is None:
+                # Feed not visible yet — wait a moment and retry before giving up
+                time.sleep(1.0)
+                feed = _get_feed(driver)
+            if feed is None:
+                worker.log_signal.emit("Feed lost after tab close; reloading search...", "active")
+                driver.get(search_url)
+                time.sleep(T_SEARCH_LOAD)
+                feed = _get_feed(driver)
 
             data["_domain"] = domain
             data["_area"] = area
@@ -512,17 +791,17 @@ def scrape_domain_progressive(
 
             collected += 1
             worker.result_signal.emit(data)
-            worker.progress_signal.emit(worker._total_collected + collected)
+            worker.progress_signal.emit(worker._progress_base + collected)
 
             name = (data.get("name") or "Unknown")[:50]
-            worker.log_signal.emit(f"#{worker._total_collected + collected}  {name}", "done")
+            worker.log_signal.emit(f"#{worker._progress_base + collected}  {name}", "done")
 
             if max_results > 0 and collected >= max_results:
-                break
+                return collected, True
             continue
 
         if _is_end_of_list(driver):
-            break
+            return collected, True
 
         if feed is None:
             feed = _get_feed(driver)
@@ -531,19 +810,89 @@ def scrape_domain_progressive(
             time.sleep(T_SEARCH_LOAD)
             feed = _get_feed(driver)
             if feed is None:
-                break
+                return collected, collected == 0
 
         worker.log_signal.emit("Loading more results...", "active")
-        _scroll_feed_step(driver, feed)
-        idle_rounds += 1
+        prev_count = len(hrefs)
+        try:
+            worker.log_signal.emit(f"Attempting scroll: prev_count={prev_count}", "active")
+        except Exception:
+            pass
+        scrolled = _scroll_feed_step(driver, feed)
+        try:
+            if not scrolled:
+                worker.log_signal.emit("Scroll step failed (stale feed?)", "active")
+            elif _is_loading(driver):
+                worker.log_signal.emit("Loader detected after scroll — waiting for it to clear...", "active")
+        except Exception:
+            pass
+        if not scrolled:
+            feed = _get_feed(driver)
+            if feed is None:
+                driver.get(search_url)
+                time.sleep(T_SEARCH_LOAD)
+                feed = _get_feed(driver)
+                if feed is None:
+                    return collected, collected == 0
 
-    return collected
+        # If a loader is spinning, wait up to 10 s for it to disappear before measuring growth
+        loader_wait_start = time.time()
+        while _is_loading(driver) and time.time() - loader_wait_start < 10.0:
+            time.sleep(0.3)
+        if time.time() - loader_wait_start > 1.0:
+            # Extra pause after loader clears so DOM can settle
+            time.sleep(0.4)
+
+        # Wait briefly for new results to appear after scrolling (handles loader overlays)
+        more = _wait_for_more_results(driver, prev_count, timeout=8.0)
+        if not more and scrolled:
+            # Some Maps feeds need an additional push to populate new cards.
+            second_feed = _get_feed(driver)
+            if second_feed is not None and second_feed != feed:
+                feed = second_feed
+            _scroll_feed_step(driver, feed)
+            # wait out any second loader
+            loader_wait_start2 = time.time()
+            while _is_loading(driver) and time.time() - loader_wait_start2 < 8.0:
+                time.sleep(0.3)
+            more = _wait_for_more_results(driver, prev_count, timeout=6.0)
+
+        try:
+            worker.log_signal.emit(f"More results appeared? {more}", "active")
+            worker.log_signal.emit(f"Currently visible: {len(get_visible_listings(driver))}", "active")
+        except Exception:
+            pass
+        if more:
+            stall_scrolls = 0
+            stall_reloads = 0
+            # refresh visible listings and try to pick the next one
+            hrefs = get_visible_listings(driver)
+            continue
+        else:
+            stall_scrolls += 1
+
+        need_more = max_results == 0 or collected < max_results
+        if stall_scrolls >= max_stall_scrolls and need_more:
+            stall_scrolls = 0
+            if stall_reloads < max_stall_reloads:
+                stall_reloads += 1
+                worker.log_signal.emit("Refreshing search results...", "active")
+                driver.get(search_url)
+                time.sleep(T_SEARCH_LOAD)
+                feed = _get_feed(driver)
+                if feed is None:
+                    continue
+            elif _is_end_of_list(driver):
+                return collected, True
+
+    return collected, False
 
 
 class ScrapeWorker(QThread):
     log_signal = pyqtSignal(str, str)
     progress_signal = pyqtSignal(int)
     result_signal = pyqtSignal(dict)
+    domain_finished_signal = pyqtSignal(str, int, int, bool)
     done_signal = pyqtSignal()
     error_signal = pyqtSignal(str)
     paused_signal = pyqtSignal(bool)
@@ -555,6 +904,7 @@ class ScrapeWorker(QThread):
         fields: list,
         headless: bool = False,
         max_results: int = 0,
+        use_tabs: bool = True,
     ):
         super().__init__()
         self.domains = domains
@@ -562,15 +912,23 @@ class ScrapeWorker(QThread):
         self.fields = fields
         self.headless = headless
         self.max_results = max(0, max_results)
+        self.use_tabs = use_tabs
         self._running = True
         self._paused = False
         self._pause_lock = threading.Event()
         self._pause_lock.set()
+        self._continue_event = threading.Event()
+        self._continue_event.set()
         self._total_collected = 0
+        self._progress_base = 0
+
+    def continue_next_domain(self):
+        self._continue_event.set()
 
     def stop(self):
         self._running = False
         self._pause_lock.set()
+        self._continue_event.set()
 
     def pause(self):
         self._paused = True
@@ -591,30 +949,64 @@ class ScrapeWorker(QThread):
         try:
             driver = get_driver(headless=self.headless)
             self._total_collected = 0
+            multi_domain = len(self.domains) > 1
 
             for domain in self.domains:
                 if not self._running:
                     break
 
-                remaining = 0
-                if self.max_results > 0:
-                    remaining = self.max_results - self._total_collected
-                    if remaining <= 0:
+                if multi_domain:
+                    limit = self.max_results
+                elif self.max_results > 0:
+                    limit = self.max_results - self._total_collected
+                    if limit <= 0:
                         break
+                else:
+                    limit = 0
 
-                count = scrape_domain_progressive(
+                if multi_domain:
+                    self._progress_base = 0
+                else:
+                    self._progress_base = self._total_collected
+                count, completed = scrape_domain_progressive(
                     driver, domain, self.area, self.fields, self,
-                    max_results=remaining,
+                    max_results=limit,
                 )
                 self._total_collected += count
 
+                if not self._running:
+                    break
+
+                if not multi_domain:
+                    if self.max_results > 0 and self._total_collected >= self.max_results:
+                        break
+                    continue
+
+                if not completed:
+                    if count:
+                        self.log_signal.emit(
+                            f'"{domain}" stopped early — {count} collected', "done",
+                        )
+                    continue
+
                 if count == 0:
                     self.log_signal.emit(f'No results for "{domain}"', "done")
+                elif self.max_results > 0 and count >= self.max_results:
+                    self.log_signal.emit(
+                        f'"{domain}" done — {count} of {self.max_results}', "done",
+                    )
                 else:
-                    self.log_signal.emit(f'"{domain}" done — {count} total', "done")
+                    self.log_signal.emit(
+                        f'"{domain}" done — {count} (no more results)', "done",
+                    )
 
-                if self.max_results > 0 and self._total_collected >= self.max_results:
-                    break
+                self._continue_event.clear()
+                hit_limit = self.max_results > 0 and count >= self.max_results
+                self.domain_finished_signal.emit(
+                    domain, count, self.max_results, hit_limit,
+                )
+                while self._running and not self._continue_event.wait(timeout=0.2):
+                    pass
 
         except Exception as e:
             self.error_signal.emit(str(e))

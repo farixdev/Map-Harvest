@@ -350,6 +350,38 @@ QListWidget#saved_list::item:selected {
 QListWidget#saved_list::item:hover {
     background-color: #2C2C2E;
 }
+
+QLabel#toast {
+    background-color: #2C2C2E;
+    border: 1px solid #48484A;
+    border-radius: 8px;
+    color: #E5E5E7;
+    font-size: 12px;
+    padding: 12px 14px;
+}
+
+QPushButton#start_btn {
+    background-color: #22A559;
+    color: #FFFFFF;
+    border: none;
+    border-radius: 8px;
+    font-size: 14px;
+    font-weight: 600;
+    padding: 0 20px;
+}
+
+QPushButton#start_btn:hover {
+    background-color: #26B863;
+}
+
+QPushButton#start_btn:pressed {
+    background-color: #1D8F4C;
+}
+
+QPushButton#start_btn:disabled {
+    background-color: #3A3A3C;
+    color: #636366;
+}
 """
 
 
@@ -367,7 +399,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("MapHarvest")
-        self.setFixedSize(QSize(520, 640))
+        self.setFixedSize(QSize(820, 640))
 
         self.stack = QStackedWidget()
         self.setCentralWidget(self.stack)
@@ -382,8 +414,10 @@ class MainWindow(QMainWindow):
         self.results_screen.stop_signal.connect(self.on_stop)
         self.results_screen.home_signal.connect(self.on_home)
 
-    def on_start(self, domains, area, fields, headless=False, max_results=50):
-        self.results_screen.setup(domains, area, fields, headless, max_results)
+    def on_start(self, domains, area, fields, headless=False, max_results=50, export_dir=""):
+        self.results_screen.setup(
+            domains, area, fields, headless, max_results, export_dir,
+        )
         self.setFixedSize(QSize(960, 720))
         self.stack.setCurrentIndex(1)
         self.results_screen.start_worker()
@@ -392,7 +426,7 @@ class MainWindow(QMainWindow):
         self.results_screen.stop_worker()
 
     def on_home(self):
-        self.setFixedSize(QSize(520, 640))
+        self.setFixedSize(QSize(820, 640))
         self.stack.setCurrentIndex(0)
 
 
