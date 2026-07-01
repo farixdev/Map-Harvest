@@ -126,6 +126,19 @@ def _wait_for_feed(driver) -> bool:
     return _get_feed(driver) is not None
 
 
+def _wait_for_visible_listings(driver, min_count: int = 1, timeout: float = 5.0) -> bool:
+    start = time.time()
+    while time.time() - start < timeout:
+        if _is_loading(driver):
+            time.sleep(0.25)
+            continue
+        hrefs = get_visible_listings(driver)
+        if len(hrefs) >= min_count:
+            return True
+        time.sleep(0.3)
+    return False
+
+
 def _is_end_of_list(driver) -> bool:
     """Detect end-of-results reliably.
 
@@ -163,10 +176,48 @@ def _scroll_feed_step(driver, feed) -> bool:
             )
         else:
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(T_SCROLL)
+        # Short, explicit wait for loading.
+        time.sleep(0.2)
         return True
     except (StaleElementReferenceException, Exception):
         return False
+
+
+def _scroll_to_bottom(driver) -> None:
+    """Scroll to the bottom of the feed 2-3 times to ensure all initial cards are loaded.
+    
+    This is called once at the start to warm up the feed before scraping begins.
+    """
+    feed = _get_feed(driver)
+    if feed is None:
+        return
+
+    # Do 2-3 scroll steps to load initial cards
+    for i in range(2):
+        try:
+            _scroll_feed_step(driver, feed)
+            
+            # Wait for loading indicators to finish
+            loader_wait_start = time.time()
+            while _is_loading(driver) and time.time() - loader_wait_start < 8.0:
+                time.sleep(0.3)
+            
+            # Wait for more results to appear
+            prev_count = len(get_visible_listings(driver))
+            _wait_for_more_results(driver, prev_count, timeout=5.0)
+            
+            time.sleep(0.3)
+        except Exception:
+            pass
+    
+    # Final scroll to make sure everything is ready
+    try:
+        feed = _get_feed(driver)
+        if feed is not None:
+            _scroll_feed_step(driver, feed)
+            time.sleep(0.3)
+    except Exception:
+        pass
 
 
 def _wait_for_more_results(driver, prev_count: int, timeout: float = 8.0) -> bool:
@@ -593,8 +644,6 @@ def extract_business_data(driver, listing_href: str, fields: list) -> dict:
     return data
 
 
-def _extract_business_data_in_new_tab(driver, listing_href: str, fields: list) -> dict:
-    """Open the business page in a new tab, scrape it, close the tab, and return to the search feed."""
 def _extract_business_data_in_new_tab(driver, listing_href: str, fields: list, worker=None) -> dict:
     """Open the business page in a new tab, scrape it, close the tab, and return to the search feed.
 
@@ -672,15 +721,10 @@ def _extract_business_data_in_new_tab(driver, listing_href: str, fields: list, w
                 pass
 
     # Give Maps time to re-render the feed panel after focus returns to the search tab.
-    # This is critical — without this wait, the feed is stale/empty and new cards are invisible.
-    time.sleep(0.5)
-
-    # Verify the feed is actually present and visible; if not, wait a bit longer.
-    feed_check_start = time.time()
-    while time.time() - feed_check_start < 5.0:
-        if _get_feed(driver) is not None:
-            break
-        time.sleep(0.3)
+    # Use an explicit wait instead of a fixed sleep.
+    WebDriverWait(driver, 5).until(lambda d: _get_feed(d) is not None)
+    # If still not ready, fallback short sleep.
+    time.sleep(0.3)
 
     return data
 
@@ -695,18 +739,29 @@ def scrape_domain_progressive(
     """
     search_url = _search_url(domain, area)
     driver.get(search_url)
-    time.sleep(T_SEARCH_LOAD)
+    # Wait for feed to appear and ensure at least one listing is visible.
+    WebDriverWait(driver, 10).until(lambda d: _get_feed(d) is not None)
+    _wait_for_visible_listings(driver, min_count=1, timeout=6.0)
 
     feed = _get_feed(driver)
     if feed is None:
         return 0, True
 
     processed: set[str] = set()
+    retry_counts: dict[str, int] = {}
+    first_listing_skipped = False  # Track if we've skipped the first listing
+
     collected = 0
     stall_scrolls = 0
     stall_reloads = 0
-    max_stall_scrolls = 24
-    max_stall_reloads = 6
+    max_stall_scrolls = 12  # Reduced - get results faster
+    max_stall_reloads = 3   # Reduced - don't keep retrying
+
+    # No upfront warm-up scrolling. Start scraping as soon as the feed is ready.
+    loader_wait_start = time.time()
+    while _is_loading(driver) and time.time() - loader_wait_start < 2.0:
+        time.sleep(0.2)
+    time.sleep(0.15)
 
     worker.log_signal.emit(f'Scanning "{domain} in {area}"...', "active")
 
@@ -718,50 +773,45 @@ def scrape_domain_progressive(
         if max_results > 0 and collected >= max_results:
             return collected, True
 
-        hrefs = get_visible_listings(driver)
+        hrefs_snapshot = get_visible_listings(driver)
         try:
-            worker.log_signal.emit(f"Visible listings: {len(hrefs)}", "active")
+            worker.log_signal.emit(f"Visible listings: {len(hrefs_snapshot)}", "active")
         except Exception:
             pass
+
         next_href = None
-        for href in hrefs:
-            if _place_key(href) not in processed:
-                next_href = href
-                break
+        next_key = None
+        is_first_listing = True
+        for href in hrefs_snapshot:
+            key = _place_key(href)
+            if key in processed:
+                continue
+            
+            # Skip the first listing on the very first pass (as per user requirement)
+            if not first_listing_skipped and is_first_listing:
+                first_listing_skipped = True
+                is_first_listing = False
+                worker.log_signal.emit("Skipping first listing (featured result)...", "active")
+                continue
+            
+            next_href = href
+            next_key = key
+            break
 
-        if next_href:
-            stall_scrolls = 0
-            stall_reloads = 0
-            processed.add(_place_key(next_href))
-
+        if next_href and next_key is not None:
+            # Do NOT mark processed until extraction succeeds.
             worker._wait_if_paused()
             if not worker._running:
                 return collected, False
 
-            # Prefer opening each listing in a new tab for speed, but fallback
-            # to in-page navigation if tab operations fail repeatedly.
             use_tabs = getattr(worker, "use_tabs", True)
             if use_tabs:
-                if "_tab_failures" not in locals():
-                    _tab_failures = 0
                 data = _extract_business_data_in_new_tab(driver, next_href, fields, worker=worker)
-                if data.get("_error"):
-                    _tab_failures += 1
-                    try:
-                        worker.log_signal.emit(f"Tab extraction error ({_tab_failures}): {data.get('_error')}", "active")
-                    except Exception:
-                        pass
-                else:
-                    _tab_failures = 0
             else:
                 data = {"_error": "Tabs disabled"}
 
-            # If tabs failing, fallback to original navigation approach
+            # If tabs failed, fallback to in-page navigation.
             if data.get("_error") and getattr(worker, "use_tabs", True):
-                try:
-                    worker.log_signal.emit("Falling back to in-page navigation for this item", "active")
-                except Exception:
-                    pass
                 try:
                     data = extract_business_data(driver, next_href, fields)
                 except Exception as e:
@@ -771,38 +821,50 @@ def scrape_domain_progressive(
                 except Exception:
                     pass
 
-            # Always re-fetch the feed after returning from a tab or back-navigation —
-            # the previous reference is stale and scrolling with it does nothing.
+            # If extraction succeeded, mark processed and emit.
+            if not data.get("_error"):
+                data["_domain"] = domain
+                data["_area"] = area
+                if "domain" in fields:
+                    data["domain"] = domain
+
+                collected += 1
+                processed.add(next_key)
+
+                worker.result_signal.emit(data)
+                worker.progress_signal.emit(worker._progress_base + collected)
+
+                name = (data.get("name") or "Unknown")[:50]
+                worker.log_signal.emit(f"#{worker._progress_base + collected}  {name}", "done")
+
+                if max_results > 0 and collected >= max_results:
+                    return collected, True
+
+            else:
+                retry_counts[next_key] = retry_counts.get(next_key, 0) + 1
+                worker.log_signal.emit(
+                    f"Extraction failed (retry {retry_counts[next_key]}/{3}): {data.get('_error','')}",
+                    "active",
+                )
+
+            # After closing a tab/back-nav, re-warm the feed reference.
+            time.sleep(0.3)
             feed = _get_feed(driver)
             if feed is None:
-                # Feed not visible yet — wait a moment and retry before giving up
-                time.sleep(1.0)
-                feed = _get_feed(driver)
-            if feed is None:
-                worker.log_signal.emit("Feed lost after tab close; reloading search...", "active")
                 driver.get(search_url)
                 time.sleep(T_SEARCH_LOAD)
                 feed = _get_feed(driver)
 
-            data["_domain"] = domain
-            data["_area"] = area
-            if "domain" in fields:
-                data["domain"] = domain
+            # Retry policy: if a listing fails 3 times, mark it processed to prevent infinite loops.
+            if data.get("_error") and retry_counts.get(next_key, 0) >= 3:
+                processed.add(next_key)
 
-            collected += 1
-            worker.result_signal.emit(data)
-            worker.progress_signal.emit(worker._progress_base + collected)
-
-            name = (data.get("name") or "Unknown")[:50]
-            worker.log_signal.emit(f"#{worker._progress_base + collected}  {name}", "done")
-
-            if max_results > 0 and collected >= max_results:
-                return collected, True
             continue
 
         if _is_end_of_list(driver):
             return collected, True
 
+        # No unprocessed listings visible: scroll quickly to load more
         if feed is None:
             feed = _get_feed(driver)
         if feed is None:
@@ -813,61 +875,34 @@ def scrape_domain_progressive(
                 return collected, collected == 0
 
         worker.log_signal.emit("Loading more results...", "active")
-        prev_count = len(hrefs)
-        try:
-            worker.log_signal.emit(f"Attempting scroll: prev_count={prev_count}", "active")
-        except Exception:
-            pass
-        scrolled = _scroll_feed_step(driver, feed)
-        try:
-            if not scrolled:
-                worker.log_signal.emit("Scroll step failed (stale feed?)", "active")
-            elif _is_loading(driver):
-                worker.log_signal.emit("Loader detected after scroll — waiting for it to clear...", "active")
-        except Exception:
-            pass
-        if not scrolled:
-            feed = _get_feed(driver)
-            if feed is None:
-                driver.get(search_url)
-                time.sleep(T_SEARCH_LOAD)
-                feed = _get_feed(driver)
-                if feed is None:
-                    return collected, collected == 0
+        prev_count = len(hrefs_snapshot)
+        scrolled_any = False
+        loaded_more = False
+        
+        # Quick scroll cycle - 2 scrolls max, fast timeouts
+        for _ in range(2):
+            if not worker._running:
+                break
+            scrolled = _scroll_feed_step(driver, feed)
+            scrolled_any = scrolled_any or bool(scrolled)
+            
+            # Short loading wait - only 2 seconds
+            loader_wait_start = time.time()
+            while _is_loading(driver) and time.time() - loader_wait_start < 2.0:
+                time.sleep(0.2)
+            
+            # Check for new results - 2 second timeout
+            more = _wait_for_more_results(driver, prev_count, timeout=2.0)
+            if more:
+                loaded_more = True
+                break
+            
+            feed = _get_feed(driver) or feed
+            time.sleep(0.1)
 
-        # If a loader is spinning, wait up to 10 s for it to disappear before measuring growth
-        loader_wait_start = time.time()
-        while _is_loading(driver) and time.time() - loader_wait_start < 10.0:
-            time.sleep(0.3)
-        if time.time() - loader_wait_start > 1.0:
-            # Extra pause after loader clears so DOM can settle
-            time.sleep(0.4)
-
-        # Wait briefly for new results to appear after scrolling (handles loader overlays)
-        more = _wait_for_more_results(driver, prev_count, timeout=8.0)
-        if not more and scrolled:
-            # Some Maps feeds need an additional push to populate new cards.
-            second_feed = _get_feed(driver)
-            if second_feed is not None and second_feed != feed:
-                feed = second_feed
-            _scroll_feed_step(driver, feed)
-            # wait out any second loader
-            loader_wait_start2 = time.time()
-            while _is_loading(driver) and time.time() - loader_wait_start2 < 8.0:
-                time.sleep(0.3)
-            more = _wait_for_more_results(driver, prev_count, timeout=6.0)
-
-        try:
-            worker.log_signal.emit(f"More results appeared? {more}", "active")
-            worker.log_signal.emit(f"Currently visible: {len(get_visible_listings(driver))}", "active")
-        except Exception:
-            pass
-        if more:
+        if loaded_more:
             stall_scrolls = 0
             stall_reloads = 0
-            # refresh visible listings and try to pick the next one
-            hrefs = get_visible_listings(driver)
-            continue
         else:
             stall_scrolls += 1
 
@@ -886,6 +921,7 @@ def scrape_domain_progressive(
                 return collected, True
 
     return collected, False
+
 
 
 class ScrapeWorker(QThread):
