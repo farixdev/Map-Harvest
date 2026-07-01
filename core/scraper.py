@@ -644,87 +644,98 @@ def extract_business_data(driver, listing_href: str, fields: list) -> dict:
     return data
 
 
-def _extract_business_data_in_new_tab(driver, listing_href: str, fields: list, worker=None) -> dict:
-    """Open the business page in a new tab, scrape it, close the tab, and return to the search feed.
-
-    If `worker` is provided it will be used to emit log messages for diagnostics.
-    """
-    original_handle = driver.current_window_handle
-    before_handles = set(driver.window_handles)
-    driver.execute_script("window.open(arguments[0], '_blank');", listing_href)
-
-    new_handle = None
-    start = time.time()
-    while time.time() - start < 5:
-        handles = driver.window_handles
-        new_handles = [h for h in handles if h not in before_handles]
-        if new_handles:
-            new_handle = new_handles[0]
-            break
-        time.sleep(0.1)
-
-    if new_handle is None:
-        new_handles = [h for h in driver.window_handles if h != original_handle]
-        if new_handles:
-            new_handle = new_handles[0]
-
-    if new_handle is None:
-        if worker is not None:
-            try:
-                worker.log_signal.emit("Unable to open business in new tab", "active")
-            except Exception:
-                pass
-        return {"_error": "Unable to open business in new tab"}
-
+def _click_listing(driver, href: str) -> bool:
+    """Click the visible anchor for this href instead of opening it in a new tab.
+    Falls back to href match by data-place-id/text if the exact anchor moved."""
     try:
-        driver.switch_to.window(new_handle)
-    except Exception:
-        if worker is not None:
+        anchors = driver.find_elements(By.CSS_SELECTOR, ", ".join(_listing_selectors()))
+        for a in anchors:
             try:
-                worker.log_signal.emit("Failed to switch to new tab", "active")
-            except Exception:
-                pass
-        return {"_error": "Failed to switch to new tab"}
-
-    if worker is not None:
-        try:
-            worker.log_signal.emit("Opened business in new tab", "active")
-        except Exception:
-            pass
-
-    data = extract_business_data(driver, listing_href, fields)
-
-    try:
-        driver.close()
+                if a.get_attribute("href") == href:
+                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", a)
+                    driver.execute_script("arguments[0].click();", a)
+                    return True
+            except StaleElementReferenceException:
+                continue
     except Exception:
         pass
+    return False
 
-    switched_back = False
+
+def _extract_business_data_in_panel(driver, listing_href: str, fields: list, worker=None) -> dict:
+    """Click the card -> panel opens in same tab (SPA nav, fast) -> extract -> click Back."""
+    if not _click_listing(driver, listing_href):
+        return {"_error": "Could not click listing"}
+
     try:
-        driver.switch_to.window(original_handle)
-        switched_back = True
-    except Exception:
-        # If switching back fails, try any remaining handle
-        remaining = [h for h in driver.window_handles if h != new_handle]
-        if remaining:
+        WebDriverWait(driver, 6).until(EC.presence_of_element_located((
+            By.CSS_SELECTOR,
+            "h1.DUwDvf, h1.fontHeadlineLarge, h1[class*='fontHeadline']",
+        )))
+        time.sleep(T_DETAIL_LOAD)
+        data = {f: "" for f in fields}
+
+        if "name" in fields:
+            data["name"] = _first_text(
+                driver, "h1.DUwDvf, h1.fontHeadlineLarge, h1[class*='fontHeadline']",
+            )
+        if "category" in fields:
+            data["category"] = _extract_category(driver)
+        if "rating" in fields or "review_count" in fields:
+            rating, count = _extract_rating_and_count(driver)
+            if "rating" in fields:
+                data["rating"] = rating
+            if "review_count" in fields:
+                data["review_count"] = count
+        if "hours" in fields:
+            data["hours"] = _extract_hours(driver)
+        if "address" in fields:
+            data["address"] = _first_text(
+                driver,
+                "button[data-item-id='address'] div.Io6YTe, button[data-tooltip='Copy address'] .Io6YTe",
+            )
+        if "website" in fields:
+            data["website"] = _first_attr(
+                driver, "a[data-item-id='authority'], a[aria-label*='website']", "href"
+            )
+        if "phone" in fields:
+            data["phone"] = _first_text(
+                driver,
+                "button[data-item-id^='phone'] .Io6YTe, button[data-tooltip='Copy phone number'] .Io6YTe",
+            )
+            if not data["phone"]:
+                tel = _first_attr(driver, "a[href^='tel:']", "href")
+                data["phone"] = tel.replace("tel:", "") if tel else ""
+        if "maps_link" in fields:
+            data["maps_link"] = driver.current_url.split("?")[0]
+        if any(f in fields for f in ("review_1", "review_2", "review_3")):
+            reviews = _extract_reviews(driver, count=3)
+            for i, key in enumerate(("review_1", "review_2", "review_3")):
+                if key in fields:
+                    data[key] = reviews[i] if i < len(reviews) else ""
+
+    except Exception as e:
+        return {"_error": str(e)}
+    finally:
+        # go back to the feed WITHOUT losing scroll position (this is the whole point)
+        clicked_back = False
+        for sel in ('button[aria-label="Back"]', 'button[jsaction*="pane.backSection"]'):
             try:
-                driver.switch_to.window(remaining[0])
-                switched_back = True
+                btn = driver.find_element(By.CSS_SELECTOR, sel)
+                driver.execute_script("arguments[0].click();", btn)
+                clicked_back = True
+                break
+            except Exception:
+                continue
+        if not clicked_back:
+            try:
+                driver.back()
             except Exception:
                 pass
-
-    if not switched_back:
-        if worker is not None:
-            try:
-                worker.log_signal.emit("Failed to switch back to search tab", "active")
-            except Exception:
-                pass
-
-    # Give Maps time to re-render the feed panel after focus returns to the search tab.
-    # Use an explicit wait instead of a fixed sleep.
-    WebDriverWait(driver, 5).until(lambda d: _get_feed(d) is not None)
-    # If still not ready, fallback short sleep.
-    time.sleep(0.3)
+        try:
+            WebDriverWait(driver, 5).until(lambda d: _get_feed(d) is not None)
+        except Exception:
+            pass
 
     return data
 
@@ -732,14 +743,8 @@ def _extract_business_data_in_new_tab(driver, listing_href: str, fields: list, w
 def scrape_domain_progressive(
     driver, domain: str, area: str, fields: list, worker, max_results: int = 0,
 ) -> tuple[int, bool]:
-    """
-    Open cards one-by-one from the visible feed, extract, return to list, scroll for more.
-    max_results: stop after this many listings for this domain pass (0 = no limit).
-    Returns (count, completed). completed is True when the limit was hit or Maps has no more results.
-    """
     search_url = _search_url(domain, area)
     driver.get(search_url)
-    # Wait for feed to appear and ensure at least one listing is visible.
     WebDriverWait(driver, 10).until(lambda d: _get_feed(d) is not None)
     _wait_for_visible_listings(driver, min_count=1, timeout=6.0)
 
@@ -749,15 +754,18 @@ def scrape_domain_progressive(
 
     processed: set[str] = set()
     retry_counts: dict[str, int] = {}
-    first_listing_skipped = False  # Track if we've skipped the first listing
+    first_listing_skipped = False
 
     collected = 0
     stall_scrolls = 0
     stall_reloads = 0
-    max_stall_scrolls = 12  # Reduced - get results faster
-    max_stall_reloads = 3   # Reduced - don't keep retrying
+    max_stall_scrolls = 12
+    max_stall_reloads = 3
 
-    # No upfront warm-up scrolling. Start scraping as soon as the feed is ready.
+    # NEW: absolute watchdog — no growth in place-count for this long -> bail out
+    last_growth_time = time.time()
+    no_growth_timeout = 45.0  # seconds
+
     loader_wait_start = time.time()
     while _is_loading(driver) and time.time() - loader_wait_start < 2.0:
         time.sleep(0.2)
@@ -773,11 +781,15 @@ def scrape_domain_progressive(
         if max_results > 0 and collected >= max_results:
             return collected, True
 
+        # NEW: hard exit if truly stuck
+        if time.time() - last_growth_time > no_growth_timeout:
+            worker.log_signal.emit(
+                f'"{domain}" — no new results for {no_growth_timeout:.0f}s, stopping this domain.',
+                "done",
+            )
+            return collected, True
+
         hrefs_snapshot = get_visible_listings(driver)
-        try:
-            worker.log_signal.emit(f"Visible listings: {len(hrefs_snapshot)}", "active")
-        except Exception:
-            pass
 
         next_href = None
         next_key = None
@@ -786,87 +798,52 @@ def scrape_domain_progressive(
             key = _place_key(href)
             if key in processed:
                 continue
-            
-            # Skip the first listing on the very first pass (as per user requirement)
             if not first_listing_skipped and is_first_listing:
                 first_listing_skipped = True
                 is_first_listing = False
                 worker.log_signal.emit("Skipping first listing (featured result)...", "active")
                 continue
-            
             next_href = href
             next_key = key
             break
 
         if next_href and next_key is not None:
-            # Do NOT mark processed until extraction succeeds.
+            last_growth_time = time.time()   # NEW: reset watchdog on real progress
             worker._wait_if_paused()
             if not worker._running:
                 return collected, False
 
-            use_tabs = getattr(worker, "use_tabs", True)
-            if use_tabs:
-                data = _extract_business_data_in_new_tab(driver, next_href, fields, worker=worker)
-            else:
-                data = {"_error": "Tabs disabled"}
+            data = _extract_business_data_in_panel(driver, next_href, fields, worker=worker)
 
-            # If tabs failed, fallback to in-page navigation.
-            if data.get("_error") and getattr(worker, "use_tabs", True):
-                try:
-                    data = extract_business_data(driver, next_href, fields)
-                except Exception as e:
-                    data = {"_error": str(e)}
-                try:
-                    _return_to_results(driver, search_url)
-                except Exception:
-                    pass
-
-            # If extraction succeeded, mark processed and emit.
             if not data.get("_error"):
                 data["_domain"] = domain
                 data["_area"] = area
                 if "domain" in fields:
                     data["domain"] = domain
-
                 collected += 1
                 processed.add(next_key)
-
                 worker.result_signal.emit(data)
                 worker.progress_signal.emit(worker._progress_base + collected)
-
                 name = (data.get("name") or "Unknown")[:50]
                 worker.log_signal.emit(f"#{worker._progress_base + collected}  {name}", "done")
-
                 if max_results > 0 and collected >= max_results:
                     return collected, True
-
             else:
                 retry_counts[next_key] = retry_counts.get(next_key, 0) + 1
                 worker.log_signal.emit(
-                    f"Extraction failed (retry {retry_counts[next_key]}/{3}): {data.get('_error','')}",
+                    f"Extraction failed (retry {retry_counts[next_key]}/3): {data.get('_error','')}",
                     "active",
                 )
-
-            # After closing a tab/back-nav, re-warm the feed reference.
-            time.sleep(0.3)
-            feed = _get_feed(driver)
-            if feed is None:
-                driver.get(search_url)
-                time.sleep(T_SEARCH_LOAD)
-                feed = _get_feed(driver)
-
-            # Retry policy: if a listing fails 3 times, mark it processed to prevent infinite loops.
-            if data.get("_error") and retry_counts.get(next_key, 0) >= 3:
-                processed.add(next_key)
+                if retry_counts[next_key] >= 3:
+                    processed.add(next_key)
 
             continue
 
         if _is_end_of_list(driver):
             return collected, True
 
-        # No unprocessed listings visible: scroll quickly to load more
-        if feed is None:
-            feed = _get_feed(driver)
+        # scroll for more
+        feed = _get_feed(driver) or feed
         if feed is None:
             driver.get(search_url)
             time.sleep(T_SEARCH_LOAD)
@@ -876,27 +853,19 @@ def scrape_domain_progressive(
 
         worker.log_signal.emit("Loading more results...", "active")
         prev_count = len(hrefs_snapshot)
-        scrolled_any = False
         loaded_more = False
-        
-        # Quick scroll cycle - 2 scrolls max, fast timeouts
+
         for _ in range(2):
             if not worker._running:
                 break
-            scrolled = _scroll_feed_step(driver, feed)
-            scrolled_any = scrolled_any or bool(scrolled)
-            
-            # Short loading wait - only 2 seconds
+            _scroll_feed_step(driver, feed)
             loader_wait_start = time.time()
             while _is_loading(driver) and time.time() - loader_wait_start < 2.0:
                 time.sleep(0.2)
-            
-            # Check for new results - 2 second timeout
-            more = _wait_for_more_results(driver, prev_count, timeout=2.0)
-            if more:
+            if _wait_for_more_results(driver, prev_count, timeout=2.0):
                 loaded_more = True
+                last_growth_time = time.time()  # NEW
                 break
-            
             feed = _get_feed(driver) or feed
             time.sleep(0.1)
 
@@ -917,11 +886,15 @@ def scrape_domain_progressive(
                 feed = _get_feed(driver)
                 if feed is None:
                     continue
-            elif _is_end_of_list(driver):
+            else:
+                # NEW: give up on this domain instead of looping forever
+                worker.log_signal.emit(
+                    f'"{domain}" — stuck after {max_stall_reloads} reloads, moving on with {collected} results.',
+                    "done",
+                )
                 return collected, True
 
     return collected, False
-
 
 
 class ScrapeWorker(QThread):
