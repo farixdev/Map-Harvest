@@ -167,17 +167,23 @@ def _find_last_listing(feed):
 
 def _scroll_feed_step(driver, feed) -> bool:
     try:
-        driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight;", feed)
+        # Dispatch a genuine wheel event so Maps' lazy-load listener actually fires,
+        # instead of relying only on scrollTop jumps which Maps often ignores.
+        driver.execute_script("""
+            const el = arguments[0];
+            el.scrollTop = el.scrollTop + el.clientHeight * 0.85;
+            el.dispatchEvent(new WheelEvent('wheel', {
+                deltaY: 800, bubbles: true, cancelable: true
+            }));
+        """, feed)
+
         last_listing = _find_last_listing(feed)
         if last_listing is not None:
             driver.execute_script(
                 "arguments[0].scrollIntoView({behavior:'auto', block:'end'});",
                 last_listing,
             )
-        else:
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        # Short, explicit wait for loading.
-        time.sleep(0.2)
+        time.sleep(0.25)
         return True
     except (StaleElementReferenceException, Exception):
         return False
@@ -791,21 +797,17 @@ def scrape_domain_progressive(
 
         hrefs_snapshot = get_visible_listings(driver)
 
-        next_href = None
-        next_key = None
-        is_first_listing = True
-        for href in hrefs_snapshot:
-            key = _place_key(href)
-            if key in processed:
-                continue
-            if not first_listing_skipped and is_first_listing:
-                first_listing_skipped = True
-                is_first_listing = False
-                worker.log_signal.emit("Skipping first listing (featured result)...", "active")
-                continue
-            next_href = href
-            next_key = key
-            break
+        candidates = [h for h in hrefs_snapshot if _place_key(h) not in processed]
+
+        # Only skip the first listing as "featured" if there's at least one
+        # more candidate behind it — never throw away the only result.
+        if not first_listing_skipped and len(candidates) > 1:
+            first_listing_skipped = True
+            candidates.pop(0)
+            worker.log_signal.emit("Skipping first listing (featured result)...", "active")
+
+        next_href = candidates[0] if candidates else None
+        next_key = _place_key(next_href) if next_href else None
 
         if next_href and next_key is not None:
             last_growth_time = time.time()   # NEW: reset watchdog on real progress
