@@ -219,26 +219,67 @@ def _feed_html(driver) -> str:
         return ""
 
 
-def _scroll_feed_step(driver, feed) -> None:
-    """Nudge the feed so Maps' lazy-load fires, then wait for it to settle."""
+# Resolves the scrollable results container in-page: the role="feed" div, with
+# the same aria-label fallbacks _get_feed() uses.
+_JS_FEED = (
+    "function feedEl(){return document.querySelector('div[role=\"feed\"]')"
+    "||document.querySelector('div[aria-label^=\"Results for\"]')"
+    "||document.querySelector('div[aria-label*=\"Search results\"]');}"
+)
+
+
+def _feed_card_count(driver) -> int:
+    """Cheap count of place links currently in the feed (for growth detection)."""
+    try:
+        return int(driver.execute_script(
+            _JS_FEED + "const f=feedEl();"
+            "return f?f.querySelectorAll('a[href*=\"/maps/place\"]').length:0;"
+        ) or 0)
+    except Exception:
+        return 0
+
+
+def _nudge_feed(driver) -> None:
+    """Fire Maps' lazy-load on the results feed.
+
+    The dispatched WheelEvent is what actually triggers loading — a bare
+    ``scrollTop`` change is ignored by Maps, and ``scrollIntoView`` fights the
+    scroll position and stalls pagination. Target the feed container directly;
+    the "div with the most links" heuristic latches onto an inner wrapper once
+    results load and freezes.
+    """
     try:
         driver.execute_script(
+            _JS_FEED +
             """
-            const el = arguments[0];
-            el.scrollTop = el.scrollTop + el.clientHeight * 0.9;
-            el.dispatchEvent(new WheelEvent('wheel', {deltaY: 1000, bubbles: true}));
-            const links = el.querySelectorAll('a[href*="/maps/place"]');
-            if (links.length) links[links.length - 1].scrollIntoView({block: 'end'});
-            """,
-            feed,
+            const f = feedEl();
+            if (f) {
+                f.scrollTop = f.scrollHeight;
+                f.dispatchEvent(new WheelEvent('wheel',
+                    {deltaY: 1500, bubbles: true, cancelable: true}));
+            }
+            """
         )
     except Exception:
         pass
 
+
+def _scroll_for_more(driver, timeout: float = 5.0) -> bool:
+    """Scroll the feed and wait for new cards to load; True if the feed grew.
+
+    Maps often needs repeated wheel events, so we keep nudging while waiting.
+    """
+    before = _feed_card_count(driver)
+    _nudge_feed(driver)
     start = time.time()
-    while _is_loading(driver) and time.time() - start < 6.0:
-        time.sleep(0.25)
-    time.sleep(T_AFTER_SCROLL)
+    while time.time() - start < timeout:
+        time.sleep(0.4)
+        if _feed_card_count(driver) > before:
+            return True
+        if _is_end_of_list(driver):
+            return False
+        _nudge_feed(driver)
+    return _feed_card_count(driver) > before
 
 
 # ── Detail-page extraction (only used when Hours/Reviews are requested) ───────
@@ -536,9 +577,9 @@ def scrape_domain_progressive(
     worker.log_signal.emit(f'Scanning "{domain} in {area}"...', "active")
 
     stall = 0
-    max_stall = 8
+    max_stall = 6
     last_growth = time.time()
-    no_growth_timeout = 90
+    no_growth_timeout = 120
     ended = False
 
     while worker._running and len(collected) < target:
@@ -586,12 +627,11 @@ def scrape_domain_progressive(
             ended = True
             break
 
-        feed = _get_feed(driver)
-        if feed is None:
+        if _get_feed(driver) is None:
             driver.get(search_url)
             time.sleep(T_SEARCH_LOAD)
             continue
-        _scroll_feed_step(driver, feed)
+        _scroll_for_more(driver)
 
     if len(collected) == 0:
         _debug_dump(driver, f"noresults_{domain}")
