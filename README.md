@@ -27,11 +27,14 @@ MapHarvest automates Google Maps business data extraction from your desktop. Sea
 
 ### 🔍 Scraping
 - Search by **business type** and **location**
+- **Card-first extraction** — most fields (name, rating, category, address, phone, website, coordinates, Place ID) are read straight from the results feed in a single pass, with **no page load per business**. This is dramatically faster and more reliable than opening every listing.
+- **Automatic detail fallback** — when the feed card omits a requested field (some categories hide phone/website), and only then, that one listing is opened to fill it. You never pay for navigation you don't need.
 - **Multi-domain mode** — scrape several categories in one session
 - **Configurable fields** — choose exactly which data points to collect
 - **Max results slider** — cap how many businesses are collected per run
 - **Pause / Resume** — freeze mid-scrape without losing progress
-- **Sponsored listings skipped** automatically
+- **Sponsored / ad listings skipped** automatically (detected, not guessed)
+- **Dedup by Place ID** — the same business is never collected twice
 - Progressive scrolling — loads more results until the limit or end of list
 
 ### 📊 Data & Export
@@ -60,8 +63,13 @@ MapHarvest automates Google Maps business data extraction from your desktop. Sea
 | Website | Website | Business website URL |
 | Phone Number | Phone | Contact number |
 | Maps Link | Maps Link | Direct Google Maps URL |
-| Review 1–3 | Review 1–3 | Sample review snippets (author, rating, date, text) |
+| Latitude | Latitude | Location latitude (from the place URL) |
+| Longitude | Longitude | Location longitude (from the place URL) |
+| Place ID | Place ID | Stable Google Place ID — ideal for de-duping / joining with the Places API |
+| Review 1–3 | Review 1–3 | Sample review snippets (author, rating, date, text) — *opens each listing, slower* |
 | Search Domain | Search Domain | Auto-added when using multiple domains |
+
+> **Fast vs. detailed fields.** Everything except **Hours** and **Reviews** comes from the results feed with no per-listing navigation. Hours and Reviews (and phone/website for the minority of categories that hide them in the card) require opening each listing, so leave them unticked for the fastest runs. Hours and Reviews are **off by default**.
 
 ---
 
@@ -150,10 +158,14 @@ Map Harvest/
 │   └── domain_list_dialog.py     # Dialog for multi-domain input
 │
 ├── core/
-│   ├── scraper.py                # Selenium scraper, browser driver, QThread worker
+│   ├── parse.py                  # Pure feed/URL parsing (no browser) — the extraction core
+│   ├── scraper.py                # Selenium orchestration, browser driver, QThread worker
 │   ├── exporter.py               # CSV export logic and field labels
 │   ├── settings.py               # Load/save user settings and recent searches
 │   └── distutils_compat.py       # Python 3.12+ compatibility shim
+│
+├── tests/
+│   └── test_parse.py             # Offline parser tests against a captured feed
 │
 └── README.md
 ```
@@ -162,13 +174,15 @@ Map Harvest/
 
 ## ⚙️ How It Works
 
-1. **Search** — Opens `https://www.google.com/maps/search/{domain}+in+{area}` in Chrome
-2. **Collect links** — Reads place URLs from the results feed, skipping sponsored entries
-3. **Extract** — Opens each place page, reads selected fields from the DOM, returns to the list
-4. **Scroll** — Scrolls the feed to load more results until the max limit or end of list
-5. **Export** — Optional CSV export from the in-memory results list
+1. **Search** — Opens `https://www.google.com/maps/search/{domain}+in+{area}?hl=en` in Chrome and clicks through any cookie/consent wall
+2. **Scroll & parse** — Scrolls the results feed and parses **every card in one pass** (`core/parse.py`): name, rating, category, address, phone, website — plus coordinates and Place ID decoded from each place URL. Sponsored/ad cards are detected and skipped; businesses are de-duplicated by Place ID
+3. **Stream** — Complete rows are emitted to the live table as they're found
+4. **Detail fallback** — *Only* for rows still missing a requested field (Hours, Reviews, or phone/website when a card hides them), the individual listing is opened and the gap is filled
+5. **Export** — Automatic CSV export per domain to your chosen folder
 
-Scraping runs on a background `QThread` so the UI stays fully responsive. Pause uses a thread event; resume continues from the same browser session.
+Because the common lead-gen fields come straight from the feed, a typical run does **zero** per-listing page loads — the slow path is used only when Google genuinely withholds the data from the card.
+
+Scraping runs on a background `QThread` so the UI stays responsive. Pause uses a thread event; resume continues from the same browser session. The parser is a pure, browser-free module (`core/parse.py`) with offline tests (`tests/test_parse.py`), so extraction can be verified without launching Chrome.
 
 ---
 
@@ -179,6 +193,7 @@ Scraping runs on a background `QThread` so the UI stays fully responsive. Pause 
 | UI | PyQt5 |
 | Browser Automation | Selenium |
 | Bot Detection Bypass | undetected-chromedriver |
+| Feed / URL parsing | lxml (fast, browser-free) |
 | Threading | QThread + pyqtSignal |
 | Export | Python `csv` (built-in) |
 | Config | JSON (`~/.mapharvest/settings.json`) |

@@ -1,4 +1,5 @@
 PyQt5>=5.15.0
 selenium>=4.18.0
 undetected-chromedriver>=3.5.0
+lxml>=5.0.0
 

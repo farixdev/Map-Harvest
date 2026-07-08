@@ -20,13 +20,20 @@ class InputScreen(QWidget):
     FIELD_KEYS = [
         "name", "category", "rating", "review_count", "hours",
         "address", "website", "phone", "maps_link",
+        "latitude", "longitude", "place_id",
         "review_1", "review_2", "review_3",
     ]
     FIELD_NAMES = [
         "Business Name", "Category", "Rating", "Review Count", "Hours",
         "Address", "Website", "Phone Number", "Maps Link",
+        "Latitude", "Longitude", "Place ID",
         "Review 1", "Review 2", "Review 3",
     ]
+
+    # Hours and Reviews require opening each listing's page (slower). Everything
+    # else is read straight from the results feed, so leave the slow ones off by
+    # default to keep scrapes fast.
+    DEFAULT_OFF_FIELDS = {"hours", "review_1", "review_2", "review_3"}
 
     def __init__(self):
         super().__init__()
@@ -180,10 +187,20 @@ class InputScreen(QWidget):
         fields_grid.setColumnStretch(1, 1)
         for i, (key, name) in enumerate(zip(self.FIELD_KEYS, self.FIELD_NAMES)):
             cb = QCheckBox(name)
-            cb.setChecked(True)
+            cb.setChecked(key not in self.DEFAULT_OFF_FIELDS)
+            if key in self.DEFAULT_OFF_FIELDS:
+                cb.setToolTip("Opens each listing's page — noticeably slower")
             self.checkboxes[key] = cb
             fields_grid.addWidget(cb, i // 2, i % 2)
         right.addLayout(fields_grid)
+        right.addSpacing(10)
+        fields_hint = QLabel(
+            "Hours and Reviews open each listing individually and are much "
+            "slower. Everything else is read directly from the results feed."
+        )
+        fields_hint.setObjectName("hint")
+        fields_hint.setWordWrap(True)
+        right.addWidget(fields_hint)
         right.addStretch(1)
 
         self.start_btn = QPushButton("Start Scraping")
