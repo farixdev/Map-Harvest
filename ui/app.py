@@ -382,6 +382,60 @@ QPushButton#start_btn:disabled {
     background-color: #3A3A3C;
     color: #636366;
 }
+
+QLineEdit#search_box {
+    padding: 4px 10px;
+    font-size: 12px;
+    border-radius: 6px;
+}
+
+QComboBox {
+    background-color: #2C2C2E;
+    border: 1px solid #3A3A3C;
+    border-radius: 6px;
+    padding: 5px 10px;
+    color: #E5E5E7;
+}
+
+QComboBox:hover { border-color: #636366; }
+QComboBox QAbstractItemView {
+    background-color: #2C2C2E;
+    color: #E5E5E7;
+    selection-background-color: #3A3A3C;
+    border: 1px solid #48484A;
+    outline: none;
+}
+
+QDoubleSpinBox#spin {
+    background-color: #2C2C2E;
+    border: 1px solid #3A3A3C;
+    border-radius: 6px;
+    padding: 4px 8px;
+    color: #E5E5E7;
+}
+
+QMenu {
+    background-color: #2C2C2E;
+    border: 1px solid #48484A;
+    border-radius: 8px;
+    padding: 4px;
+    color: #E5E5E7;
+}
+
+QMenu::item {
+    padding: 6px 18px;
+    border-radius: 4px;
+}
+
+QMenu::item:selected {
+    background-color: #3A3A3C;
+}
+
+QMenu::separator {
+    height: 1px;
+    background: #3A3A3C;
+    margin: 4px 6px;
+}
 """
 
 
@@ -414,11 +468,12 @@ class MainWindow(QMainWindow):
         self.results_screen.stop_signal.connect(self.on_stop)
         self.results_screen.home_signal.connect(self.on_home)
 
-    def on_start(self, domains, area, fields, headless=False, max_results=50, export_dir=""):
+    def on_start(self, domains, areas, fields, headless=False, max_results=50,
+                 export_dir="", filters=None):
         self.results_screen.setup(
-            domains, area, fields, headless, max_results, export_dir,
+            domains, areas, fields, headless, max_results, export_dir, filters or {},
         )
-        self.setFixedSize(QSize(960, 720))
+        self.setFixedSize(QSize(1040, 740))
         self.stack.setCurrentIndex(1)
         self.results_screen.start_worker()
 

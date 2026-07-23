@@ -30,6 +30,8 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 from core.parse import parse_feed_html, parse_place_url, place_key
+from core.enrich import enrich_website, ENRICH_KEYS
+from core import filters as recfilters
 
 # ── Timing (seconds) ─────────────────────────────────────────────────────────
 T_SEARCH_LOAD = 2.0
@@ -40,6 +42,8 @@ T_AFTER_SCROLL = 0.5
 DETAIL_ONLY_FIELDS = ("hours", "review_1", "review_2", "review_3")
 # Card-derived fields that a detail visit can improve when one happens anyway.
 UPGRADEABLE_FIELDS = ("address", "category", "rating", "review_count")
+# Fields that require fetching the business website (HTTP, not the browser).
+ENRICH_FIELDS = tuple(ENRICH_KEYS)
 
 
 # ── Chrome / driver ──────────────────────────────────────────────────────────
@@ -500,6 +504,8 @@ def _card_to_record(card: dict, fields: list, domain: str, area: str) -> dict:
     record["_href"] = card.get("_href", "")
     if "domain" in fields:
         record["domain"] = domain
+    if "area" in fields:
+        record["area"] = area
     return record
 
 
@@ -514,11 +520,42 @@ def _debug_dump(driver, tag: str) -> None:
         print("debug dump failed:", e)
 
 
-# ── Main per-domain scrape ───────────────────────────────────────────────────
+# ── Main per-(domain, area) scrape ───────────────────────────────────────────
+def _detail_wants(card: dict, fields: list, spec: dict) -> list:
+    """Which detail-page fields to fetch for this card (empty = no detail visit)."""
+    want = [f for f in fields if f in DETAIL_ONLY_FIELDS]
+    if ("phone" in fields or recfilters.needs_phone(spec)) and not card.get("phone"):
+        want.append("phone")
+    # We need the website URL to enrich (email/socials), even if the user didn't
+    # ask for the Website column itself.
+    enrich_needed = any(f in fields for f in ENRICH_FIELDS) or recfilters.needs_email(spec)
+    if ("website" in fields or enrich_needed) and not card.get("website"):
+        want.append("website")
+    if ("review_count" in fields or recfilters.needs_reviews(spec)) and not card.get("review_count"):
+        want.append("review_count")
+    if "rating" in fields and not card.get("rating"):
+        want.append("rating")
+    # Opportunistically upgrade address/category if a visit is already happening.
+    if want:
+        for f in ("address", "category"):
+            if f in fields:
+                want.append(f)
+    return list(dict.fromkeys(want))
+
+
+def _enrich_wants(card: dict, fields: list, spec: dict) -> list:
+    want = [f for f in fields if f in ENRICH_FIELDS]
+    if recfilters.needs_email(spec) and "email" not in want:
+        want.append("email")
+    return want if card.get("website") else []
+
+
 def scrape_domain_progressive(
-    driver, domain: str, area: str, fields: list, worker, max_results: int = 0,
+    driver, domain: str, area: str, fields: list, worker,
+    max_results: int = 0, filters: dict = None,
 ) -> tuple:
-    """Scrape one domain. Returns (collected_count, completed_naturally)."""
+    """Scrape one (domain, area). Returns (matched_count, completed_naturally)."""
+    spec = recfilters.normalize_spec(filters)
     search_url = _search_url(domain, area)
     driver.get(search_url)
     time.sleep(1.0)
@@ -534,45 +571,52 @@ def scrape_domain_progressive(
 
     reason = _page_blocked_reason(driver)
     if reason:
-        _debug_dump(driver, f"blocked_{domain}")
-        worker.log_signal.emit(f'"{domain}" — {reason} See debug/ folder.', "done")
+        _debug_dump(driver, f"blocked_{domain}_{area}")
+        worker.log_signal.emit(f'"{domain} in {area}" — {reason} See debug/ folder.', "done")
         return 0, True
 
     try:
         WebDriverWait(driver, 12).until(lambda d: _get_feed(d) is not None)
     except Exception:
         reason = _page_blocked_reason(driver)
-        _debug_dump(driver, f"nofeed_{domain}")
+        _debug_dump(driver, f"nofeed_{domain}_{area}")
         msg = reason or (
             "no results feed appeared. Saved debug/nofeed_*.png and .html — "
             "check what Chrome actually loaded."
         )
-        worker.log_signal.emit(f'"{domain}" — {msg}', "done")
+        worker.log_signal.emit(f'"{domain} in {area}" — {msg}', "done")
         return 0, True
 
-    # Hours/Reviews always need a detail page. Phone/Website need one only when
-    # the card omits them (common for cafes/restaurants, rare for services).
-    forced_detail = [f for f in fields if f in DETAIL_ONLY_FIELDS]
-    fallback_fields = [f for f in ("phone", "website") if f in fields]
     target = max_results if max_results > 0 else 10 ** 9
+    # Filters that can only be decided after a detail visit / enrichment mean we
+    # may reject some candidates, so over-collect to still reach the target.
+    strict = (recfilters.needs_phone(spec) or recfilters.needs_email(spec)
+              or recfilters.needs_reviews(spec))
+    collect_cap = target if not strict else min(target * 4, target + 300)
 
-    collected = []      # every unique non-sponsored record: (record, href)
-    pending = []        # records still needing a detail-page visit
     seen = set()
+    pending = []        # (card, href) that still need a Maps detail visit
+    matched = 0
     emitted = 0
+    enrich_active = bool([f for f in fields if f in ENRICH_FIELDS]) or recfilters.needs_email(spec)
 
-    def emit(record: dict) -> None:
+    def emit(card: dict) -> None:
         nonlocal emitted
         emitted += 1
+        record = _card_to_record(card, fields, domain, area)
         worker.result_signal.emit(record)
         worker.progress_signal.emit(worker._progress_base + emitted)
-        name = (record.get("name") or "Unknown")[:50]
+        name = (card.get("name") or "Unknown")[:50]
         worker.log_signal.emit(f"#{worker._progress_base + emitted}  {name}", "done")
 
-    def needs_detail(record: dict) -> bool:
-        if forced_detail:
-            return True
-        return any(not record.get(f) for f in fallback_fields)
+    def do_enrich(card: dict) -> None:
+        want = _enrich_wants(card, fields, spec)
+        if not want:
+            return
+        contacts = enrich_website(card.get("website", ""), fields=tuple(want))
+        for k, v in contacts.items():
+            if v:
+                card[k] = v
 
     worker.log_signal.emit(f'Scanning "{domain} in {area}"...', "active")
 
@@ -582,10 +626,10 @@ def scrape_domain_progressive(
     no_growth_timeout = 120
     ended = False
 
-    while worker._running and len(collected) < target:
+    while worker._running and matched < target and (matched + len(pending)) < collect_cap:
         worker._wait_if_paused()
         if not worker._running:
-            return len(collected), False
+            return matched, False
 
         cards = parse_feed_html(_feed_html(driver))
         new_this_round = 0
@@ -596,33 +640,45 @@ def scrape_domain_progressive(
             if not key or key in seen:
                 continue
             seen.add(key)
-            record = _card_to_record(card, fields, domain, area)
-            href = card.get("_href", "")
-            collected.append((record, href))
             new_this_round += 1
-            if needs_detail(record):
-                pending.append((record, href))
+
+            if not recfilters.cheap_pass(card, spec):
+                continue  # rejected on card-level data; no further work
+
+            if _detail_wants(card, fields, spec):
+                pending.append((card, card.get("_href", "")))
             else:
-                emit(record)  # card is complete — stream it live
-            if len(collected) >= target:
+                # No Maps detail needed — enrich (HTTP, safe) then decide now.
+                # Enrichment can take seconds per card, so honour Pause/Stop here
+                # rather than making the user wait out the whole batch.
+                worker._wait_if_paused()
+                if not worker._running:
+                    break
+                if enrich_active:
+                    do_enrich(card)
+                if recfilters.full_pass(card, spec):
+                    emit(card)
+                    matched += 1
+            if matched >= target or (matched + len(pending)) >= collect_cap:
                 break
 
-        if len(collected) >= target:
+        if not worker._running:
+            return matched, False
+        if matched >= target or (matched + len(pending)) >= collect_cap:
             break
 
         if new_this_round:
             last_growth = time.time()
             stall = 0
-        elif collected:
-            stall += 1
-            worker.log_signal.emit(f'Found {len(collected)} businesses so far...', "active")
         else:
             stall += 1
+            if seen:
+                worker.log_signal.emit(
+                    f'Scanned {len(seen)}, matched {matched} so far...', "active")
 
         if _is_end_of_list(driver) and new_this_round == 0:
             ended = True
             break
-
         if stall >= max_stall or time.time() - last_growth > no_growth_timeout:
             ended = True
             break
@@ -633,39 +689,46 @@ def scrape_domain_progressive(
             continue
         _scroll_for_more(driver)
 
-    if len(collected) == 0:
-        _debug_dump(driver, f"noresults_{domain}")
+    if not seen:
+        _debug_dump(driver, f"noresults_{domain}_{area}")
         worker.log_signal.emit(
-            f'"{domain}" — no listings found in the results feed. See debug/ folder.', "done",
+            f'"{domain} in {area}" — no listings found in the results feed. '
+            f'See debug/ folder.', "done",
         )
         return 0, True
 
     if not worker._running:
-        return len(collected), False
+        return matched, False
 
-    # Detail pass — only for records the feed couldn't fully cover.
-    if pending:
-        want = list(dict.fromkeys(
-            forced_detail + fallback_fields + [f for f in UPGRADEABLE_FIELDS if f in fields]
-        ))
-        total = len(pending)
-        for idx, (record, href) in enumerate(pending, 1):
-            if not worker._running:
-                break
-            worker._wait_if_paused()
-            worker.log_signal.emit(
-                f'Fetching details {idx}/{total}: {record.get("name", "")[:40]}', "active",
-            )
-            detail = _extract_detail(driver, href, want)
-            for f in want:
-                if detail.get(f) and (
-                    f in forced_detail or f in UPGRADEABLE_FIELDS or not record.get(f)
-                ):
-                    record[f] = detail[f]
-            emit(record)
+    # Detail pass — for candidates that needed a Maps place-page visit.
+    total = len(pending)
+    for idx, (card, href) in enumerate(pending, 1):
+        if not worker._running or matched >= target:
+            break
+        worker._wait_if_paused()
+        worker.log_signal.emit(
+            f'Fetching details {idx}/{total}: {card.get("name", "")[:40]}', "active")
+        want = _detail_wants(card, fields, spec)
+        detail = _extract_detail(driver, href, want)
+        for f in want:
+            if detail.get(f) and (
+                f in DETAIL_ONLY_FIELDS or f in UPGRADEABLE_FIELDS or not card.get(f)
+            ):
+                card[f] = detail[f]
+        if enrich_active:
+            do_enrich(card)
+        if recfilters.full_pass(card, spec):
+            emit(card)
+            matched += 1
 
-    completed = ended or (max_results > 0 and len(collected) >= max_results)
-    return len(collected), completed
+    if matched == 0 and recfilters.is_active(spec):
+        worker.log_signal.emit(
+            f'"{domain} in {area}" — scanned {len(seen)} but none matched your filters.',
+            "done",
+        )
+
+    completed = ended or (max_results > 0 and matched >= max_results)
+    return matched, completed
 
 
 # ── Qt worker thread (interface unchanged) ───────────────────────────────────
@@ -673,7 +736,8 @@ class ScrapeWorker(QThread):
     log_signal = pyqtSignal(str, str)
     progress_signal = pyqtSignal(int)
     result_signal = pyqtSignal(dict)
-    domain_finished_signal = pyqtSignal(str, int, int, bool)
+    # domain, area, count, max_results, hit_limit
+    domain_finished_signal = pyqtSignal(str, str, int, int, bool)
     done_signal = pyqtSignal()
     error_signal = pyqtSignal(str)
     paused_signal = pyqtSignal(bool)
@@ -681,18 +745,20 @@ class ScrapeWorker(QThread):
     def __init__(
         self,
         domains: list,
-        area: str,
+        areas,
         fields: list,
         headless: bool = False,
         max_results: int = 0,
+        filters: dict = None,
         use_tabs: bool = True,  # kept for backward compatibility (unused)
     ):
         super().__init__()
         self.domains = domains
-        self.area = area
+        self.areas = areas if isinstance(areas, list) else [areas]
         self.fields = fields
         self.headless = headless
         self.max_results = max(0, max_results)
+        self.filters = filters or {}
         self.use_tabs = use_tabs
         self._running = True
         self._paused = False
@@ -730,13 +796,14 @@ class ScrapeWorker(QThread):
         try:
             driver = get_driver(headless=self.headless)
             self._total_collected = 0
-            multi_domain = len(self.domains) > 1
+            tasks = [(d, a) for d in self.domains for a in self.areas]
+            multi = len(tasks) > 1
 
-            for domain in self.domains:
+            for domain, area in tasks:
                 if not self._running:
                     break
 
-                if multi_domain:
+                if multi:
                     limit = self.max_results
                 elif self.max_results > 0:
                     limit = self.max_results - self._total_collected
@@ -745,34 +812,36 @@ class ScrapeWorker(QThread):
                 else:
                     limit = 0
 
-                self._progress_base = 0 if multi_domain else self._total_collected
+                self._progress_base = 0 if multi else self._total_collected
 
                 count, completed = scrape_domain_progressive(
-                    driver, domain, self.area, self.fields, self, max_results=limit,
+                    driver, domain, area, self.fields, self,
+                    max_results=limit, filters=self.filters,
                 )
                 self._total_collected += count
 
                 if not self._running:
                     break
 
-                if not multi_domain:
+                if not multi:
                     if self.max_results > 0 and self._total_collected >= self.max_results:
                         break
                     continue
 
+                label = f"{domain} in {area}"
                 if not completed and count:
-                    self.log_signal.emit(f'"{domain}" stopped early — {count} collected', "done")
+                    self.log_signal.emit(f'"{label}" stopped early — {count} collected', "done")
 
                 if count == 0:
-                    self.log_signal.emit(f'No results for "{domain}"', "done")
+                    self.log_signal.emit(f'No results for "{label}"', "done")
                 elif self.max_results > 0 and count >= self.max_results:
-                    self.log_signal.emit(f'"{domain}" done — {count} of {self.max_results}', "done")
+                    self.log_signal.emit(f'"{label}" done — {count} of {self.max_results}', "done")
                 else:
-                    self.log_signal.emit(f'"{domain}" done — {count} (no more results)', "done")
+                    self.log_signal.emit(f'"{label}" done — {count} (no more results)', "done")
 
                 self._continue_event.clear()
                 hit_limit = self.max_results > 0 and count >= self.max_results
-                self.domain_finished_signal.emit(domain, count, self.max_results, hit_limit)
+                self.domain_finished_signal.emit(domain, area, count, self.max_results, hit_limit)
                 while self._running and not self._continue_event.wait(timeout=0.2):
                     pass
 

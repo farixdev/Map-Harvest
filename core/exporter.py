@@ -14,10 +14,17 @@ FIELD_LABELS = {
     "latitude": "Latitude",
     "longitude": "Longitude",
     "place_id": "Place ID",
+    "email": "Email",
+    "facebook": "Facebook",
+    "instagram": "Instagram",
+    "linkedin": "LinkedIn",
+    "twitter": "Twitter/X",
+    "youtube": "YouTube",
     "review_1": "Review 1",
     "review_2": "Review 2",
     "review_3": "Review 3",
     "domain": "Search Domain",
+    "area": "Search Area",
 }
 
 

@@ -1,6 +1,8 @@
+import webbrowser
+
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
-    QWidget, QLabel, QPushButton,
+    QWidget, QLabel, QPushButton, QLineEdit, QMenu, QApplication,
     QProgressBar, QTableWidget, QTableWidgetItem,
     QHBoxLayout, QVBoxLayout,
     QHeaderView, QAbstractItemView,
@@ -11,27 +13,47 @@ from core.exporter import export_csv, FIELD_LABELS
 from core.scraper import ScrapeWorker
 
 
+class SortableItem(QTableWidgetItem):
+    """Table cell that sorts numerically when both values look like numbers."""
+
+    def __lt__(self, other):
+        a, b = self._num(self.text()), self._num(other.text())
+        if a is not None and b is not None:
+            return a < b
+        return self.text().lower() < other.text().lower()
+
+    @staticmethod
+    def _num(text):
+        t = (text or "").replace(",", "").strip()
+        try:
+            return float(t)
+        except ValueError:
+            return None
+
+
 class ResultsScreen(QWidget):
     stop_signal = pyqtSignal()
     home_signal = pyqtSignal()
 
-    TOAST_MS = 5000
+    TOAST_MS = 6000
 
     def __init__(self):
         super().__init__()
         self.worker = None
         self.results = []
         self.fields = []
-        self.domain = ""
-        self.area = ""
         self._domains = []
+        self._areas = []
         self._headless = False
         self._max_results = 50
         self._export_dir = ""
+        self._filters = {}
+        self._multi = False
         self._is_running = False
         self._is_paused = False
         self._stopped_by_user = False
         self._toast_timer = None
+        self._search_text = ""
         self._build()
 
     def _build(self):
@@ -47,7 +69,6 @@ class ResultsScreen(QWidget):
 
         top_row = QHBoxLayout()
         top_row.setSpacing(8)
-
         name_lbl = QLabel("MapHarvest")
         name_lbl.setObjectName("app_name")
 
@@ -56,6 +77,12 @@ class ResultsScreen(QWidget):
         self.pause_btn.setFixedHeight(30)
         self.pause_btn.clicked.connect(self._on_pause_clicked)
 
+        self.export_btn = QPushButton("Export CSV")
+        self.export_btn.setObjectName("outlined")
+        self.export_btn.setFixedHeight(30)
+        self.export_btn.setToolTip("Save the current results to a CSV file")
+        self.export_btn.clicked.connect(self._on_export_clicked)
+
         self.action_btn = QPushButton("Stop")
         self.action_btn.setObjectName("danger")
         self.action_btn.setFixedHeight(30)
@@ -63,6 +90,7 @@ class ResultsScreen(QWidget):
 
         top_row.addWidget(name_lbl)
         top_row.addStretch()
+        top_row.addWidget(self.export_btn)
         top_row.addWidget(self.pause_btn)
         top_row.addWidget(self.action_btn)
         header_layout.addLayout(top_row)
@@ -85,11 +113,8 @@ class ResultsScreen(QWidget):
 
         top_line = QHBoxLayout()
         top_line.setSpacing(16)
-        top_line.setContentsMargins(0, 0, 0, 0)
-
         count_wrap = QHBoxLayout()
         count_wrap.setSpacing(6)
-        count_wrap.setContentsMargins(0, 0, 0, 0)
         count_wrap.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.count_label = QLabel("0")
         self.count_label.setObjectName("count_label")
@@ -116,17 +141,27 @@ class ResultsScreen(QWidget):
         self.progress_bar.setValue(0)
         self.progress_bar.setTextVisible(False)
         status_block.addWidget(self.progress_bar)
-
         body_layout.addLayout(status_block)
 
         table_header = QHBoxLayout()
         table_header.setContentsMargins(0, 4, 0, 0)
+        table_header.setSpacing(12)
         table_title = QLabel("Results")
         table_title.setObjectName("section_label")
+        table_header.addWidget(table_title)
+
+        self.search_input = QLineEdit()
+        self.search_input.setObjectName("search_box")
+        self.search_input.setPlaceholderText("Filter results…")
+        self.search_input.setClearButtonEnabled(True)
+        self.search_input.setFixedHeight(28)
+        self.search_input.setMaximumWidth(260)
+        self.search_input.textChanged.connect(self._apply_search)
+        table_header.addWidget(self.search_input)
+
+        table_header.addStretch()
         self.row_count_label = QLabel("")
         self.row_count_label.setObjectName("muted")
-        table_header.addWidget(table_title)
-        table_header.addStretch()
         table_header.addWidget(self.row_count_label)
         body_layout.addLayout(table_header)
 
@@ -146,7 +181,14 @@ class ResultsScreen(QWidget):
         self.table.horizontalHeader().setMinimumSectionSize(80)
         self.table.horizontalHeader().setDefaultSectionSize(130)
         self.table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._show_row_menu)
+        self.table.cellDoubleClicked.connect(self._on_cell_double_clicked)
         body_layout.addWidget(self.table, stretch=1)
+
+        hint = QLabel("Double-click a row to open it in Google Maps · right-click for more · click a header to sort")
+        hint.setObjectName("hint")
+        body_layout.addWidget(hint)
 
         self.toast_label = QLabel("")
         self.toast_label.setObjectName("toast")
@@ -157,6 +199,7 @@ class ResultsScreen(QWidget):
 
         root.addWidget(body)
 
+    # ── mode helpers ─────────────────────────────────────────────────────────
     def _restyle(self, widget):
         widget.style().unpolish(widget)
         widget.style().polish(widget)
@@ -172,6 +215,7 @@ class ResultsScreen(QWidget):
         self.action_btn.setObjectName("danger")
         self._restyle(self.action_btn)
         self.action_btn.setEnabled(True)
+        self.table.setSortingEnabled(False)
 
     def _set_idle_mode(self):
         self._is_running = False
@@ -181,51 +225,50 @@ class ResultsScreen(QWidget):
         self.action_btn.setObjectName("outlined")
         self._restyle(self.action_btn)
         self.action_btn.setEnabled(True)
+        self.table.setSortingEnabled(True)  # allow header-click sorting once done
 
-    def setup(
-        self,
-        domains: list,
-        area: str,
-        fields: list,
-        headless: bool = False,
-        max_results: int = 50,
-        export_dir: str = "",
-    ):
+    # ── setup / worker ───────────────────────────────────────────────────────
+    def setup(self, domains, areas, fields, headless=False, max_results=50,
+              export_dir="", filters=None):
         self._stopped_by_user = False
         self.results = []
-        self.area = area
-        self._domains = domains
+        self._domains = list(domains)
+        self._areas = list(areas) if isinstance(areas, list) else [areas]
         self._headless = headless
         self._max_results = max_results
         self._export_dir = export_dir or ""
-        self.domain = domains[0] if domains else ""
+        self._filters = filters or {}
+        self._multi = len(self._domains) * len(self._areas) > 1
 
         self.fields = list(fields)
-        if len(domains) > 1 and "domain" not in self.fields:
+        if len(self._areas) > 1 and "area" not in self.fields:
+            self.fields = ["area"] + self.fields
+        if len(self._domains) > 1 and "domain" not in self.fields:
             self.fields = ["domain"] + self.fields
 
         labels = [FIELD_LABELS.get(f, f) for f in self.fields]
+        self.table.setSortingEnabled(False)
         self.table.clear()
         self.table.setRowCount(0)
         self.table.setColumnCount(len(labels))
         self.table.setHorizontalHeaderLabels(labels)
-
         if labels:
             self.table.setColumnWidth(0, 180)
 
+        self.search_input.clear()
+        self._search_text = ""
         self.progress_bar.setValue(0)
         self.progress_bar.setMaximum(max(self._max_results, 1))
         self.count_label.setText("0")
         self.count_sub.setText(f"of {self._max_results}")
         self.row_count_label.setText("")
-        self.status_label.setText("Starting...")
-        self.area_label.setText(f"{', '.join(domains)} · {area}")
-
-        if self._export_dir:
-            self.export_path_label.setText(f"Saving exports to {self._export_dir}")
-        else:
-            self.export_path_label.setText("")
-
+        self.status_label.setText("Starting…")
+        self.area_label.setText(
+            f"{', '.join(self._domains)} · {', '.join(self._areas)}"
+        )
+        self.export_path_label.setText(
+            f"Saving exports to {self._export_dir}" if self._export_dir else ""
+        )
         self._hide_toast()
         self._set_running_mode()
 
@@ -246,11 +289,9 @@ class ResultsScreen(QWidget):
                     pass
 
         self.worker = ScrapeWorker(
-            self._domains,
-            self.area,
-            self.fields,
-            headless=self._headless,
-            max_results=self._max_results,
+            self._domains, self._areas, self.fields,
+            headless=self._headless, max_results=self._max_results,
+            filters=self._filters,
         )
         self.worker.log_signal.connect(self._on_log)
         self.worker.result_signal.connect(self.add_table_row)
@@ -258,7 +299,7 @@ class ResultsScreen(QWidget):
         self.worker.done_signal.connect(self.on_done)
         self.worker.error_signal.connect(self.on_error)
         self.worker.paused_signal.connect(self._on_paused)
-        if len(self._domains) > 1:
+        if self._multi:
             self.worker.domain_finished_signal.connect(self._on_domain_finished)
         self.worker.start()
 
@@ -268,7 +309,7 @@ class ResultsScreen(QWidget):
             self.worker.stop()
         self.pause_btn.setEnabled(False)
         self.action_btn.setEnabled(False)
-        self.status_label.setText("Stopping...")
+        self.status_label.setText("Stopping…")
 
     def _on_pause_clicked(self):
         if not self.worker or not self.worker.isRunning():
@@ -285,7 +326,7 @@ class ResultsScreen(QWidget):
             self.status_label.setText("Paused")
         else:
             self.pause_btn.setText("Pause")
-            self.status_label.setText("Resuming...")
+            self.status_label.setText("Resuming…")
 
     def _on_log(self, message: str, status: str):
         if status == "active":
@@ -293,68 +334,176 @@ class ResultsScreen(QWidget):
         elif status == "done" and message.startswith("#"):
             short = message.lstrip("#").strip()
             if len(short) > 48:
-                short = short[:45] + "..."
+                short = short[:45] + "…"
             self.status_label.setText(short)
 
     def update_progress(self, collected: int):
         self.count_label.setText(str(collected))
         self.progress_bar.setMaximum(max(self._max_results, 1))
         self.progress_bar.setValue(min(collected, self._max_results))
-        self.row_count_label.setText(f"{collected} row{'s' if collected != 1 else ''}")
 
+    # ── table ────────────────────────────────────────────────────────────────
     def add_table_row(self, data: dict):
         self.results.append(data)
         row = self.table.rowCount()
         self.table.insertRow(row)
 
         for col, field in enumerate(self.fields):
-            raw = data.get(field, data.get("_domain", "") if field == "domain" else "")
-            text = str(raw).strip() if raw else "—"
-            if len(text) > 80:
-                display = text[:77] + "..."
-                tip = text
+            if field == "domain":
+                raw = data.get("domain", data.get("_domain", ""))
+            elif field == "area":
+                raw = data.get("area", data.get("_area", ""))
             else:
-                display = text
-                tip = ""
+                raw = data.get(field, "")
+            text = str(raw).strip() if raw else "—"
+            display = text[:77] + "…" if len(text) > 80 else text
 
-            item = QTableWidgetItem(display)
+            item = SortableItem(display)
             item.setFlags(item.flags() & ~Qt.ItemIsEditable)
             item.setTextAlignment(Qt.AlignVCenter | Qt.AlignLeft)
-            if tip:
-                item.setToolTip(tip)
+            item.setData(Qt.UserRole + 1, text)  # full (untruncated) value for search
+            if len(text) > 80:
+                item.setToolTip(text)
+            if col == 0:
+                item.setData(Qt.UserRole, data)  # attach record for row actions
             self.table.setItem(row, col, item)
 
-        self.table.scrollToBottom()
-        self.row_count_label.setText(f"{len(self.results)} row{'s' if len(self.results) != 1 else ''}")
+        if self._search_text and not self._row_matches(row, self._search_text):
+            self.table.setRowHidden(row, True)
+        else:
+            self.table.scrollToBottom()
+        self._update_row_count()
 
-    def _rows_for_domain(self, domain: str) -> list:
-        return [
-            r for r in self.results
-            if r.get("domain", r.get("_domain", "")) == domain
-        ]
+    def _update_row_count(self):
+        total = len(self.results)
+        visible = sum(0 if self.table.isRowHidden(r) else 1 for r in range(self.table.rowCount()))
+        if visible != total:
+            self.row_count_label.setText(f"{visible} of {total} rows")
+        else:
+            self.row_count_label.setText(f"{total} row{'s' if total != 1 else ''}")
 
-    def _export_summary(self, domain: str, count: int, hit_limit: bool) -> str:
+    def _row_matches(self, row: int, text: str) -> bool:
+        for col in range(self.table.columnCount()):
+            it = self.table.item(row, col)
+            if it is None:
+                continue
+            full = it.data(Qt.UserRole + 1)
+            hay = full if isinstance(full, str) else it.text()
+            if text in hay.lower():
+                return True
+        return False
+
+    def _apply_search(self, text: str):
+        self._search_text = (text or "").strip().lower()
+        for row in range(self.table.rowCount()):
+            hide = bool(self._search_text) and not self._row_matches(row, self._search_text)
+            self.table.setRowHidden(row, hide)
+        self._update_row_count()
+
+    def _record_for_row(self, row: int) -> dict:
+        it = self.table.item(row, 0)
+        if it is None:
+            return {}
+        data = it.data(Qt.UserRole)
+        return data if isinstance(data, dict) else {}
+
+    def _on_cell_double_clicked(self, row: int, _col: int):
+        rec = self._record_for_row(row)
+        url = rec.get("maps_link") or rec.get("_href")
+        if url:
+            webbrowser.open(url)
+
+    def _show_row_menu(self, pos):
+        index = self.table.indexAt(pos)
+        if not index.isValid():
+            return
+        rec = self._record_for_row(index.row())
+        if not rec:
+            return
+        menu = QMenu(self)
+        maps_url = rec.get("maps_link") or rec.get("_href")
+        website = rec.get("website")
+        phone = rec.get("phone")
+        email = rec.get("email")
+
+        if maps_url:
+            menu.addAction("Open in Google Maps", lambda: webbrowser.open(maps_url))
+        if website:
+            menu.addAction("Open website", lambda: webbrowser.open(website))
+        if maps_url or website:
+            menu.addSeparator()
+        if phone:
+            menu.addAction("Copy phone", lambda: self._copy(phone))
+        if email:
+            menu.addAction("Copy email", lambda: self._copy(email))
+        if rec.get("name"):
+            menu.addAction("Copy name", lambda: self._copy(rec.get("name")))
+        menu.addAction("Copy row (tab-separated)", lambda: self._copy_row(rec))
+        menu.exec_(self.table.viewport().mapToGlobal(pos))
+
+    def _copy(self, text: str):
+        QApplication.clipboard().setText(str(text))
+        self.status_label.setText("Copied to clipboard")
+
+    def _copy_row(self, rec: dict):
+        vals = []
+        for f in self.fields:
+            if f == "domain":
+                vals.append(str(rec.get("domain", rec.get("_domain", ""))))
+            elif f == "area":
+                vals.append(str(rec.get("area", rec.get("_area", ""))))
+            else:
+                vals.append(str(rec.get(f, "")))
+        self._copy("\t".join(vals))
+
+    # ── export / summaries ───────────────────────────────────────────────────
+    def _current_task(self):
+        if self.results:
+            last = self.results[-1]
+            return last.get("_domain", ""), last.get("_area", "")
+        d = self._domains[0] if self._domains else ""
+        a = self._areas[0] if self._areas else ""
+        return d, a
+
+    def _export_summary(self, domain, area, count, hit_limit) -> str:
+        label = f"{domain} in {area}"
         if count <= 0:
-            return f'"{domain} in {self.area}" — no results found. Skipping CSV.'
+            return f'"{label}" — no results found. Skipping CSV.'
         if hit_limit:
             summary = f"{count} of {self._max_results} collected"
         elif self._max_results > 0 and count < self._max_results:
-            summary = (
-                f"{count} of {self._max_results} requested — "
-                "Google Maps had fewer results"
-            )
+            summary = f"{count} of {self._max_results} requested — Google Maps had fewer"
         else:
             summary = f"{count} collected"
-        return f'"{domain} in {self.area}" — {summary}'
+        return f'"{label}" — {summary}'
 
-    def _save_domain_csv(self, domain: str, rows: list) -> str:
-        return export_csv(rows, domain, self.area, self.fields, self._export_dir)
+    def _export_rows(self, rows):
+        """Ensure the pseudo-columns (domain/area) are populated for CSV."""
+        out = []
+        for r in rows:
+            r2 = dict(r)
+            if "domain" in self.fields and not r2.get("domain"):
+                r2["domain"] = r2.get("_domain", "")
+            if "area" in self.fields and not r2.get("area"):
+                r2["area"] = r2.get("_area", "")
+            out.append(r2)
+        return out
 
-    def _show_toast(self, message: str, filepath: str | None = None):
-        if filepath:
-            text = f"{message}\nCSV saved to:\n{filepath}"
-        else:
-            text = message
+    def _notify_task_export(self, domain, area, count, hit_limit, rows=None):
+        message = self._export_summary(domain, area, count, hit_limit)
+        filepath = None
+        rows = self.results if rows is None else rows
+        if count > 0 and rows:
+            try:
+                filepath = export_csv(
+                    self._export_rows(rows), domain, area, self.fields, self._export_dir,
+                )
+            except Exception as e:
+                message += f"  (CSV save failed: {e})"
+        self._show_toast(message, filepath)
+
+    def _show_toast(self, message: str, filepath=None):
+        text = f"{message}\nCSV saved to:\n{filepath}" if filepath else message
         self.toast_label.setText(text)
         self.toast_label.show()
         if self._toast_timer is not None:
@@ -368,59 +517,52 @@ class ResultsScreen(QWidget):
         self.toast_label.hide()
         self.toast_label.clear()
 
-    def _notify_domain_export(self, domain: str, count: int, hit_limit: bool):
-        message = self._export_summary(domain, count, hit_limit)
-        filepath = None
-        if count > 0:
-            rows = self._rows_for_domain(domain)
-            if rows:
-                filepath = self._save_domain_csv(domain, rows)
-        self._show_toast(message, filepath)
-
-    def _on_domain_finished(self, domain: str, count: int, max_results: int, hit_limit: bool):
+    def _on_domain_finished(self, domain, area, count, max_results, hit_limit):
         if not self.worker:
             return
-
-        self._notify_domain_export(domain, count, hit_limit)
-
+        self._notify_task_export(domain, area, count, hit_limit, rows=list(self.results))
         self.results = []
         self.table.setRowCount(0)
         self.count_label.setText("0")
         self.progress_bar.setValue(0)
         self.row_count_label.setText("")
-        self.domain = ""
-        self.status_label.setText("Continuing to next domain...")
-
+        self.status_label.setText("Continuing to next search…")
         self.worker.continue_next_domain()
 
     def on_done(self):
         n = len(self.results)
         if self._stopped_by_user:
-            if n > 0 and self.domain:
-                self._notify_domain_export(self.domain, n, False)
+            if n > 0:
+                d, a = self._current_task()
+                self._notify_task_export(d, a, n, False)
                 self.status_label.setText("Stopped — partial results saved")
             else:
                 self.status_label.setText("Stopped — no results collected")
         else:
-            if len(self._domains) == 1 and self._domains:
-                domain = self._domains[0]
+            if not self._multi:
+                d = self._domains[0] if self._domains else ""
+                a = self._areas[0] if self._areas else ""
                 hit_limit = self._max_results > 0 and n >= self._max_results
-                self._notify_domain_export(domain, n, hit_limit)
-                self.status_label.setText(
-                    f"Done — {n} businesses" if n else "Done — no results"
-                )
+                self._notify_task_export(d, a, n, hit_limit)
+                self.status_label.setText(f"Done — {n} businesses" if n else "Done — no results")
             else:
-                self.status_label.setText("Done — all domains scraped")
+                self.status_label.setText("Done — all searches scraped")
 
         self.count_sub.setText(f"of {self._max_results}")
-        if n:
-            self.row_count_label.setText(f"{n} row{'s' if n != 1 else ''}")
+        self._update_row_count()
         self._set_idle_mode()
         self._stopped_by_user = False
 
     def on_error(self, message: str):
         self.status_label.setText(f"Error: {message[:60]}")
         self._set_idle_mode()
+
+    def _on_export_clicked(self):
+        if not self.results:
+            self._show_toast("Nothing to export yet.")
+            return
+        d, a = self._current_task()
+        self._notify_task_export(d, a, len(self.results), False)
 
     def _on_action_clicked(self):
         if self._is_running:
