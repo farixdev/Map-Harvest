@@ -760,6 +760,7 @@ class ScrapeWorker(QThread):
         self.max_results = max(0, max_results)
         self.filters = filters or {}
         self.use_tabs = use_tabs
+        self._driver = None   # set in run(); used by abort() on app close
         self._running = True
         self._paused = False
         self._pause_lock = threading.Event()
@@ -776,6 +777,22 @@ class ScrapeWorker(QThread):
         self._running = False
         self._pause_lock.set()
         self._continue_event.set()
+
+    def abort(self):
+        """Stop and force the browser closed (used when the app is closing).
+
+        Selenium calls block the worker thread, so a co-operative stop can't
+        interrupt an in-flight page load. Quitting the driver from the outside
+        makes that call fail fast, letting run() unwind and the thread exit
+        instead of hanging with an orphaned chrome.exe.
+        """
+        self.stop()
+        driver = self._driver
+        if driver is not None:
+            try:
+                driver.quit()
+            except Exception:
+                pass
 
     def pause(self):
         self._paused = True
@@ -795,6 +812,7 @@ class ScrapeWorker(QThread):
         driver = None
         try:
             driver = get_driver(headless=self.headless)
+            self._driver = driver
             self._total_collected = 0
             tasks = [(d, a) for d in self.domains for a in self.areas]
             multi = len(tasks) > 1
@@ -854,4 +872,5 @@ class ScrapeWorker(QThread):
                     driver.quit()
                 except Exception:
                     pass
+            self._driver = None
             self.done_signal.emit()

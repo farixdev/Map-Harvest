@@ -273,6 +273,14 @@ class ResultsScreen(QWidget):
         self._set_running_mode()
 
     def start_worker(self):
+        # Never let two scrapes overlap — a previous worker that is still
+        # shutting down would leave a second Chrome running alongside the new one.
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.stop()
+            if not self.worker.wait(5000):
+                self.worker.abort()
+                self.worker.wait(5000)
+
         if self.worker is not None:
             for signal, slot in (
                 (self.worker.log_signal, self._on_log),

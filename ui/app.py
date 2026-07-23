@@ -1,6 +1,8 @@
+import signal
 import sys
+import traceback
 
-from PyQt5.QtCore import QSize
+from PyQt5.QtCore import QSize, QTimer
 from PyQt5.QtGui import QFont, QFontDatabase
 from PyQt5.QtWidgets import QApplication, QMainWindow, QStackedWidget
 
@@ -484,12 +486,64 @@ class MainWindow(QMainWindow):
         self.setFixedSize(QSize(820, 640))
         self.stack.setCurrentIndex(0)
 
+    def shutdown_worker(self) -> None:
+        """Stop a running scrape and tear the browser down deterministically.
+
+        Without this, closing the window while a scrape is running leaves the
+        QThread alive and an orphaned chrome.exe behind — the app appears to
+        hang on exit and Chrome processes pile up.
+        """
+        worker = getattr(self.results_screen, "worker", None)
+        if worker is None or not worker.isRunning():
+            return
+
+        self.results_screen._stopped_by_user = True
+        worker.stop()                     # co-operative stop (checked in the loop)
+        if worker.wait(5000):
+            return
+        worker.abort()                    # force-close the browser to unblock Selenium
+        if worker.wait(5000):
+            return
+        worker.terminate()                # last resort
+        worker.wait(2000)
+
+    def closeEvent(self, event):
+        self.shutdown_worker()
+        event.accept()
+
+
+def _install_excepthook():
+    """Keep the GUI alive (and loud) when a slot raises, instead of dying silently."""
+    def hook(exc_type, exc, tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            QApplication.quit()
+            return
+        traceback.print_exception(exc_type, exc, tb)
+    sys.excepthook = hook
+
 
 def run():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     load_font(app)
     app.setStyleSheet(QSS)
+    _install_excepthook()
+
     window = MainWindow()
+
+    # Qt's event loop is C++, so Python never runs while idle and a Ctrl+C sits
+    # queued until some slot happens to execute (which is why it used to surface
+    # as a bogus traceback inside whatever button you clicked next). Handle
+    # SIGINT explicitly and tick a timer so Python gets a chance to process it.
+    def _on_sigint(*_):
+        window.shutdown_worker()
+        app.quit()
+
+    signal.signal(signal.SIGINT, _on_sigint)
+    idle = QTimer()
+    idle.start(200)
+    idle.timeout.connect(lambda: None)
+    app.aboutToQuit.connect(window.shutdown_worker)
+
     window.show()
     sys.exit(app.exec_())
