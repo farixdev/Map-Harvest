@@ -22,3 +22,4 @@ Thumbs.db
 # PyInstaller build output
 build/
 dist/
+releases/
