@@ -18,6 +18,7 @@ class InputScreen(QWidget):
     # domains, areas, fields, headless, max_results, export_dir, filters
     start_signal = pyqtSignal(list, list, list, bool, int, str, dict)
     settings_signal = pyqtSignal()
+    outreach_signal = pyqtSignal()
 
     FIELD_KEYS = [
         "name", "category", "rating", "review_count", "hours",
@@ -465,6 +466,13 @@ class InputScreen(QWidget):
         open_settings_btn.setFixedHeight(32)
         open_settings_btn.clicked.connect(self.settings_signal.emit)
         settings_row.addWidget(open_settings_btn)
+
+        go_outreach_btn = QPushButton("Go to Outreach")
+        go_outreach_btn.setObjectName("start_btn")
+        go_outreach_btn.setFixedHeight(32)
+        go_outreach_btn.clicked.connect(self.outreach_signal.emit)
+        settings_row.addWidget(go_outreach_btn)
+
         settings_row.addStretch()
         layout.addLayout(settings_row)
         layout.addSpacing(6)

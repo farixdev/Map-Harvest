@@ -797,6 +797,7 @@ class MainWindow(QMainWindow):
 
         self.input_screen.start_signal.connect(self.on_start)
         self.input_screen.settings_signal.connect(self.on_settings)
+        self.input_screen.outreach_signal.connect(self.on_outreach_direct)
         self.results_screen.stop_signal.connect(self.on_stop)
         self.results_screen.home_signal.connect(self.on_home)
         self.results_screen.outreach_signal.connect(self.on_outreach)
@@ -818,6 +819,10 @@ class MainWindow(QMainWindow):
 
     def on_home(self):
         self.stack.setCurrentIndex(INPUT_SCREEN)
+
+    def on_outreach_direct(self):
+        self.outreach_screen.refresh()
+        self.stack.setCurrentIndex(OUTREACH_SCREEN)
 
     def on_outreach(self, records):
         self.outreach_screen.load_from_results(records)
