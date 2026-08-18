@@ -79,6 +79,15 @@ class InputScreen(QWidget):
             self._tab_btns[idx] = btn
         self.scrape_tab_btn = self._tab_btns[0]
         header.addLayout(tab_row)
+
+        header.addSpacing(12)
+        outreach_btn = QPushButton("Outreach")
+        outreach_btn.setObjectName("outlined")
+        outreach_btn.setFixedHeight(30)
+        outreach_btn.setCursor(Qt.PointingHandCursor)
+        outreach_btn.clicked.connect(self.outreach_signal.emit)
+        header.addWidget(outreach_btn)
+
         root.addLayout(header)
         root.addSpacing(20)
 
@@ -466,13 +475,6 @@ class InputScreen(QWidget):
         open_settings_btn.setFixedHeight(32)
         open_settings_btn.clicked.connect(self.settings_signal.emit)
         settings_row.addWidget(open_settings_btn)
-
-        go_outreach_btn = QPushButton("Go to Outreach")
-        go_outreach_btn.setObjectName("start_btn")
-        go_outreach_btn.setFixedHeight(32)
-        go_outreach_btn.clicked.connect(self.outreach_signal.emit)
-        settings_row.addWidget(go_outreach_btn)
-
         settings_row.addStretch()
         layout.addLayout(settings_row)
         layout.addSpacing(6)
