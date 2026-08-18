@@ -568,6 +568,44 @@ class _SecretField(QWidget):
         self.edit.setText(value or "")
         self.toggle.setChecked(False)
 
+    @property
+    def editingFinished(self):
+        return self.edit.editingFinished
+
+
+class ModelComboBox(QComboBox):
+    """An editable QComboBox that acts like QLineEdit (with text/setText API) for seamless settings integration."""
+
+    def __init__(self, placeholder: str, parent=None):
+        super().__init__(parent)
+        self.setEditable(True)
+        self.setInsertPolicy(QComboBox.NoInsert)
+        self.lineEdit().setPlaceholderText(placeholder)
+        self.setFixedHeight(34)
+
+    def text(self) -> str:
+        return self.currentText()
+
+    def setText(self, val: str) -> None:
+        self.setEditText(val)
+
+
+class _FetchModelsProbe(QThread):
+    """Fetches AI models from the provider's API on a background thread to prevent UI freezing."""
+    result_signal = pyqtSignal(list)
+
+    def __init__(self, provider: str, api_key: str, parent=None):
+        super().__init__(parent)
+        self.provider = provider
+        self.api_key = api_key
+
+    def run(self) -> None:
+        try:
+            models = ai_client.fetch_models(self.provider, self.api_key)
+            self.result_signal.emit(models)
+        except Exception:
+            self.result_signal.emit([])
+
 
 class _Probe(QThread):
     """Runs one blocking credential check off the GUI thread.
@@ -889,9 +927,11 @@ class SettingsScreen(QWidget):
 
         self.groq_key, self.groq_model, self.groq_status = self._provider_block(
             layout, "Groq", "gsk_…", "llama-3.3-70b-versatile", "groq")
+        self.groq_key.editingFinished.connect(self._fetch_groq_models)
         layout.addSpacing(22)
         self.openrouter_key, self.openrouter_model, self.openrouter_status = self._provider_block(
             layout, "OpenRouter", "sk-or-…", "meta-llama/llama-3.3-70b-instruct", "openrouter")
+        self.openrouter_key.editingFinished.connect(self._fetch_openrouter_models)
         layout.addSpacing(22)
 
         layout.addWidget(_section_label("Token budget"))
@@ -941,9 +981,7 @@ class SettingsScreen(QWidget):
         status.setWordWrap(True)
         status.hide()
 
-        model_edit = QLineEdit()
-        model_edit.setPlaceholderText(model_placeholder)
-        model_edit.setFixedHeight(34)
+        model_edit = ModelComboBox(model_placeholder)
 
         grid = QGridLayout()
         grid.setHorizontalSpacing(12)
@@ -1879,8 +1917,10 @@ class SettingsScreen(QWidget):
         self._select_data(self.provider_combo, settings.get("ai_provider", "auto"))
         self.groq_key.setText(get_secret(settings, "groq_api_key"))
         self.groq_model.setText(str(settings.get("groq_model") or ""))
+        self._fetch_groq_models()
         self.openrouter_key.setText(get_secret(settings, "openrouter_api_key"))
         self.openrouter_model.setText(str(settings.get("openrouter_model") or ""))
+        self._fetch_openrouter_models()
         self.tokens_per_lead_spin.setValue(self._int(settings.get("ai_max_tokens_per_lead"), 220))
         self.monthly_cap_spin.setValue(self._int(settings.get("ai_monthly_token_cap"), 2_000_000))
         for label in (self.groq_status, self.openrouter_status):
@@ -2096,6 +2136,34 @@ class SettingsScreen(QWidget):
 
         self._start_probe(
             lambda: ai_client.test_provider(provider, api_key, model), finished)
+
+    def _fetch_groq_models(self) -> None:
+        self._fetch_models_async("groq", self.groq_key, self.groq_model)
+
+    def _fetch_openrouter_models(self) -> None:
+        self._fetch_models_async("openrouter", self.openrouter_key, self.openrouter_model)
+
+    def _fetch_models_async(self, provider: str, key_field: _SecretField, model_combo: ModelComboBox) -> None:
+        api_key = key_field.text()
+        if not api_key:
+            return
+
+        probe = _FetchModelsProbe(provider, api_key, parent=self)
+        def on_models_fetched(models: list[str]) -> None:
+            if not models:
+                return
+            current = model_combo.text()
+            model_combo.blockSignals(True)
+            model_combo.clear()
+            for m in models:
+                model_combo.addItem(m)
+            if current:
+                model_combo.setText(current)
+            model_combo.blockSignals(False)
+
+        probe.result_signal.connect(on_models_fetched)
+        probe.finished.connect(probe.deleteLater)
+        probe.start()
 
     # ── probes ──
 

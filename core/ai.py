@@ -644,3 +644,45 @@ def test_provider(provider: str, api_key: str, model: str) -> tuple[bool, str, i
     if payload is None:
         return False, error, latency_ms
     return True, f"{model} responded", latency_ms
+
+
+def fetch_models(provider: str, api_key: str, timeout: float = 15.0) -> list[str]:
+    """Fetch the list of available models from the provider's API.
+
+    Returns a sorted list of model ID strings, or an empty list on failure.
+    """
+    name = str(provider or "").strip().lower()
+    if name not in _PROVIDERS:
+        return []
+    key = secrets.decrypt(str(api_key or "")).strip()
+    if not key:
+        return []
+
+    url = "https://api.groq.com/openai/v1/models" if name == "groq" else "https://openrouter.ai/api/v1/models"
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Accept": "application/json",
+        "User-Agent": _UA,
+    }
+    if name == "openrouter":
+        headers.update(_PROVIDERS["openrouter"]["headers"])
+
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read(1024 * 1024)
+    except Exception:
+        return []
+
+    try:
+        parsed = json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        return []
+
+    models = []
+    if isinstance(parsed, dict) and isinstance(parsed.get("data"), list):
+        for item in parsed["data"]:
+            if isinstance(item, dict) and isinstance(item.get("id"), str):
+                models.append(item["id"])
+    return sorted(models)
+
