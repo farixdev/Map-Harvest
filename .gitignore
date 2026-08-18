@@ -23,3 +23,6 @@ Thumbs.db
 build/
 dist/
 releases/
+
+# tools/md2pdf.py intermediate render (the .pdf is the artifact)
+docs/*.html

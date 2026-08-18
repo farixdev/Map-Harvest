@@ -1,0 +1,617 @@
+"""Offline tests for the chrome the four screens are made of.
+
+Everything here is a rendering or geometry contract, so the assertions are
+against pixels and measured widths rather than against the code that produced
+them: a QSS rule can be beaten by a more specific one and a layout can hand a
+widget less than it asked for, and in both cases the only honest witness is what
+the screen actually shows.
+
+Qt runs on the offscreen platform. That platform paints no glyphs — a label
+renders as empty ground — but it does report real font metrics, so widths,
+`sizeHint()` and `elidedText()` all mean what they say. Colour assertions are
+therefore about painted shapes only, which is exactly what the check indicator
+is.
+
+`SETTINGS_DIR` is redirected into a temp directory before any screen is built,
+so constructing one can never read or write a developer's real ~/.mapharvest.
+"""
+import os
+import re
+import sys
+import tempfile
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from PyQt5.QtCore import QSize, Qt  # noqa: E402
+from PyQt5.QtWidgets import (  # noqa: E402
+    QApplication, QCheckBox, QFrame, QLabel, QListWidget, QListWidgetItem,
+    QProgressBar, QScrollArea, QStyleOptionButton,
+)
+
+from core import outreach_db as DB  # noqa: E402
+from core import settings as ST  # noqa: E402
+from core.campaign import OutreachWorker  # noqa: E402
+from ui import app as APP  # noqa: E402
+from ui import screen_outreach as SO  # noqa: E402
+from ui.screen_input import InputScreen  # noqa: E402
+from ui.screen_results import ResultsScreen  # noqa: E402
+from ui.screen_settings import SettingsScreen  # noqa: E402
+
+_TMP = tempfile.mkdtemp(prefix="mapharvest-ui-chrome-")
+_APP = None
+_SCREENS: dict = {}
+
+ACCOUNT = "samantha.whitfield@gmail.com"
+FROM_LINE = ("To Zeta Roofing <zeta@example.com>  ·  "
+             "From Sam Whitfield <%s>" % ACCOUNT)
+ADDRESS = "Suite 1200 - 12 King Street West\nToronto, ON M5H 1A1\nCanada"
+
+# The two sizes every screen has to survive: what `MainWindow` opens at, and the
+# minimum it will let the user drag down to.
+DEFAULT_SIZE, MINIMUM_SIZE = (1080, 760), (880, 620)
+
+
+def _app() -> QApplication:
+    """The one QApplication for this module, styled exactly as `ui.app.run`.
+
+    Through `install_style`, not by hand: the check indicators are painted by
+    `TickStyle` and the sheet deliberately says nothing about them, so an app
+    that only gets the sheet is not the app the user runs.
+    """
+    global _APP
+    if _APP is None:
+        ST.SETTINGS_DIR = _TMP
+        ST.SETTINGS_PATH = os.path.join(_TMP, "settings.json")
+        _APP = QApplication.instance() or QApplication([])
+    APP.install_style(_APP)
+    return _APP
+
+
+def _screen(kind: str):
+    """One built screen per kind, over a seeded throwaway database."""
+    if kind not in _SCREENS:
+        app = _app()
+        if kind == "outreach":
+            conn = DB.connect(os.path.join(_TMP, "outreach.db"))
+            DB.upsert_lead(conn, {"email": "zeta@example.com", "name": "Zeta Roofing",
+                                  "opportunity_score": 30, "status": "audited",
+                                  "source": "test"})
+            screen = SO.OutreachScreen()
+            screen.settings["smtp_accounts"] = [
+                {"email": ACCOUNT, "display_name": "Sam Whitfield",
+                 "enabled": True, "daily_cap": 10}]
+            screen.settings["sender_profile"] = {"sender_name": "Sam Whitfield",
+                                                 "postal_address": ADDRESS}
+            screen._reload_leads()
+        else:
+            screen = {"input": InputScreen, "results": ResultsScreen,
+                      "settings": SettingsScreen}[kind]()
+        screen.resize(QSize(*DEFAULT_SIZE))
+        screen.show()
+        app.processEvents()
+        _SCREENS[kind] = screen
+    return _SCREENS[kind]
+
+
+def _sized(screen, size):
+    """`screen` laid out at `size`, with the layout actually run."""
+    app = _app()
+    screen.resize(QSize(*size))
+    if screen.layout() is not None:
+        screen.layout().activate()
+    app.processEvents()
+    app.processEvents()
+    return screen
+
+
+def _histogram(widget, rect=None) -> dict:
+    """Every colour `widget` paints inside `rect`, counted."""
+    image = widget.grab().toImage()
+    box = rect if rect is not None else image.rect()
+    counts: dict = {}
+    for y in range(max(0, box.top()), min(image.height() - 1, box.bottom()) + 1):
+        for x in range(max(0, box.left()), min(image.width() - 1, box.right()) + 1):
+            name = image.pixelColor(x, y).name().upper()
+            counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
+def _near_white(counts: dict, floor: int = 200) -> int:
+    """Pixels bright enough in every channel to read as the tick."""
+    return sum(count for colour, count in counts.items()
+               if all(int(colour[start:start + 2], 16) >= floor
+                      for start in (1, 3, 5)))
+
+
+def _indicator_rect(box: QCheckBox):
+    option = QStyleOptionButton()
+    option.initFrom(box)
+    return box.style().subElementRect(box.style().SE_CheckBoxIndicator, option, box)
+
+
+# ── U1: every checkbox must draw a tick ──────────────────────────────────────
+
+def test_a_checked_box_paints_a_tick_and_an_unchecked_one_does_not():
+    """The whole defect: checked and unchecked differed only in brightness.
+
+    Measured inside the indicator alone, so the label cannot contribute — and
+    on this platform it could not anyway, since no glyph is ever painted.
+    """
+    app = _app()
+    box = QCheckBox("Dry run — build and log every email, send none")
+    box.resize(box.sizeHint())
+    box.show()
+
+    marks = {}
+    for state in (False, True):
+        box.setChecked(state)
+        app.processEvents()
+        rect = _indicator_rect(box)
+        assert rect.width() >= 12 and rect.height() >= 12, \
+            "there is no indicator left to measure: %s" % rect
+        marks[state] = _near_white(_histogram(box, rect))
+
+    assert marks[False] == 0, \
+        "an unchecked box paints %d near-white pixels" % marks[False]
+    assert marks[True] >= 10, (
+        "a checked box paints only %d near-white pixels — that is the tickless "
+        "indicator again" % marks[True])
+
+
+def test_a_checked_list_row_paints_the_same_tick():
+    """The 21 'Data to scrape' boxes are list items, a different primitive."""
+    app = _app()
+    listing = QListWidget()
+    listing.setObjectName("service_list")
+    for label, state in (("Email", Qt.Unchecked), ("Phone", Qt.Checked)):
+        item = QListWidgetItem(label)
+        item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+        item.setCheckState(state)
+        listing.addItem(item)
+    listing.resize(220, 90)
+    listing.show()
+    app.processEvents()
+
+    unchecked = _near_white(_histogram(listing, listing.visualItemRect(listing.item(0))))
+    checked = _near_white(_histogram(listing, listing.visualItemRect(listing.item(1))))
+    assert unchecked == 0, "an unchecked row paints %d near-white pixels" % unchecked
+    assert checked >= 10, "a checked row paints only %d near-white pixels" % checked
+
+
+def test_the_sheet_leaves_the_indicator_to_the_style():
+    """A single `::indicator` rule anywhere would beat `TickStyle` again."""
+    sheet = re.sub(r"/\*.*?\*/", "", APP.QSS, flags=re.S)
+    rules = [line for line in sheet.splitlines() if "::indicator" in line]
+    assert rules == [], "the sheet styles an indicator again: %s" % rules
+
+
+def test_the_dry_run_toggle_itself_draws_a_tick():
+    """The safety switch, on the real screen, at both window sizes."""
+    app = _app()
+    screen = _screen("settings")
+    box = screen.dry_run_cb
+    # Unchecking it opens a confirmation dialog; this test is about paint.
+    box.blockSignals(True)
+    try:
+        for size in (DEFAULT_SIZE, MINIMUM_SIZE):
+            _sized(screen, size)
+            marks = {}
+            for state in (False, True):
+                box.setChecked(state)
+                app.processEvents()
+                marks[state] = _near_white(_histogram(box, _indicator_rect(box)))
+            assert marks[False] == 0 and marks[True] >= 10, \
+                "dry run reads the same either way at %dx%d: %s" % (size + (marks,))
+    finally:
+        box.setChecked(True)
+        box.blockSignals(False)
+
+
+# ── U2: the To/From line must elide, not clip ────────────────────────────────
+
+def test_an_elided_label_shortens_and_keeps_the_whole_thing_in_a_tooltip():
+    """Driven by width alone, off any layout that could resize it back."""
+    app = _app()
+    label = SO._ElidedLabel(FROM_LINE)
+    # Shown, because Qt holds a hidden widget's resize event back until it is.
+    label.show()
+    app.processEvents()
+    label.resize(QSize(label.sizeHint().width() + 40, 17))
+    app.processEvents()
+    assert label.text() == FROM_LINE, "elided a line that had room: %r" % label.text()
+
+    label.resize(QSize(120, 17))
+    app.processEvents()
+    assert label.text() != FROM_LINE, "the line is still being clipped, not elided"
+    assert label.text().endswith("…"), \
+        "a shortened line must say so: %r" % label.text()
+    assert label.toolTip() == FROM_LINE, \
+        "the sending account has to stay readable somewhere"
+    assert label.fullText() == FROM_LINE
+
+
+def test_the_campaign_from_line_elides_in_place_at_the_window_minimum():
+    screen = _screen("outreach")
+    for size in (DEFAULT_SIZE, MINIMUM_SIZE):
+        _sized(screen, size)
+        screen._goto_tab(1)
+        screen.preview_meta.setText(FROM_LINE)
+        _sized(screen, size)
+        label = screen.preview_meta
+        assert label.toolTip() == FROM_LINE, \
+            "the line that names the sending account has no tooltip at %dx%d" % size
+        assert label.width() < label.sizeHint().width(), (
+            "this line no longer overflows at %dx%d, so the assertion below "
+            "proves nothing" % size)
+        assert label.text().endswith("…"), (
+            "%dx%d gives the line %dpx of %d and shows %r with no cue"
+            % (size + (label.width(), label.sizeHint().width(), label.text())))
+
+
+# ── U3: the Campaign left column must adapt, not clip ────────────────────────
+
+def _campaign_column(screen):
+    """The widget the Campaign tab's cards are laid out on.
+
+    Reached through a button that is unarguably in it rather than by attribute
+    name, so these tests measure the column wherever it ends up living — which
+    is the whole point: the fix moved it inside a scroll area, and an assertion
+    phrased in terms of that scroll area could only ever confirm its own
+    existence.
+    """
+    schedule_card = screen.prepare_btn.parentWidget()
+    assert schedule_card.objectName() == "card", \
+        "Prepare campaign is no longer on a card: %r" % schedule_card
+    return schedule_card.parentWidget()
+
+
+def _laid_out_campaign(screen, size):
+    """The Campaign tab at `size`, with a three-line plan and both buttons up."""
+    _sized(screen, size)
+    screen._goto_tab(1)
+    screen.plan_summary.setText("43 messages over 4 days.<br>"
+                                "First goes out Mon 9:14 AM.<br>"
+                                "Last message lands Thu 12:00 AM")
+    screen.goto_sending_btn.show()
+    _sized(screen, size)
+    return _campaign_column(screen)
+
+
+def _scroll_ancestor(widget):
+    """The scroll area `widget` lives in, if any."""
+    parent = widget.parentWidget()
+    while parent is not None:
+        if isinstance(parent, QScrollArea):
+            return parent
+        parent = parent.parentWidget()
+    return None
+
+
+def test_nothing_in_the_campaign_column_is_placed_out_of_reach():
+    """The defect, stated as the invariant it broke.
+
+    The column asked for more height than the row had and was handed less, so
+    its bottom simply fell off the page: the plan's last line disappeared and
+    the two buttons were pushed into each other, with nothing on screen saying
+    so. Nothing in the column can be made shorter, so the only honest outcomes
+    are 'it fits' or 'it scrolls' — never 'it is quietly cut'.
+    """
+    screen = _screen("outreach")
+    for size in (DEFAULT_SIZE, MINIMUM_SIZE):
+        column = _laid_out_campaign(screen, size)
+        beyond = column.height() - column.parentWidget().height()
+        area = _scroll_ancestor(column)
+        reachable = area.verticalScrollBar().maximum() if area is not None else 0
+        assert beyond <= reachable, (
+            "%dpx of the campaign column hangs past the bottom of what holds "
+            "it at %dx%d and only %d of that can be scrolled to"
+            % ((beyond,) + size + (reachable,)))
+
+        overlap = screen.prepare_btn.geometry().intersected(
+            screen.goto_sending_btn.geometry())
+        assert not overlap.isValid() or overlap.width() * overlap.height() == 0, \
+            "Prepare campaign overlaps Open Sending at %dx%d" % size
+
+
+def test_the_campaign_column_scrolls_exactly_its_overflow():
+    screen = _screen("outreach")
+
+    column = _laid_out_campaign(screen, MINIMUM_SIZE)
+    area = _scroll_ancestor(column)
+    assert area is not None, "the campaign column cannot scroll at all"
+    overflow = column.height() - area.viewport().height()
+    assert overflow > 0, (
+        "the column no longer overflows at the window minimum, so the "
+        "assertion below proves nothing")
+    assert area.verticalScrollBar().maximum() == overflow, (
+        "%dpx of the column is off the bottom and the scrollbar reaches %d"
+        % (overflow, area.verticalScrollBar().maximum()))
+    assert area.horizontalScrollBar().maximum() == 0, \
+        "nothing may be pushed off sideways"
+
+    column = _laid_out_campaign(screen, DEFAULT_SIZE)
+    assert column.height() <= _scroll_ancestor(column).viewport().height(), \
+        "the column overflows even at the default size"
+
+
+# ── U4: the Accounts card during a rehearsal ─────────────────────────────────
+
+def test_a_dry_run_shows_on_the_accounts_card_without_spending_quota():
+    screen = _screen("outreach")
+    app = _app()
+    screen._goto_tab(2)
+    screen._rehearsed.clear()
+    screen._refresh_accounts()
+    app.processEvents()
+
+    def card():
+        holder = screen.accounts_holder.itemAt(0).widget()
+        counter = [lb for lb in holder.findChildren(QLabel) if "today" in lb.text()][0]
+        bar = holder.findChildren(QProgressBar)[0]
+        return counter.text(), bar.value(), counter.toolTip()
+
+    before, before_bar, _ = card()
+    assert "rehearsed" not in before and "0 / 10 today" in before
+
+    worker = OutreachWorker(0, {"dry_run": True}, dry_run=True)
+    screen.send_worker = worker
+    try:
+        for _ in range(2):
+            screen._on_message_sent({"lead_id": 0, "step": 0, "account_email": ACCOUNT})
+    finally:
+        screen.send_worker = None
+    app.processEvents()
+
+    after, after_bar, tip = card()
+    assert "2 rehearsed" in after, "the card said nothing about the rehearsal: %r" % after
+    assert "0 / 10 today" in after, \
+        "a rehearsal must not be added into the real count: %r" % after
+    assert after_bar == before_bar + 2, "the bar gave no feedback during the run"
+    assert "no real quota spent" in tip
+
+    zone = screen.settings.get("send_timezone")
+    assert DB.sent_today(screen.conn, ACCOUNT, zone) == 0, \
+        "a rehearsal spent real quota"
+    screen._rehearsed.clear()
+    screen._refresh_accounts()
+
+
+def test_a_live_send_is_not_counted_as_a_rehearsal():
+    screen = _screen("outreach")
+    screen._rehearsed.clear()
+    worker = OutreachWorker(0, {"dry_run": False}, dry_run=False)
+    screen.send_worker = worker
+    try:
+        screen._on_message_sent({"lead_id": 0, "step": 0, "account_email": ACCOUNT})
+    finally:
+        screen.send_worker = None
+    assert screen._rehearsed == {}, \
+        "a live send was tallied as rehearsed: %s" % screen._rehearsed
+
+
+# ── U5: the postal address box ───────────────────────────────────────────────
+
+def test_a_three_line_address_fits_the_postal_box_whole():
+    screen = _screen("settings")
+    app = _app()
+    for size in (DEFAULT_SIZE, MINIMUM_SIZE):
+        _sized(screen, size)
+        edit = screen.postal_edit
+        edit.setPlainText(ADDRESS)
+        app.processEvents()
+        wanted = edit.document().documentLayout().documentSize().height()
+        assert wanted > 0, "the document was never laid out, so this proves nothing"
+        assert wanted <= edit.viewport().height(), (
+            "the address needs %dpx and the box shows %d at %dx%d"
+            % (wanted, edit.viewport().height(), size[0], size[1]))
+        assert edit.verticalScrollBar().maximum() == 0, \
+            "the address box still scrolls at %dx%d" % size
+
+
+def test_the_postal_box_does_not_creep_when_asked_twice():
+    """It sizes itself from `contentsMargins`, not from a stale viewport."""
+    screen = _screen("settings")
+    screen.postal_edit.setPlainText(ADDRESS)
+    _app().processEvents()
+    first = screen.postal_edit.height()
+    for _ in range(3):
+        screen._fit_postal_box()
+        _app().processEvents()
+    assert screen.postal_edit.height() == first, \
+        "the box grew from %d to %d just by being measured" % (first, screen.postal_edit.height())
+
+
+def test_the_postal_box_keeps_a_floor_and_a_ceiling():
+    screen = _screen("settings")
+    edit = screen.postal_edit
+    edit.setPlainText("")
+    _app().processEvents()
+    empty = edit.height()
+    edit.setPlainText("\n".join("line %d" % n for n in range(30)))
+    _app().processEvents()
+    tall = edit.height()
+    assert empty >= 4 * edit.fontMetrics().lineSpacing(), \
+        "an empty address box no longer reads as one"
+    assert tall > empty, "the box never grows"
+    assert tall <= 11 * edit.fontMetrics().lineSpacing() + 40, \
+        "a pasted essay pushes the rest of the page off screen"
+    edit.setPlainText(ADDRESS)
+
+
+# ── U6: the results table's empty state ──────────────────────────────────────
+
+def _visible_card_text(screen) -> str:
+    card = screen.table_stack.currentWidget().findChild(QFrame, "card")
+    if card is None:
+        return ""
+    return " · ".join(label.text() for label in card.findChildren(QLabel))
+
+
+def test_an_empty_results_table_says_what_to_do_next():
+    screen = _screen("results")
+    screen.results = []
+    screen.table.setRowCount(0)
+    screen._is_running = False
+    screen._update_table_page()
+    _app().processEvents()
+
+    assert screen.table_stack.currentIndex() == screen.NOTHING_PAGE
+    assert screen.table_stack.currentWidget() is not screen.table
+    text = _visible_card_text(screen)
+    assert "Nothing collected" in text and "Home screen" in text, \
+        "the empty table still says nothing: %r" % text
+
+
+def test_a_run_that_has_not_produced_a_row_yet_says_so():
+    screen = _screen("results")
+    screen.results = []
+    screen.table.setRowCount(0)
+    screen._is_running = True
+    screen._update_table_page()
+    try:
+        assert screen.table_stack.currentIndex() == screen.WAITING_PAGE
+        assert "Looking for businesses" in _visible_card_text(screen)
+    finally:
+        screen._is_running = False
+
+
+def test_the_table_comes_back_the_moment_a_row_arrives():
+    screen = _screen("results")
+    screen.setup(["plumbers"], ["Toronto"], ["name", "email"], max_results=10)
+    screen.add_table_row({"name": "Zeta Roofing", "email": "zeta@example.com"})
+    _app().processEvents()
+    assert screen.table_stack.currentWidget() is screen.table
+
+    screen._apply_search("nothing matches this")
+    assert screen.table_stack.currentIndex() == screen.FILTERED_PAGE, \
+        "a filter that hides every row leaves a bare rectangle again"
+    assert "Clear the filter" in _visible_card_text(screen)
+    screen._apply_search("")
+    assert screen.table_stack.currentWidget() is screen.table
+
+
+# ── U7: the export-folder browse button ──────────────────────────────────────
+
+def test_the_browse_button_is_wide_enough_for_its_own_label():
+    screen = _screen("input")
+    for size in (DEFAULT_SIZE, MINIMUM_SIZE):
+        _sized(screen, size)
+        button = screen.export_browse_btn
+        assert button.text() == "…"
+        assert button.width() >= button.sizeHint().width(), (
+            "the browse button is %dpx wide and needs %d at %dx%d, so it "
+            "renders '..'" % (button.width(), button.sizeHint().width()) + size)
+        assert button.height() == 40, "it must stay square-ish beside the field"
+
+
+# ── U8: every colour the sheet writes text in has to clear its ground ────────
+
+_PAGE, _CARD, _AA, _COMPONENT = "#1C1C1E", "#2C2C2E", 4.5, 3.0
+
+
+def _luminance(colour: str) -> float:
+    """Relative luminance of a #RRGGBB, by the WCAG 2.1 definition."""
+    channels = []
+    for start in (1, 3, 5):
+        value = int(colour[start:start + 2], 16) / 255
+        channels.append(value / 12.92 if value <= 0.03928
+                        else ((value + 0.055) / 1.055) ** 2.4)
+    return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+
+
+def _contrast(one: str, other: str) -> float:
+    first, second = _luminance(one), _luminance(other)
+    return (max(first, second) + 0.05) / (min(first, second) + 0.05)
+
+
+def _sheet() -> str:
+    return re.sub(r"/\*.*?\*/", "", APP.QSS, flags=re.S)
+
+
+def _ink_rules() -> list:
+    """(selector, colour, grounds) for every rule that paints text.
+
+    A rule that names its own background is measured against that; anything
+    else is transparent and can land on either ground, so it is measured
+    against both. `:disabled` is skipped, and only because WCAG exempts an
+    inactive component — not because those greys would pass.
+    """
+    rules = []
+    for selector, body in re.findall(r"([^{}]+)\{([^{}]*)\}", _sheet()):
+        selector = " ".join(selector.split())
+        ink = re.search(r"(?<!-)\bcolor:\s*(#[0-9A-Fa-f]{6})", body)
+        if ink is None or ":disabled" in selector:
+            continue
+        own = re.search(r"background(?:-color)?:\s*(#[0-9A-Fa-f]{6})", body)
+        grounds = [own.group(1).upper()] if own else [_PAGE, _CARD]
+        rules.append((selector, ink.group(1).upper(), grounds))
+    return rules
+
+
+def test_the_two_grounds_are_the_ones_that_actually_paint():
+    """The ratios below are worth no more than the grounds they assume.
+
+    Both are read off rendered pixels rather than off the sheet, since a card
+    that turned out to paint something else would make every ratio in this
+    section a different number.
+    """
+    page = _histogram(_sized(_screen("input"), DEFAULT_SIZE))
+    assert max(page, key=page.get) == _PAGE, \
+        "the page paints %s" % max(page, key=page.get)
+
+    outreach = _screen("outreach")
+    outreach._goto_tab(1)
+    frame = outreach.prepare_btn.parentWidget()
+    assert frame.objectName() == "card", \
+        "this is measuring %r, not a card" % frame.objectName()
+    card = _histogram(frame)
+    assert max(card, key=card.get) == _CARD, \
+        "a card paints %s" % max(card, key=card.get)
+
+
+def test_no_text_colour_falls_under_aa_on_either_ground():
+    """The defect: a grey chosen on the page and then used on a card.
+
+    #8E8E93 measures 5.22:1 on #1C1C1E and 4.27:1 on #2C2C2E, so every label
+    that moved onto a card took a passing colour under the floor with it. The
+    sweep is over the whole sheet because fixing the two labels that were
+    reported and leaving the next one for the next pass is how this got here.
+    """
+    under = ["%s — %s on %s is %.2f:1" % (selector, ink, ground,
+                                          _contrast(ink, ground))
+             for selector, ink, grounds in _ink_rules() for ground in grounds
+             if _contrast(ink, ground) < _AA]
+    assert not under, "text under %.1f:1:\n  %s" % (_AA, "\n  ".join(under))
+
+
+def test_the_primary_button_reads_in_every_state_it_paints():
+    """Start Scraping, Audit all, Prepare campaign, Start sending, Save.
+
+    14px/600 is not WCAG large text, so its label needs 4.5:1 on all three
+    live fills — and the fills themselves need to stay 3:1 clear of the cards
+    they sit on, or the button stops looking like one. Those two pull in
+    opposite directions, which is the trap: darkening the green until white
+    passes walks the fill straight into the card.
+    """
+    sheet = _sheet()
+    ink = re.search(r"QPushButton#start_btn\s*\{[^}]*?(?<!-)\bcolor:\s*"
+                    r"(#[0-9A-Fa-f]{6})", sheet).group(1).upper()
+    fills = [fill.upper() for fill in re.findall(
+        r"QPushButton#start_btn(?::(?:hover|pressed))?\s*\{[^}]*?"
+        r"background-color:\s*(#[0-9A-Fa-f]{6})", sheet)]
+    assert len(fills) == 3, "base, :hover and :pressed, not %s" % fills
+
+    for fill in fills:
+        assert _contrast(ink, fill) >= _AA, \
+            "%s on %s is %.2f:1" % (ink, fill, _contrast(ink, fill))
+        assert _contrast(fill, _CARD) >= _COMPONENT, (
+            "%s on a card is %.2f:1, so the button has no edge left"
+            % (fill, _contrast(fill, _CARD)))
+
+    base, hover, pressed = fills
+    for state, fill in (("hover", hover), ("pressed", pressed)):
+        assert _contrast(base, fill) >= 1.15, (
+            ":%s is %s against a %s base — %.2f:1, which is no feedback at "
+            "all" % (state, fill, base, _contrast(base, fill)))

@@ -4,13 +4,52 @@ from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
     QWidget, QLabel, QPushButton, QLineEdit, QMenu, QApplication,
     QProgressBar, QTableWidget, QTableWidgetItem,
-    QHBoxLayout, QVBoxLayout,
+    QFrame, QHBoxLayout, QStackedWidget, QVBoxLayout,
     QHeaderView, QAbstractItemView,
     QSizePolicy,
 )
 
 from core.exporter import export_csv, FIELD_LABELS
 from core.scraper import ScrapeWorker
+
+
+def _empty_state(headline: str, sentence: str) -> QWidget:
+    """A card that says what is missing and what to do about it.
+
+    Same shape as the outreach screen's empty tables, because it is the same
+    problem: with nothing collected this table was a bare bordered rectangle
+    400px tall — no header row, no message, no next action — and it is the
+    largest thing on the screen a scrape is watched from.
+    """
+    page = QWidget()
+    box = QVBoxLayout(page)
+    box.setContentsMargins(0, 0, 0, 0)
+    box.addStretch()
+
+    frame = QFrame()
+    frame.setObjectName("card")
+    frame.setMaximumWidth(460)
+    inner = QVBoxLayout(frame)
+    inner.setContentsMargins(16, 14, 16, 14)
+    inner.setSpacing(6)
+
+    title = QLabel(headline)
+    title.setObjectName("count_label")
+    title.setAlignment(Qt.AlignCenter)
+    inner.addWidget(title)
+    body = QLabel(sentence)
+    body.setObjectName("hint")
+    body.setWordWrap(True)
+    body.setAlignment(Qt.AlignCenter)
+    inner.addWidget(body)
+
+    row = QHBoxLayout()
+    row.addStretch()
+    row.addWidget(frame)
+    row.addStretch()
+    box.addLayout(row)
+    box.addStretch()
+    return page
 
 
 class SortableItem(QTableWidgetItem):
@@ -34,6 +73,7 @@ class SortableItem(QTableWidgetItem):
 class ResultsScreen(QWidget):
     stop_signal = pyqtSignal()
     home_signal = pyqtSignal()
+    outreach_signal = pyqtSignal(list)   # the collected records, handed to the outreach screen
 
     TOAST_MS = 6000
 
@@ -83,6 +123,12 @@ class ResultsScreen(QWidget):
         self.export_btn.setToolTip("Save the current results to a CSV file")
         self.export_btn.clicked.connect(self._on_export_clicked)
 
+        self.outreach_btn = QPushButton("Start Outreach")
+        self.outreach_btn.setObjectName("outlined")
+        self.outreach_btn.setFixedHeight(30)
+        self.outreach_btn.setToolTip("Audit these businesses and prepare a cold-email campaign")
+        self.outreach_btn.clicked.connect(self._on_outreach_clicked)
+
         self.action_btn = QPushButton("Stop")
         self.action_btn.setObjectName("danger")
         self.action_btn.setFixedHeight(30)
@@ -91,6 +137,7 @@ class ResultsScreen(QWidget):
         top_row.addWidget(name_lbl)
         top_row.addStretch()
         top_row.addWidget(self.export_btn)
+        top_row.addWidget(self.outreach_btn)
         top_row.addWidget(self.pause_btn)
         top_row.addWidget(self.action_btn)
         header_layout.addLayout(top_row)
@@ -184,7 +231,28 @@ class ResultsScreen(QWidget):
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_row_menu)
         self.table.cellDoubleClicked.connect(self._on_cell_double_clicked)
-        body_layout.addWidget(self.table, stretch=1)
+
+        self.table_stack = QStackedWidget()
+        self.table_stack.addWidget(self.table)
+        self.empty_waiting = _empty_state(
+            "Looking for businesses",
+            "Nothing has come back yet. Each business appears here the moment "
+            "it is read off the map, and the counter above tracks how far "
+            "through the run this is.")
+        self.table_stack.addWidget(self.empty_waiting)
+        self.empty_nothing = _empty_state(
+            "Nothing collected",
+            "This run finished without a single business. Try a broader area "
+            "or a different search term on the Home screen, and loosen the "
+            "'must have' filters — those drop a listing before it ever "
+            "reaches this table.")
+        self.table_stack.addWidget(self.empty_nothing)
+        self.empty_filtered = _empty_state(
+            "No row matches that filter",
+            "Every collected business is still here. Clear the filter box "
+            "above to see them again.")
+        self.table_stack.addWidget(self.empty_filtered)
+        body_layout.addWidget(self.table_stack, stretch=1)
 
         hint = QLabel("Double-click a row to open it in Google Maps · right-click for more · click a header to sort")
         hint.setObjectName("hint")
@@ -216,6 +284,7 @@ class ResultsScreen(QWidget):
         self._restyle(self.action_btn)
         self.action_btn.setEnabled(True)
         self.table.setSortingEnabled(False)
+        self._update_table_page()
 
     def _set_idle_mode(self):
         self._is_running = False
@@ -226,6 +295,7 @@ class ResultsScreen(QWidget):
         self._restyle(self.action_btn)
         self.action_btn.setEnabled(True)
         self.table.setSortingEnabled(True)  # allow header-click sorting once done
+        self._update_table_page()
 
     # ── setup / worker ───────────────────────────────────────────────────────
     def setup(self, domains, areas, fields, headless=False, max_results=50,
@@ -382,6 +452,8 @@ class ResultsScreen(QWidget):
             self.table.scrollToBottom()
         self._update_row_count()
 
+    TABLE_PAGE, WAITING_PAGE, NOTHING_PAGE, FILTERED_PAGE = range(4)
+
     def _update_row_count(self):
         total = len(self.results)
         visible = sum(0 if self.table.isRowHidden(r) else 1 for r in range(self.table.rowCount()))
@@ -389,6 +461,27 @@ class ResultsScreen(QWidget):
             self.row_count_label.setText(f"{visible} of {total} rows")
         else:
             self.row_count_label.setText(f"{total} row{'s' if total != 1 else ''}")
+        self._update_table_page()
+
+    def _update_table_page(self):
+        """Which of the four pages the table area shows.
+
+        Three different nothings, and they need three different sentences: a run
+        that has not produced its first row yet, a run that produced none at
+        all, and a filter box that has hidden every row there is.
+        """
+        total = len(self.results)
+        visible = sum(0 if self.table.isRowHidden(r) else 1
+                      for r in range(self.table.rowCount()))
+        if visible:
+            page = self.TABLE_PAGE
+        elif total:
+            page = self.FILTERED_PAGE
+        elif self._is_running:
+            page = self.WAITING_PAGE
+        else:
+            page = self.NOTHING_PAGE
+        self.table_stack.setCurrentIndex(page)
 
     def _row_matches(self, row: int, text: str) -> bool:
         for col in range(self.table.columnCount()):
@@ -534,6 +627,7 @@ class ResultsScreen(QWidget):
         self.count_label.setText("0")
         self.progress_bar.setValue(0)
         self.row_count_label.setText("")
+        self._update_table_page()
         self.status_label.setText("Continuing to next search…")
         self.worker.continue_next_domain()
 
@@ -571,6 +665,12 @@ class ResultsScreen(QWidget):
             return
         d, a = self._current_task()
         self._notify_task_export(d, a, len(self.results), False)
+
+    def _on_outreach_clicked(self):
+        if not self.results:
+            self._show_toast("Nothing to send outreach to yet.")
+            return
+        self.outreach_signal.emit(list(self.results))
 
     def _on_action_clicked(self):
         if self._is_running:

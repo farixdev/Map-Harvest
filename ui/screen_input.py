@@ -7,7 +7,7 @@ from PyQt5.QtWidgets import (
     QHBoxLayout, QVBoxLayout, QFrame,
     QScrollArea, QStackedWidget, QButtonGroup,
     QSlider, QSpinBox, QDoubleSpinBox, QComboBox,
-    QListWidget, QListWidgetItem, QFileDialog,
+    QListWidget, QListWidgetItem, QFileDialog, QSizePolicy,
 )
 
 from core.settings import load_settings, save_settings, add_saved_search
@@ -17,6 +17,7 @@ from ui.domain_list_dialog import DomainListDialog, ListDialog
 class InputScreen(QWidget):
     # domains, areas, fields, headless, max_results, export_dir, filters
     start_signal = pyqtSignal(list, list, list, bool, int, str, dict)
+    settings_signal = pyqtSignal()
 
     FIELD_KEYS = [
         "name", "category", "rating", "review_count", "hours",
@@ -179,7 +180,13 @@ class InputScreen(QWidget):
         export_row.setSpacing(10)
         self.export_browse_btn = QPushButton("…")
         self.export_browse_btn.setObjectName("outlined")
-        self.export_browse_btn.setFixedSize(40, 40)
+        # Height fixed, width only floored. The sheet's 16px horizontal padding
+        # puts the ellipsis' own sizeHint at 45px, so a hard 40 clipped it back
+        # to a bare '..' on the first screen a new user sees — and any font or
+        # translation that needs more would clip it again.
+        self.export_browse_btn.setFixedHeight(40)
+        self.export_browse_btn.setMinimumWidth(40)
+        self.export_browse_btn.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
         self.export_browse_btn.setToolTip("Choose folder for automatic CSV exports")
         self.export_browse_btn.clicked.connect(self._browse_export_dir)
         self.export_dir_input = QLineEdit()
@@ -439,10 +446,51 @@ class InputScreen(QWidget):
         cap_hint.setWordWrap(True)
         layout.addSpacing(6)
         layout.addWidget(cap_hint)
+        layout.addSpacing(26)
+
+        # Outreach has far more settings than fit beside a checkbox and a spin
+        # box, so it gets its own screen. What stays here is a read-only summary
+        # of the handful of values that decide whether a campaign can send at
+        # all — enough to notice "no sending accounts" without leaving this tab.
+        layout.addWidget(self._section_label("Outreach"))
+        layout.addSpacing(10)
+        self.outreach_summary = QLabel("")
+        self.outreach_summary.setObjectName("muted")
+        self.outreach_summary.setWordWrap(True)
+        layout.addWidget(self.outreach_summary)
+        layout.addSpacing(12)
+        settings_row = QHBoxLayout()
+        open_settings_btn = QPushButton("Open full settings")
+        open_settings_btn.setObjectName("outlined")
+        open_settings_btn.setFixedHeight(32)
+        open_settings_btn.clicked.connect(self.settings_signal.emit)
+        settings_row.addWidget(open_settings_btn)
+        settings_row.addStretch()
+        layout.addLayout(settings_row)
+        layout.addSpacing(6)
+        outreach_hint = QLabel(
+            "Sender profile, AI provider, Gmail accounts, sending window and "
+            "compliance live there."
+        )
+        outreach_hint.setObjectName("hint")
+        outreach_hint.setWordWrap(True)
+        layout.addWidget(outreach_hint)
         layout.addStretch()
 
         scroll.setWidget(page)
         return scroll
+
+    def _update_outreach_summary(self):
+        accounts = [a for a in (self.settings.get("smtp_accounts") or [])
+                    if isinstance(a, dict) and a.get("enabled", True) and a.get("email")]
+        provider = str(self.settings.get("ai_provider") or "auto")
+        start = self.settings.get("send_start_hour", 9)
+        end = self.settings.get("send_end_hour", 17)
+        mode = "Dry run — nothing is sent" if self.settings.get("dry_run", True) else "LIVE — real emails send"
+        self.outreach_summary.setText(
+            f"{len(accounts)} sending account{'s' if len(accounts) != 1 else ''} · "
+            f"AI {provider} · window {start}:00–{end}:00 · {mode}"
+        )
 
     def _section_label(self, text: str) -> QLabel:
         lbl = QLabel(text.upper())
@@ -474,6 +522,18 @@ class InputScreen(QWidget):
             w.clear()
 
     # ── Settings glue ────────────────────────────────────────────────────────
+    def apply_settings(self, settings: dict):
+        """Adopt a settings dict written elsewhere (the full settings screen).
+
+        Both screens hold their own copy of the file. Without this the next
+        `_persist_settings` here would write a copy loaded before the outreach
+        settings existed and roll the whole lot back.
+        """
+        if not isinstance(settings, dict):
+            return
+        self.settings = settings
+        self._apply_settings_to_ui()
+
     def _apply_settings_to_ui(self):
         cap = int(self.settings.get("max_limit_cap", 100))
         default_max = int(self.settings.get("default_max_results", 50))
@@ -491,6 +551,7 @@ class InputScreen(QWidget):
         export_dir = self.settings.get("export_dir") or ""
         self.export_dir_input.setText(export_dir)
         self._refresh_saved_list()
+        self._update_outreach_summary()
 
     def _update_slider_cap(self, cap: int):
         value = self.max_results_slider.value()
