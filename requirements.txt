@@ -2,4 +2,8 @@ PyQt5>=5.15.0
 selenium>=4.18.0
 undetected-chromedriver>=3.5.0
 lxml>=5.0.0
+# Data, not code: Windows ships no tz database at all, and without one every
+# IANA name a user picks for the sending window resolves to this machine's
+# clock instead — so the mail goes out at the wrong hour in the reader's day.
+tzdata>=2024.1
 

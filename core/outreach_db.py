@@ -40,7 +40,12 @@ DB_FILENAME = "outreach.db"
 
 LEAD_STATUSES = ("new", "audited", "queued", "sent", "replied",
                  "bounced", "skipped", "suppressed")
-MESSAGE_STATUSES = ("queued", "sending", "sent", "failed",
+# 'rehearsed' is a dry run's record of a message it built and did not send. It
+# earns a status of its own because every question worth asking about a message
+# — has it gone, may this lead be contacted, is the queue empty — is a status
+# query, and one that could not tell a rehearsal from a send is what made a
+# stranger's first ever email read "Bumping my last email".
+MESSAGE_STATUSES = ("queued", "sending", "sent", "rehearsed", "failed",
                     "skipped", "bounced", "replied")
 
 _HOUR_SEC = 3600.0
@@ -484,10 +489,16 @@ _MESSAGE_UPDATABLE = ("sent_at", "error", "message_id", "account_email",
 
 
 def first_touch_message_id(conn, campaign_id: int, lead_id: int) -> str:
-    """The Message-ID of this lead's step-0 message, once it has been sent."""
+    """The Message-ID of this lead's step-0 message, once it has been sent.
+
+    Scoped to a real send, not merely to a row carrying a header id: a chaser
+    that says `In-Reply-To` a message nobody ever received shows up in the
+    recipient's client as an answer to a conversation they were never part of.
+    """
     rows = _query(conn,
                   "SELECT message_id FROM messages WHERE campaign_id = ? AND lead_id = ? "
-                  "AND step = 0 AND message_id != '' ORDER BY id LIMIT 1",
+                  "AND step = 0 AND status = 'sent' AND message_id != '' "
+                  "ORDER BY id LIMIT 1",
                   (_int(campaign_id), _int(lead_id)))
     return _text(rows[0].get("message_id")) if rows else ""
 
@@ -498,6 +509,29 @@ def claimed_messages(conn, campaign_id: int = 0) -> list[dict]:
         return _query(conn, "SELECT * FROM messages WHERE status = 'sending' "
                             "AND campaign_id = ? ORDER BY id", (_int(campaign_id),))
     return _query(conn, "SELECT * FROM messages WHERE status = 'sending' ORDER BY id")
+
+
+def requeue_rehearsed(conn, campaign_id: int = 0) -> int:
+    """Put every rehearsed message back on the queue. Returns how many.
+
+    A rehearsal has to hand the campaign back exactly as it found it. Nothing
+    it marked ever left the machine, so every one of those rows is still owed
+    to its lead, and a dry run that kept them would be the reason the next real
+    run had no first touches left to send.
+
+    `sent_at` and `error` go back with the status, so a restored row is
+    indistinguishable from one that was never rehearsed.
+    """
+    campaign_id = _int(campaign_id)
+    scope = " AND campaign_id = ?" if campaign_id else ""
+    params = (campaign_id,) if campaign_id else ()
+    with _LOCK:
+        pending = _scalar(conn, "SELECT COUNT(*) FROM messages "
+                                "WHERE status = 'rehearsed'" + scope, params)
+        if pending:
+            _write(conn, "UPDATE messages SET status = 'queued', sent_at = 0, error = '' "
+                         "WHERE status = 'rehearsed'" + scope, params)
+        return pending
 
 
 def mark_message(conn, message_id, /, status: str, **fields) -> None:
@@ -546,6 +580,10 @@ def suppress(conn, email: str, reason: str) -> None:
     Cancelling the queued messages is the whole point: by the time somebody
     unsubscribes, their follow-ups are already scheduled days out, and leaving
     them queued would send mail to a person who has explicitly opted out.
+
+    A rehearsed row is cancelled with them. It is a message still owed to this
+    lead, and `requeue_rehearsed` would put it straight back on the queue, so
+    an opt-out that skipped over it would hold only until the next dry run.
     """
     address = _email(email)
     if "@" not in address:
@@ -559,7 +597,7 @@ def suppress(conn, email: str, reason: str) -> None:
                (address, _text(reason), now))
         _write(conn,
                "UPDATE messages SET status = 'skipped', error = 'suppressed' "
-               "WHERE status IN ('queued', 'sending') "
+               "WHERE status IN ('queued', 'sending', 'rehearsed') "
                "AND lead_id IN (SELECT id FROM leads WHERE LOWER(email) = ?)",
                (address,))
         _write(conn, "UPDATE leads SET status = 'suppressed', updated_at = ? "

@@ -22,6 +22,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core import mailer as M  # noqa: E402
+from core import templates as T  # noqa: E402
 
 BASE = {
     "to_email": "owner@acmeplumbing.ca",
@@ -104,6 +105,67 @@ def test_header_injection():
     assert set(reparsed.keys()).isdisjoint({"Bcc", "X-Evil"}), reparsed.keys()
     assert _recipients_of(reparsed) == ["owner@acmeplumbing.ca"]
     print("header injection: OK")
+
+
+# Every spelling of a reply prefix a real client emits, and the repeats and
+# leading whitespace that arrive with a forwarded thread.
+REPLY_PREFIXED = (
+    "Re: booking on acme.ca", "re: booking on acme.ca", "RE: booking on acme.ca",
+    "Fwd: booking on acme.ca", "fwd: booking on acme.ca", "FW: booking on acme.ca",
+    "Re: Re: Re: booking on acme.ca", "Re: Fwd: booking on acme.ca",
+    "   Re:   booking on acme.ca",
+)
+
+# Businesses whose names open on the same three letters. RE/MAX trades as
+# "Re-Max", and the sample list this app ships is roofing contractors, where
+# "Re-Roof" and "Re-Cover" are ordinary trading names.
+HYPHENATED_NAMES = (
+    "Re-Max Realty", "Re-Roof Toronto", "Re-Cover Roofing", "Re-Store Windows",
+    "Fwd-Thinking Design", "Forward-Motion Physio",
+)
+
+
+def _builtin(template_id: str) -> T.Template:
+    """A shipped template without going near the store, so this file still runs
+    standalone, outside the conftest that redirects the profile."""
+    return next(t for t in T.BUILTIN_TEMPLATES if t.id == template_id)
+
+
+def test_only_a_colon_marks_a_reply():
+    """A hyphen inside a name is not a reply prefix.
+
+    Accepting one meant "Re-Max Realty" was read as a reply to "Max Realty" and
+    the amputated name went out as the Subject header. The strip itself still
+    has to work: a manufactured `Re:` on a first cold email is the misleading
+    subject line CAN-SPAM prohibits, so neither half of this is optional.
+    """
+    for raw in REPLY_PREFIXED:
+        assert M._plain_subject(raw) == "booking on acme.ca", raw
+        assert _build(subject=raw)[0]["Subject"] == "booking on acme.ca", raw
+
+    for name in HYPHENATED_NAMES:
+        assert M._plain_subject(name) == name, name
+        assert _build(subject=name)[0]["Subject"] == name, name
+
+    # The guarantee is written twice on purpose — `core.templates` strips on the
+    # way out of render, `core.mailer` strips again at the wire — so the two
+    # have to answer identically or one of them is a hole in it.
+    for raw in REPLY_PREFIXED + HYPHENATED_NAMES:
+        assert T._subject_rules(raw) == M._plain_subject(raw), raw
+    print("only a colon marks a reply: OK")
+
+
+def test_a_hyphenated_name_survives_render_to_the_wire():
+    """A lead whose audit found no gaps falls through to its business name as the
+    whole subject, so a mangled name is the entire line the reader sees."""
+    for name in HYPHENATED_NAMES:
+        ctx = {"business_name": name, "first_name": "there",
+               "sender_name": "Umar Farooq", "sender_title": "Automation lead",
+               "company": "Auto Army"}
+        subject, text, html = T.render(_builtin("gap_direct"), ctx)
+        assert subject == name, (name, subject)
+        assert _build(subject=subject, body_text=text, body_html=html)[0]["Subject"] == name, name
+    print("hyphenated name survives to the wire: OK")
 
 
 # ── Body ──
@@ -344,6 +406,8 @@ if __name__ == "__main__":
     test_unsubscribe_falls_back_to_sender()
     test_supplied_message_id()
     test_header_injection()
+    test_only_a_colon_marks_a_reply()
+    test_a_hyphenated_name_survives_render_to_the_wire()
     test_alternative_ordering()
     test_plain_only_when_no_html()
     test_no_tracking()

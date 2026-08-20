@@ -64,12 +64,18 @@ QLineEdit:focus, QTextEdit:focus {
     outline: none;
 }
 
+/* The 2px border here is the focus ring, spending its unfocused life as
+   `transparent` — see the `:focus` rule at the end of the button block. Every
+   variant carries a 2px border for the same reason, and the ones that already
+   drew a hairline were widened to 2px rather than left at 1px so the ring is
+   one thickness everywhere. Padding drops by the 2px the border takes back, so
+   the contents rect and every sizeHint land exactly where they did before. */
 QPushButton {
     background-color: #636366;
     color: #FFFFFF;
-    border: none;
+    border: 2px solid transparent;
     border-radius: 8px;
-    padding: 0 16px;
+    padding: 0 14px;
     height: 36px;
     font-size: 13px;
     font-weight: 500;
@@ -87,7 +93,7 @@ QPushButton:disabled {
 QPushButton#outlined {
     background-color: transparent;
     color: #E5E5E7;
-    border: 1px solid #48484A;
+    border: 2px solid #48484A;
 }
 
 QPushButton#outlined:hover {
@@ -102,13 +108,13 @@ QPushButton#outlined:disabled {
 QPushButton#danger {
     background-color: transparent;
     color: #FF6B6B;
-    border: 1px solid rgba(255, 107, 107, 0.35);
+    border: 2px solid rgba(255, 107, 107, 0.35);
 }
 
 QPushButton#live {
     background-color: #B3261E;
     color: #FFFFFF;
-    border: 1px solid #D4483F;
+    border: 2px solid #D4483F;
     font-weight: 600;
 }
 
@@ -119,7 +125,7 @@ QPushButton#live:hover {
 QPushButton#rehearsal {
     background-color: transparent;
     color: #A0A0A6;
-    border: 1px dashed #5A5A5E;
+    border: 2px dashed #5A5A5E;
     font-weight: 500;
 }
 
@@ -260,9 +266,9 @@ QLabel#section_label {
 QPushButton#tab {
     background-color: transparent;
     color: #AEAEB2;
-    border: none;
+    border: 2px solid transparent;
     border-radius: 6px;
-    padding: 6px 14px;
+    padding: 4px 12px;
     height: 28px;
     font-size: 12px;
     font-weight: 500;
@@ -398,9 +404,23 @@ QListWidget#saved_list::item {
     border-radius: 4px;
 }
 
-QListWidget#saved_list::item:selected {
-    background-color: #3A3A3C;
-    color: #E5E5E7;
+/* Which row is selected has to survive being read as a shape, not only as
+   brighter text: #3A3A3C on the list's own #242426 is a 1.37:1 ground change,
+   well under the 3:1 WCAG 1.4.11 asks of anything carrying state. #727276 is
+   as far up as this grey can go and still keep its label over AA — 3.23:1
+   against the unselected ground, 4.79:1 for the ink — so the rail carries the
+   rest at 15.49:1, and the 3px it costs comes back out of the padding, or the
+   label would jump sideways as rows are picked.
+
+   `:hover` is spelled out here because `::item:hover` matches the selected row
+   too, and a fill of #2C2C2E is how mousing across the list used to wipe the
+   selection out from under the pointer. */
+QListWidget#saved_list::item:selected,
+QListWidget#saved_list::item:selected:hover {
+    background-color: #727276;
+    color: #FFFFFF;
+    border-left: 3px solid #FFFFFF;
+    padding-left: 5px;
 }
 
 QListWidget#saved_list::item:hover {
@@ -427,11 +447,11 @@ QLabel#toast {
 QPushButton#start_btn {
     background-color: #22A559;
     color: #000000;
-    border: none;
+    border: 2px solid transparent;
     border-radius: 8px;
     font-size: 14px;
     font-weight: 600;
-    padding: 0 20px;
+    padding: 0 18px;
 }
 
 QPushButton#start_btn:hover {
@@ -504,9 +524,9 @@ QMenu::separator {
 QPushButton#reveal {
     background-color: transparent;
     color: #AEAEB2;
-    border: 1px solid #3A3A3C;
+    border: 2px solid #3A3A3C;
     border-radius: 6px;
-    padding: 0 8px;
+    padding: 0 6px;
     height: 34px;
     font-size: 11px;
     font-weight: 500;
@@ -520,6 +540,41 @@ QPushButton#reveal:hover {
 QPushButton#reveal:checked {
     color: #E5E5E7;
     background-color: #3A3A3C;
+}
+
+/* Keyboard focus. `outline` was the obvious property and it is the wrong one:
+   Qt paints an outline on the CONTENTS rect, not outside the border box, so
+   the 2px white ring landed inside the padding and came out exactly the width
+   of the label — a line struck through the text of 29 of the 36 focusable
+   buttons, the one holding focus at startup included. The ring is the border
+   instead, held at 2px in every state so the box never changes size and only
+   its colour moves; each variant's padding gave up the 2px the border took, so
+   no contents rect moved either.
+
+   Every id is named because Qt ranks selectors by CSS2 specificity: a bare
+   `QPushButton:focus` loses to `QPushButton#outlined` on `border`, and the
+   button would keep its grey hairline while focused. The rule sits last in the
+   sheet for the same arithmetic one rung down — `#reveal:hover` also writes
+   `border-color` and ties with `#reveal:focus`, and a tie goes to whichever
+   came later, so a focused button under the pointer would otherwise lose its
+   ring.
+
+   White is the one ink that clears 3:1 on every fill a button can have —
+   5.99:1 on the default grey, 3.18:1 on #start_btn's green, 6.54:1 on #live's
+   red — and it clears it again on both grounds the ring's outer edge meets,
+   17.01:1 on the page and 13.94:1 on a card. A ring at the button's edge
+   cannot be read as :hover or :checked, which are both fills, and it is a long
+   way from every hairline it replaces: 9.12:1 apart from #outlined's #48484A,
+   6.87:1 from #rehearsal's #5A5A5E, 4.38:1 from #live's #D4483F. */
+QPushButton:focus,
+QPushButton#outlined:focus,
+QPushButton#danger:focus,
+QPushButton#live:focus,
+QPushButton#rehearsal:focus,
+QPushButton#tab:focus,
+QPushButton#start_btn:focus,
+QPushButton#reveal:focus {
+    border: 2px solid #FFFFFF;
 }
 
 QLabel#status_ok {

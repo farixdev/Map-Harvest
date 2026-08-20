@@ -8,9 +8,10 @@ is discovered here, offline and for free, and the model only ever receives
 
 The output that earns its keep is `gaps`. Each detected gap carries the Auto Army
 services that close it, resolved through `core.templates.AUTO_ARMY_SERVICES` so
-the pitch can never name a capability the business does not actually sell. Order
-is part of the contract: severity first, catalogue order second, so `gaps[0]` is
-always the headline the email leads with.
+the pitch can never name a capability the business does not actually sell. A gap
+the catalogue has no answer for carries none, and that is what orders the list:
+gaps with an offer behind them first, then severity, then catalogue order, so
+`gaps[0]` is always a headline the email can follow with an offer.
 
 Detection is deliberately conservative. A wrong "no online booking" in a live
 cold email is worse than a missed gap: it tells the reader you did not look. So a
@@ -41,9 +42,11 @@ from core.templates import AUTO_ARMY_SERVICES
 
 # ── Service resolution ──
 
-# lower() -> the catalogue's own spelling. Category names count as services:
-# "Lead Automation" and "CRM & Sales Automation" are how the seller pitches
-# whole lines of work.
+# lower() -> the catalogue's own spelling. Category names count here: a gap is
+# sometimes closed by a whole line of work rather than by one item, and
+# "CRM & Sales Automation" is how the seller names that line. It is a heading,
+# though, so it is a fact about the gap and never copy — `core.templates`
+# resolves it to an entry beneath it before a prospect reads the sentence.
 _CATALOGUE_INDEX: dict[str, str] = {}
 for _category, _names in AUTO_ARMY_SERVICES.items():
     _CATALOGUE_INDEX.setdefault(_category.lower(), _category)
@@ -108,12 +111,19 @@ GAP_CATALOGUE: dict[str, dict] = {
     "no_analytics": {
         "title": "nothing measuring the site", "severity": 2,
         "subject_phrase": "measuring the site",
-        "services": _svc("automated reports", "reporting"),
+        # Not "reporting" beside "automated reports": the pair is one offer said
+        # twice, and the second word alone reads as a heading in a list.
+        "services": _svc("automated reports", "competitor monitoring"),
     },
     "careers_manual": {
         "title": "careers handled manually", "severity": 2,
         "subject_phrase": "the careers page",
-        "services": _svc("HR processes", "employee onboarding"),
+        # Not "HR processes" in front: it is a real catalogue entry, but in the
+        # slot that reads "the fix is ___" it names a department rather than a
+        # thing that gets built. What the gap is about is CVs arriving to be
+        # read and sorted, and a hire that then has to be walked through a week
+        # of paperwork by hand.
+        "services": _svc("employee onboarding", "AI document/data extraction"),
     },
     "ecommerce_manual": {
         "title": "orders handled by hand", "severity": 2,
@@ -130,12 +140,23 @@ GAP_CATALOGUE: dict[str, dict] = {
     "multi_location": {
         "title": "several locations, one inbox", "severity": 2,
         "subject_phrase": "running several locations",
-        "services": _svc("automated reports", "Business Process Automation"),
+        # Same rule as no_analytics, and the same reason: "reporting" beside
+        # "automated reports" is one offer said twice. The second slot goes to
+        # what the gap is actually about — a message arriving for one branch and
+        # having to find its way to that branch.
+        "services": _svc("automated reports", "lead assignment"),
     },
     "no_mobile": {
         "title": "no mobile layout", "severity": 2,
         "subject_phrase": "the site on phones",
-        "services": _svc("Business Process Automation"),
+        # Empty on purpose. The catalogue automates the work behind a business;
+        # it does not build websites, and nothing in it makes a desktop layout
+        # fit a phone. An offer here would have to be borrowed from an unrelated
+        # line, and the reader parses "no mobile layout, so we build approval
+        # systems" as a broken mail merge. `_gaps` sorts a gap carrying no
+        # services behind every gap that carries one, so this is evidence and a
+        # score, and it never becomes the sentence an offer has to follow.
+        "services": [],
     },
     "stale_blog": {
         "title": "a blog that has gone quiet", "severity": 1,
@@ -150,12 +171,19 @@ GAP_CATALOGUE: dict[str, dict] = {
     "stale_site": {
         "title": "a site nobody has touched in years", "severity": 1,
         "subject_phrase": "keeping the site current",
-        "services": _svc("Business Process Automation"),
+        # This one does map, and to the same work as `stale_blog`: the finding is
+        # that nobody remembers to put anything new on the site, and what the
+        # catalogue sells against that is content that arrives without anybody
+        # remembering. The subject phrase already says it — "keeping the site
+        # current".
+        "services": _svc("AI content generation", "content pipelines"),
     },
     "slow_site": {
         "title": "a slow site", "severity": 1,
         "subject_phrase": "the site speed",
-        "services": _svc("Business Process Automation"),
+        # Empty for the reason `no_mobile` is empty: page speed is hosting,
+        # images and front-end work, and the catalogue sells none of it.
+        "services": [],
     },
     "no_schema": {
         "title": "nothing search engines can read", "severity": 1,
@@ -946,7 +974,13 @@ def _gaps(tech: dict, signals: dict, facts: dict) -> list[dict]:
                           "enquiry has to ask"))
 
     order = list(GAP_CATALOGUE)
-    fired.sort(key=lambda g: (-g["severity"], order.index(g["code"])))
+    # A gap with nothing in the catalogue behind it sorts last whatever its
+    # severity. The email names `gaps[0]` and then makes an offer, so a headline
+    # with no offer behind it either borrows an unrelated one or leaves the
+    # reader with a sentence that answers nothing. It still fires, still scores
+    # and still reaches the model's brief, where it is an observation and not a
+    # promise.
+    fired.sort(key=lambda g: (not g["services"], -g["severity"], order.index(g["code"])))
     return fired
 
 

@@ -201,38 +201,104 @@ def top_services(services=(), limit: int = 6) -> list[str]:
 # carries its own `services`, and these are appended behind them so the two
 # priority lines surface on the gaps where they genuinely apply. Also the sole
 # source when a gap dict arrives without services (hand-built leads, CSV import).
+#
+# Entries only, never the headings they sit under. `service_1` is read inside a
+# sentence — "the fix is {{service_1}}" — and a heading dropped into that slot
+# sells the reader a section of the seller's own catalogue instead of a thing
+# that could be done for them. Where a gap is really the whole line of work, the
+# entry beneath it that best answers the gap stands in for the line, and
+# `spoken_service` resolves anything that still arrives as a heading.
+#
+# The other rule this table obeys is that the offer has to follow from the gap.
+# The email names one finding and then names what would be built, and a reader
+# who cannot draw the line between the two reads a broken mail merge — which is
+# worse than an email that said nothing about their site at all. So a code is
+# absent here rather than mapped to whatever was nearest: `slow_site` and
+# `no_mobile` are website work, the catalogue is not a web shop, and there is no
+# honest entry to give them. A gap that reaches `services_for_gaps` with nothing
+# on either side of it contributes nothing, and `build_context` will not let it
+# become the headline.
 GAP_SERVICES: dict[str, list[str]] = {
-    "no_online_booking": ["appointment booking", "Lead Automation", "automatic follow-ups"],
-    "no_live_chat": ["AI customer-support agents", "AI lead qualification"],
-    "contact_form_only": ["AI lead qualification", "automatic follow-ups", "Business Process Automation"],
-    "no_crm_signals": ["CRM & Sales Automation", "automatically add leads to CRM"],
-    "no_lead_capture": ["Lead Generation", "Lead Automation", "website lead extraction"],
-    "quote_by_form": ["AI lead scoring", "AI decision/triage systems", "Business Process Automation"],
+    "no_online_booking": ["appointment booking", "automatic follow-ups", "sales notifications"],
+    "no_live_chat": ["AI customer-support agents", "AI lead qualification",
+                     "human-in-the-loop AI systems"],
+    "contact_form_only": ["AI lead qualification", "automatic follow-ups",
+                          "automatically add leads to CRM"],
+    "no_crm_signals": ["automatic CRM updates", "automatically add leads to CRM", "lead assignment"],
+    "no_lead_capture": ["business lead discovery", "automatic follow-ups", "website lead extraction"],
+    "quote_by_form": ["AI lead scoring", "AI decision/triage systems", "approval systems"],
     "stale_blog": ["AI content generation", "content pipelines"],
-    "no_analytics": ["automated reports", "reporting", "Web Scraping & Data Automation"],
-    "careers_manual": ["HR processes", "employee onboarding", "Business Process Automation"],
-    "ecommerce_manual": ["purchase/order workflows", "Business Process Automation"],
-    "pdf_forms": ["Document Automation", "PDF/document data extraction"],
-    "multi_location": ["automated reports", "Business Process Automation"],
-    "no_social_presence": ["social media workflows", "Marketing Automation"],
-    "stale_site": ["Business Process Automation"],
-    "slow_site": ["Business Process Automation"],
-    "no_mobile": ["Business Process Automation"],
-    "no_schema": ["SEO automation", "Web Scraping & Data Automation"],
+    "no_analytics": ["automated reports", "competitor monitoring", "data collection and cleaning"],
+    "careers_manual": ["employee onboarding", "AI document/data extraction",
+                       "AI decision/triage systems"],
+    "ecommerce_manual": ["purchase/order workflows", "approval systems", "invoice processing"],
+    "pdf_forms": ["PDF/document data extraction", "automatic document generation",
+                  "AI document/data extraction"],
+    # Not "reporting" behind "automated reports" — the same pair `core.audit`
+    # struck out of no_analytics, one offer said twice and the second word alone
+    # reading as a heading. The gap is a message arriving for one branch, so the
+    # slots behind it are getting it to that branch.
+    "multi_location": ["automated reports", "lead assignment", "sales notifications"],
+    "no_social_presence": ["social media workflows", "content pipelines", "customer segmentation"],
+    # Nobody has put anything new on the site in years, and what the catalogue
+    # sells against that is content that arrives without anyone remembering.
+    "stale_site": ["AI content generation", "content pipelines", "SEO automation"],
+    # `slow_site` and `no_mobile` are deliberately absent: see the note above.
+    "no_schema": ["SEO automation", "competitor monitoring", "website data extraction"],
     "price_opaque": ["AI lead qualification", "price monitoring", "competitor monitoring"],
 }
 
 
 # What to pitch when the audit found nothing to pitch against. Ordered so the
 # sentence reads ("the fix is automatic follow-ups") and so the two lines the
-# seller cares most about still land in the first three slots.
+# seller cares most about still land in the first three slots — as the work
+# under them, which is what the sentence can carry.
 DEFAULT_PITCH_SERVICES: list[str] = [
     "automatic follow-ups",
-    "Business Process Automation",
-    "Web Scraping & Data Automation",
-    "AI lead qualification",
+    "approval systems",
     "automated reports",
+    "AI lead qualification",
+    "appointment booking",
 ]
+
+
+# The entry that speaks for a whole line when nothing more specific is known.
+# Every one of them is a noun phrase, because the slot they fill is read as the
+# object of a verb the template already wrote ("we build...", "the fix is...").
+CATEGORY_SERVICE: dict[str, str] = {
+    "Workflow Automation": "automatic data entry",
+    "AI Automation": "AI workflow agents",
+    "Lead Generation": "business lead discovery",
+    "Lead Automation": "automatic follow-ups",
+    "CRM & Sales Automation": "automatic CRM updates",
+    "Business Process Automation": "approval systems",
+    "Web Scraping & Data Automation": "automated reports",
+    "Document Automation": "automatic document generation",
+    "Marketing Automation": "email campaigns",
+}
+
+
+def spoken_service(name: str, code: str = "") -> str:
+    """`name` as a prospect can be offered it.
+
+    A catalogue entry passes through in the catalogue's own spelling. A category
+    is a heading over entries — the seller's filing, not a deliverable — so a
+    heading is spent as the work beneath it: the entry `GAP_SERVICES[code]`
+    already chose for this gap, or the line's own stand-in. Unknown names are
+    left alone; they are the user's wording and this module does not edit it.
+
+    A line added to the catalogue with no stand-in written for it falls back to
+    its first entry rather than raising. Nothing on the send path may fail over
+    a copy table, and the first entry is a service either way.
+    """
+    clean = canonical_service(name)
+    if clean not in AUTO_ARMY_SERVICES:
+        return clean
+    for candidate in GAP_SERVICES.get(str(code or ""), ()):
+        if clean in _CATEGORIES_OF.get(candidate.lower(), ()):
+            return candidate
+    under = AUTO_ARMY_SERVICES[clean]
+    return CATEGORY_SERVICE.get(clean) or (under[0] if under else clean)
 
 
 def services_for_gaps(gaps, extra=()) -> list[str]:
@@ -241,12 +307,16 @@ def services_for_gaps(gaps, extra=()) -> list[str]:
     Each gap contributes its own `services` first, then the `GAP_SERVICES` entry
     for its code. `extra` tops the result up, in the order given, so
     `service_1..3` are always populated even for a thin audit.
+
+    Everything leaves through `spoken_service`, so a gap that names a whole line
+    of work — `core.audit` does, and so does a hand-built lead — reaches the copy
+    as something that can be built for the reader rather than as a heading.
     """
     out: list[str] = []
     seen: set[str] = set()
 
-    def _add(name) -> None:
-        clean = canonical_service(name)
+    def _add(name, code: str = "") -> None:
+        clean = spoken_service(name, code)
         if clean and clean.lower() not in seen:
             seen.add(clean.lower())
             out.append(clean)
@@ -254,10 +324,11 @@ def services_for_gaps(gaps, extra=()) -> list[str]:
     for gap in gaps or []:
         if not isinstance(gap, dict):
             continue
+        code = str(gap.get("code") or "")
         for name in gap.get("services") or []:
-            _add(name)
-        for name in GAP_SERVICES.get(str(gap.get("code") or ""), []):
-            _add(name)
+            _add(name, code)
+        for name in GAP_SERVICES.get(code, []):
+            _add(name, code)
     for name in extra or ():
         _add(name)
     return out
@@ -350,21 +421,31 @@ BUILTIN_TEMPLATES: list[Template] = [
             "{{sender_title}}, {{company}}"
         ),
     ),
+    # `service_1` is whatever the headline gap resolved to, and that is a
+    # different kind of work for each of the eighteen. So nothing around it may
+    # describe the work: "the message gets answered, sorted and logged" cohered
+    # only while the gap was about an inbox, and read "the fix is automated
+    # reports, the message gets answered" for the eleven that were not. What all
+    # eighteen share is that somebody is doing it by hand every time, and that is
+    # the whole claim. The clause after `service_1` sits inside the same sentence
+    # for the reason set out above: on its own it would be a sentence left
+    # pointing at a fix that had gone.
     Template(
         id="time_saved",
         name="Hours back",
         step=0,
-        subject="the minutes after every enquiry",
+        subject="the same few minutes, over and over",
         body=(
             "Hi {{first_name}},\n"
             "\n"
             "{{ai_opener}}\n"
             "\n"
-            "Answering an enquiry by hand costs the same few minutes every time: open "
-            "it, read it, type a reply, add it to the list, remember to chase.\n"
+            "The work that quietly eats a week is the part somebody redoes by hand "
+            "every time: open it, read it, type the same reply, copy it somewhere, "
+            "remember to come back to it.\n"
             "\n"
-            "The fix is {{service_1}}. The message gets answered, sorted and logged "
-            "before anyone at {{business_name}} opens the inbox.\n"
+            "The fix is {{service_1}}, running on the tools {{business_name}} already "
+            "has rather than on somebody remembering.\n"
             "\n"
             "{{proof_point}}\n"
             "\n"
@@ -722,7 +803,11 @@ _FIELD_RE = re.compile(r"\{\{\s*([A-Za-z0-9_]+)\s*\}\}")
 _TOKEN_RE = re.compile(r"\{\{[^{}]*\}\}")
 _SINGLE_BRACE_RE = re.compile(r"\{(?:%s)\}" % "|".join(MERGE_FIELDS + _EXTRA_CONTEXT_KEYS))
 _URL_RE = re.compile(r"https?://[^\s<>\"']+")
-_SUBJECT_PREFIX_RE = re.compile(r"^\s*(?:re|fw|fwd)\s*[:\-]\s*", re.I)
+# A colon and nothing else. Treating a hyphen as a delimiter too made "Re-Max
+# Realty" a reply to "Max Realty", and a lead whose audit found no gaps reaches
+# the subject line as its business name and nothing else. Mirrored in
+# `core.mailer._plain_subject`, which holds the same guarantee at the wire.
+_SUBJECT_PREFIX_RE = re.compile(r"^\s*(?:re|fw|fwd)\s*:\s*", re.I)
 # A salutation the model wrote for itself: the greeting word, an optional name or
 # two behind it, and the punctuation that closes it. The closing punctuation is
 # required, so "Hidden costs" and "Hire us in March" are left alone.
@@ -905,7 +990,7 @@ def render(template: Template, ctx: dict) -> tuple[str, str, str]:
         subject = _clean_subject(_resolve(source, ctx), ctx)
 
         core = _tidy(_resolve(template.body, ctx))
-        body_html = to_html(core, ctx)
+        body_html = _body_html(core, ctx)
         footer = _footer_text(ctx)
         body_text = core + "\n\n" + footer if footer else core
         return subject, body_text, body_html
@@ -953,6 +1038,30 @@ def _footer_html(ctx: dict) -> str:
     )
 
 
+def _body_html(core: str, ctx: dict) -> str:
+    """`core` — a body with no footer in it — as paragraphs, plus the footer.
+
+    Every paragraph it is handed is printed. Nothing here reads a block's text
+    to decide what the block is, so whatever the plain-text part says the HTML
+    part says too: the two MIME alternatives cannot drift apart on a profile
+    whose sign-off happens to read like the footer.
+    """
+    blocks = []
+    for para in re.split(r"\n\s*\n", str(core or "").strip()):
+        lines = [ln.strip() for ln in para.splitlines() if ln.strip()]
+        if not lines:
+            continue
+        blocks.append(
+            '<p style="margin:0 0 14px 0;">%s</p>'
+            % "<br>".join(_linkify(_html.escape(ln)) for ln in lines)
+        )
+    return (
+        '<div style="font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\','
+        "Roboto,Helvetica,Arial,sans-serif;font-size:15px;line-height:1.55;"
+        'color:#1a1a1a;">%s%s</div>' % ("".join(blocks), _footer_html(ctx))
+    )
+
+
 def to_html(body_text: str, ctx: dict) -> str:
     """Deliverability-safe HTML for `body_text`.
 
@@ -962,29 +1071,18 @@ def to_html(body_text: str, ctx: dict) -> str:
     """
     ctx = dict(ctx or {})
     try:
-        unsubscribe = str(ctx.get("unsubscribe_line") or "").strip()
-        identity = " | ".join(
-            p for p in (str(ctx.get("company") or "").strip(),
-                        str(ctx.get("postal_address") or "").strip()) if p
-        )
-        blocks = []
-        for para in re.split(r"\n\s*\n", str(body_text or "").strip()):
-            lines = [ln.strip() for ln in para.splitlines() if ln.strip()]
-            if not lines:
-                continue
-            if unsubscribe and any(unsubscribe in ln for ln in lines):
-                continue
-            if identity and len(lines) == 1 and lines[0] == identity:
-                continue
-            blocks.append(
-                '<p style="margin:0 0 14px 0;">%s</p>'
-                % "<br>".join(_linkify(_html.escape(ln)) for ln in lines)
-            )
-        return (
-            '<div style="font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\','
-            "Roboto,Helvetica,Arial,sans-serif;font-size:15px;line-height:1.55;"
-            'color:#1a1a1a;">%s%s</div>' % ("".join(blocks), _footer_html(ctx))
-        )
+        body = str(body_text or "").strip()
+        # Cut as the exact suffix `render` appended, once, off the end. The old
+        # rule recognised the footer by its wording anywhere in the body, and the
+        # identity line is the company on its own whenever no postal address is
+        # configured — which is also how a sender with no name and no title signs
+        # off. That signature was deleted from the HTML part while the plain-text
+        # part kept it, so the two alternatives went out carrying different copy,
+        # and only on the incomplete profile the app now invites a send from.
+        footer = _footer_text(ctx)
+        if footer:
+            body = re.sub(r"(?:\A|\n\s*\n)%s\Z" % re.escape(footer), "", body).rstrip()
+        return _body_html(body, ctx)
     except Exception:
         return ""
 
@@ -1803,23 +1901,81 @@ def _observed_field(ai: dict, key: str, limit: int, anchors: frozenset[str],
         _observed(_clean_snippet(ai.get(key), _SNIPPET_MAX), anchors, sender), limit)
 
 
-def _unsubscribe_address(profile: dict, settings: dict) -> str:
-    raw = str(settings.get("unsubscribe_mailto") or "").strip()
+# The opt-out sentence, with a slot for the address, and the same sentence for
+# when there is no address to offer. They are constants rather than literals in
+# `build_context` because two things have to agree about the wording: what is
+# written when a campaign is planned, and `retarget_unsubscribe`, which rewrites
+# the address inside it when the message finally leaves.
+UNSUBSCRIBE_LINE = (
+    'Not the right person? Reply "unsubscribe" or write to %s and I will stop.')
+UNSUBSCRIBE_LINE_NO_ADDRESS = (
+    'Not the right person? Reply "unsubscribe" and I will stop.')
+
+_LINE_BEFORE, _LINE_AFTER = UNSUBSCRIBE_LINE.split("%s")
+# Anchored on the half of the sentence `html.escape` leaves alone, so one
+# pattern finds the address in the plain-text part and in the HTML part — where
+# the quotes around "unsubscribe" are `&quot;` and the word itself has become an
+# anchor, and only the tail of the sentence still reads the same in both.
+_FOOTER_ADDRESS_RE = re.compile(
+    "(%s)(\\S+?)(%s)" % (re.escape(_LINE_BEFORE.rsplit('"', 1)[-1]), re.escape(_LINE_AFTER)))
+_FOOTER_HREF_RE = re.compile(r"mailto:[^\"'>\s]*\?subject=unsubscribe")
+
+
+def unsubscribe_address(profile: dict, settings: dict, account_email: str = "") -> str:
+    """The one mailbox a message's opt-out routes point at.
+
+    `account_email` is the account the message is actually sent from. It comes
+    second only to the address the user typed in Settings, and it comes ahead of
+    `reply_to`, because `core.mailer.build_message` resolves `List-Unsubscribe`
+    the same way — setting first, sending account second — and a footer that
+    resolved differently offered the reader a second, different route out. With
+    more than one account enabled the two picked different mailboxes, and the
+    footer's was whichever account happened to be first in the list.
+
+    `reply_to` survives as the last resort rather than the second, because it is
+    the only route left when no sending account is configured at all, and
+    because it is the one address here the app has no credentials for and
+    therefore cannot promise to read.
+    """
+    raw = str((settings or {}).get("unsubscribe_mailto") or "").strip()
     if not raw:
-        raw = str(profile.get("reply_to") or "").strip()
+        raw = str(account_email or "").strip()
     if not raw:
-        for account in settings.get("smtp_accounts") or []:
+        for account in (settings or {}).get("smtp_accounts") or []:
             if isinstance(account, dict) and account.get("enabled", True):
                 raw = str(account.get("email") or "").strip()
                 if raw:
                     break
+    if not raw:
+        raw = str((profile or {}).get("reply_to") or "").strip()
     if raw.lower().startswith("mailto:"):
         raw = raw[7:]
     return raw.split("?")[0].strip()
 
 
+def retarget_unsubscribe(body: str, address: str) -> str:
+    """Point the footer's opt-out route at `address`, sentence and mailto alike.
+
+    A body is written when the campaign is planned and the account it leaves
+    from is chosen when it comes due — a capped or benched account hands the
+    message to the next one — so the address baked into the footer is a guess
+    until the message is built. This is where the guess is corrected, against
+    the same address `List-Unsubscribe` is about to carry, so the reader is
+    never offered two different ways out.
+
+    A body with no footer in it, or no address to write, comes back unchanged.
+    """
+    text = str(body or "")
+    address = re.sub(r"[\s<>\"']+", "", str(address or ""))
+    if not text or not address:
+        return text
+    text = _FOOTER_ADDRESS_RE.sub(lambda m: m.group(1) + address + m.group(3), text)
+    return _FOOTER_HREF_RE.sub(
+        "mailto:%s?subject=unsubscribe" % urllib.parse.quote(address, safe="@"), text)
+
+
 def build_context(lead: dict, audit: dict, ai: dict, profile: dict,
-                  settings: dict) -> dict:
+                  settings: dict, account_email: str = "") -> dict:
     """Merge fields for one lead.
 
     Every key in `MERGE_FIELDS` is present. Fields that read as part of a
@@ -1828,6 +1984,12 @@ def build_context(lead: dict, audit: dict, ai: dict, profile: dict,
     one. `calendar_link` falls back to the company website so the copy rule of
     exactly one link still holds when no calendar is configured, and `ai_ps`
     arrives already prefixed "P.S." so the line disappears cleanly without it.
+
+    `account_email` is the account this message will be sent from, when the
+    caller already knows it, and it decides the footer's opt-out address — see
+    `unsubscribe_address`. A caller that does not know yet writes the footer for
+    the first account that could send, and `retarget_unsubscribe` corrects it
+    when the message is built.
     """
     lead = dict(lead or {})
     audit = dict(audit or {})
@@ -1836,6 +1998,20 @@ def build_context(lead: dict, audit: dict, ai: dict, profile: dict,
     settings = dict(settings or {})
 
     gaps = [g for g in (audit.get("gaps") or []) if isinstance(g, dict)]
+    # Which gap the email leads with is not "the worst one", it is "the worst one
+    # there is something to say about". Every template that names `gap_1` follows
+    # it with an offer, so a headline the catalogue cannot answer either borrows
+    # a service from an unrelated line — "a slow site, so we build approval
+    # systems" — or leaves the offer answering a different question than the one
+    # the reader was just asked to think about. `core.audit` already sorts these
+    # last; doing it again here covers a hand-built lead and a CSV import, which
+    # arrive in whatever order they were written.
+    answerable = [g for g in gaps if services_for_gaps([g])]
+    taken = {id(g) for g in answerable}
+    # A gap with no offer is still worth knowing, so it stays reachable as
+    # `gap_2`, where it is detail behind a headline and not a promise of its own.
+    headline = answerable + [g for g in gaps if id(g) not in taken] if answerable else []
+
     chosen = [s for s in (profile.get("services") or []) if str(s or "").strip()]
     # A profile still holding the whole seeded catalogue is not a choice, so the
     # curated pitch leads; a narrowed list is a choice and leads instead.
@@ -1864,10 +2040,10 @@ def build_context(lead: dict, audit: dict, ai: dict, profile: dict,
         "category": _spoken_category(lead.get("category")) or "local",
         "website_domain": domain or "your site",
 
-        "gap_1": str(gaps[0].get("title") or "").strip() if gaps else "",
-        "gap_2": str(gaps[1].get("title") or "").strip() if len(gaps) > 1 else "",
-        "gap_1_evidence": _clean_snippet(gaps[0].get("evidence"), 90) if gaps else "",
-        "gap_1_subject": _gap_subject(gaps[0]) if gaps else "",
+        "gap_1": str(headline[0].get("title") or "").strip() if headline else "",
+        "gap_2": str(headline[1].get("title") or "").strip() if len(headline) > 1 else "",
+        "gap_1_evidence": _clean_snippet(headline[0].get("evidence"), 90) if headline else "",
+        "gap_1_subject": _gap_subject(headline[0]) if headline else "",
         "service_1": services[0],
         "service_2": services[1],
         "service_3": services[2],
@@ -1887,15 +2063,10 @@ def build_context(lead: dict, audit: dict, ai: dict, profile: dict,
             _pick(profile.get("proof_points"), domain or str(lead.get("email") or ""))),
     }
 
-    address = _unsubscribe_address(profile, settings)
+    address = unsubscribe_address(profile, settings, account_email)
     ctx["unsubscribe_email"] = address
-    if address:
-        ctx["unsubscribe_line"] = (
-            'Not the right person? Reply "unsubscribe" or write to %s and I will stop.'
-            % address
-        )
-    else:
-        ctx["unsubscribe_line"] = 'Not the right person? Reply "unsubscribe" and I will stop.'
+    ctx["unsubscribe_line"] = (
+        UNSUBSCRIBE_LINE % address) if address else UNSUBSCRIBE_LINE_NO_ADDRESS
 
     out = {k: _strip_dashes(str(v)) for k, v in ctx.items()}
     # Not merge fields, and deliberately not strings: nothing renders these. They

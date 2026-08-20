@@ -18,6 +18,16 @@ What is asserted here is that both halves of that bargain are kept:
   With `require_profile_complete` on, Prepare and Start ask and offer to go
   ahead; with it off they do not ask at all. Neither one refuses.
 
+And one thing no switch governs: the *route* out. A message carries the opt-out
+twice — the footer sentence a person reads and the `List-Unsubscribe` header
+their mail client acts on — and those two used to be resolved by different code
+against different fallbacks, so with more than one Gmail account enabled, or a
+`reply_to` of its own, they named different mailboxes. The reader who did
+everything right wrote to the one nobody reads and kept getting the chasers.
+The sweep below builds real messages across the multi-account and custom
+`reply_to` combinations and asserts the two routes are one address, and that it
+is the account the message actually left from.
+
 Qt runs offscreen. `SETTINGS_DIR` and the database are redirected into a temp
 directory before the screen is built, so nothing here can read or write a
 developer's real ~/.mapharvest.
@@ -25,6 +35,7 @@ developer's real ~/.mapharvest.
 import contextlib
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -298,6 +309,287 @@ def test_a_planned_campaign_queues_the_switched_off_footer():
                 assert needle.lower() in body, (switches, needle)
             for needle in unwanted:
                 assert needle.lower() not in body, (switches, needle)
+
+
+# ── One opt-out route, not two ───────────────────────────────────────────────
+
+# Three accounts, because one is the case that hid the bug: with a single
+# account every fallback in the chain happens to land on it. The middle one is
+# the only mailbox with IMAP switched on, which is what the warnings below are
+# measured against.
+ACCOUNTS = [dict(ACCOUNT, email="one@shop.test"),
+            dict(ACCOUNT, email="two@shop.test", imap_enabled=True),
+            dict(ACCOUNT, email="three@shop.test")]
+
+
+def _first(pattern: str, text: str) -> str:
+    found = re.search(pattern, text)
+    return found.group(1) if found else ""
+
+
+def _routes(message) -> dict:
+    """Every unsubscribe address a built message carries, by where it carries it.
+
+    Four places, and a reader or their mail client can act on any of them: the
+    sentence in the plain-text part, the same sentence in the HTML part, the
+    mailto behind the word "unsubscribe" there, and the header Gmail turns into
+    its own unsubscribe button.
+    """
+    plain = message.get_body(preferencelist=("plain",))
+    rich = message.get_body(preferencelist=("html",))
+    plain = plain.get_content() if plain is not None else ""
+    rich = rich.get_content() if rich is not None else ""
+    sentence = r"write to (\S+?) and I will stop\."
+    return {
+        "header": _first(r"<mailto:([^?>]+)", message["List-Unsubscribe"] or ""),
+        "text": _first(sentence, plain),
+        "html": _first(sentence, rich),
+        "href": _first(r"mailto:([^\"?]+)\?subject=unsubscribe", rich),
+    }
+
+
+def _message_from(settings: dict, profile: dict, sender: str, queued_for: str = ""):
+    """The message the send loop would hand to SMTP, sent from `sender`.
+
+    `queued_for` is the account the copy was written for, when that is not the
+    account it ends up leaving from — which is the ordinary case, because a
+    capped or benched account hands its due messages to the next one.
+    """
+    ctx = C.apply_compliance(T.build_context(LEAD, AUDIT, {}, profile, settings), settings)
+    _subject, text, html = T.render(PROBE, ctx)
+    if queued_for:
+        text, html = C._for_account(text, html, profile, settings, queued_for)
+    message, _mid = M.build_message(
+        to_email=LEAD["email"], to_name=LEAD["name"], from_email=sender,
+        from_name="Umar", reply_to=str(profile.get("reply_to") or ""),
+        subject="booking by phone only", body_text=text, body_html=html,
+        unsubscribe_mailto=str(settings.get("unsubscribe_mailto") or ""))
+    return message
+
+
+def test_the_two_opt_out_routes_never_name_different_mailboxes():
+    """The sweep that found the split: accounts x reply_to x explicit address.
+
+    Fifty-four real messages. What is asserted is not a fallback order but the
+    property that matters to the recipient — every way out of the list that this
+    message offers goes to the same mailbox, and that mailbox is one the sender
+    has credentials for rather than whichever account happened to be first.
+    """
+    combinations = 0
+    for count in (1, 2, 3):
+        accounts = [dict(a) for a in ACCOUNTS[:count]]
+        for mailto in ("", "optout@autoarmy.io", "mailto:optout@autoarmy.io?subject=stop"):
+            for reply_to in ("", "umar@autoarmy.io", "hello@elsewhere.test"):
+                settings = _settings(smtp_accounts=accounts, unsubscribe_mailto=mailto)
+                profile = dict(PROFILE, reply_to=reply_to)
+                for account in accounts:
+                    sender = account["email"]
+                    routes = _routes(_message_from(settings, profile, sender))
+                    wanted = "optout@autoarmy.io" if mailto else sender
+                    assert set(routes.values()) == {wanted}, \
+                        (count, mailto, reply_to, sender, routes)
+                    combinations += 1
+    assert combinations == 54
+
+
+def test_the_footer_follows_the_account_the_message_leaves_from():
+    """A message written for one account and sent from another still reads true.
+
+    `_pick_account` re-decides at send time, so the copy in `messages` was
+    written for whichever account the planner placed it on. The footer has to
+    end up naming the one that actually sent it — anything else asks the reader
+    to write to a mailbox that did not send them this email.
+    """
+    settings = _settings(smtp_accounts=[dict(a) for a in ACCOUNTS[:2]])
+    written = _message_from(settings, PROFILE, "one@shop.test", queued_for="one@shop.test")
+    assert set(_routes(written).values()) == {"one@shop.test"}
+
+    handed_on = _message_from(settings, PROFILE, "two@shop.test", queued_for="one@shop.test")
+    assert set(_routes(handed_on).values()) == {"two@shop.test"}, _routes(handed_on)
+    assert "one@shop.test" not in handed_on.get_body(
+        preferencelist=("plain",)).get_content()
+
+
+def test_the_send_loop_rewrites_the_footer_of_a_queued_message():
+    """End to end, off the worker rather than off a helper.
+
+    The row is queued on one account and `_send` is handed the other, which is
+    exactly what happens when the first is at its cap for the day.
+    """
+    with temp_db() as conn:
+        settings = _settings(smtp_accounts=[dict(a) for a in ACCOUNTS[:2]])
+        campaign_id = DB.create_campaign(conn, "rotation", "", PROFILE, settings)
+        lead_id = DB.upsert_lead(conn, dict(LEAD))
+        ctx = C.apply_compliance(
+            T.build_context(LEAD, AUDIT, {}, PROFILE, settings), settings)
+        _subject, text, html = T.render(PROBE, ctx)
+        text, html = C._for_account(text, html, PROFILE, settings, "one@shop.test")
+        assert "one@shop.test" in text, text
+
+        DB.queue_message(conn, {"campaign_id": campaign_id, "lead_id": lead_id, "step": 0,
+                                "subject": "booking by phone only", "body_text": text,
+                                "body_html": html, "account_email": "one@shop.test",
+                                "scheduled_at": time.time() - 10})
+        worker = C.OutreachWorker(campaign_id, settings, dry_run=True)
+        row = DB.due_messages(conn, time.time())[0]
+
+        built = []
+        original = C._mailer.build_message
+
+        def spy(**kwargs):
+            message, mid = original(**kwargs)
+            built.append(message)
+            return message, mid
+
+        C._mailer.build_message = spy
+        try:
+            worker._send(conn, row, dict(ACCOUNTS[1]), time.time())
+        finally:
+            C._mailer.build_message = original
+
+        assert built, "the worker never built a message"
+        assert set(_routes(built[0]).values()) == {"two@shop.test"}, _routes(built[0])
+
+
+def test_a_planned_campaign_queues_each_body_for_its_own_account():
+    """The queue reads honestly too, not only the wire.
+
+    A body in `messages` naming an account other than the one it is placed on is
+    a footer nobody would notice was wrong until a lead wrote to it.
+    """
+    leads = [dict(LEAD, email="rob%d@harbourvale.co.uk" % n) for n in range(6)]
+    with temp_db() as conn, _probe_template():
+        settings = _settings(smtp_accounts=[dict(a) for a in ACCOUNTS[:2]],
+                             followup_enabled=True, followup_max_steps=2,
+                             followup_gap_days=4)
+        campaign_id = DB.create_campaign(conn, "rotation", "", PROFILE, settings)
+        plan = C.plan_campaign(conn, campaign_id=campaign_id, leads=leads,
+                               template_id=PROBE.id, profile=PROFILE,
+                               settings=settings, ai=None)
+        assert not plan["error"], plan["error"]
+        assert plan["queued"] == 6 and plan["followups"], plan
+
+        rows = DB.due_messages(conn, time.time() + 40 * 86400)
+        used = set()
+        for row in rows:
+            account = row["account_email"]
+            used.add(account)
+            assert 'write to %s and I will stop.' % account in row["body_text"], \
+                (account, row["body_text"][-200:])
+            assert "mailto:%s?subject=unsubscribe" % account in row["body_html"], account
+        assert used == {"one@shop.test", "two@shop.test"}, used
+
+
+# ── An opt-out nobody reads is said out loud ─────────────────────────────────
+
+def test_a_route_no_mailbox_polls_is_named_in_a_warning():
+    """Which mailboxes get opened is the user's own Gmail setup, so say so.
+
+    `_imap_accounts` only polls accounts with IMAP switched on and a password
+    stored. Every other reader-visible route — a `reply_to` of its own, an
+    explicit unsubscribe address, a sending account with IMAP off — is a promise
+    in the footer that nothing in this app can keep, and the address has to be in
+    the sentence or there is nothing to act on.
+    """
+    reads = dict(ACCOUNT, email="two@shop.test", imap_enabled=True)
+    quiet = dict(ACCOUNT, email="one@shop.test", imap_enabled=False)
+
+    silent = C.optout_warnings(_settings(smtp_accounts=[dict(quiet)]),
+                               dict(PROFILE, reply_to=""))
+    assert len(silent) == 1, silent
+    assert "one@shop.test" in silent[0] and "IMAP" in silent[0], silent
+
+    # Nothing to say when the only account is polled and nothing points away.
+    assert C.optout_warnings(_settings(smtp_accounts=[dict(reads)]),
+                             dict(PROFILE, reply_to="")) == []
+
+    # A reply-to of its own is a second route, and it is not an account at all.
+    away = C.optout_warnings(_settings(smtp_accounts=[dict(reads)]),
+                             dict(PROFILE, reply_to="hello@elsewhere.test"))
+    assert len(away) == 1 and "hello@elsewhere.test" in away[0], away
+    assert "follow-ups" in away[0], away[0]
+
+    # So is an explicit unsubscribe address.
+    typed = C.optout_warnings(
+        _settings(smtp_accounts=[dict(reads)], unsubscribe_mailto="optout@autoarmy.io"),
+        dict(PROFILE, reply_to=""))
+    assert len(typed) == 1 and "optout@autoarmy.io" in typed[0], typed
+
+    # An account with no password stored is not polled either, whatever the box says.
+    unopenable = C.optout_warnings(
+        _settings(smtp_accounts=[dict(reads, app_password="")]), dict(PROFILE, reply_to=""))
+    assert len(unopenable) == 1 and "two@shop.test" in unopenable[0], unopenable
+
+
+def test_the_polled_set_is_the_one_the_worker_actually_reads():
+    """One predicate, so a warning cannot describe a mailbox the app does read."""
+    settings = _settings(smtp_accounts=[dict(a) for a in ACCOUNTS])
+    worker = C.OutreachWorker(0, settings, dry_run=True)
+    assert {a["email"] for a in worker._imap_accounts()} == C.polled_mailboxes(settings)
+    assert C.polled_mailboxes(settings) == {"two@shop.test"}
+
+
+def test_the_warning_reaches_the_plan_and_the_run():
+    with temp_db() as conn, _probe_template():
+        settings = _settings(smtp_accounts=[dict(ACCOUNTS[0])],
+                             sender_profile=dict(PROFILE, reply_to="hello@elsewhere.test"))
+        campaign_id = DB.create_campaign(conn, "unread", "", PROFILE, settings)
+        plan = C.plan_campaign(conn, campaign_id=campaign_id, leads=[dict(LEAD)],
+                               template_id=PROBE.id,
+                               profile=dict(PROFILE, reply_to="hello@elsewhere.test"),
+                               settings=settings, ai=None)
+        assert plan["queued"] == 1, plan
+        named = " ".join(plan["warnings"])
+        assert "one@shop.test" in named and "hello@elsewhere.test" in named, plan["warnings"]
+
+        logged = [e for e in DB.recent_events(conn) if e["kind"] == "unread_optout"]
+        assert len(logged) == len(plan["warnings"]), logged
+
+        worker = C.OutreachWorker(campaign_id, settings, dry_run=True)
+        said = []
+        worker.log_signal.connect(lambda text, level: said.append((text, level)))
+        worker._warn_unread_optouts()
+        assert [text for text, _level in said] == plan["warnings"], said
+        assert all(level == "error" for _text, level in said), said
+
+
+# ── Defence in depth on the subject line ─────────────────────────────────────
+
+def test_build_message_strips_a_reply_prefix_it_was_handed():
+    """`render` already strips these; the guarantee should not depend on it.
+
+    A manufactured `Re:` on a first cold email is the misleading subject line
+    CAN-SPAM prohibits, and a chaser carries its thread in `In-Reply-To`. Every
+    caller gets the rule now, not only the two that route through `render`.
+    """
+    for wearing in ("Re: booking by phone only", "RE:booking by phone only",
+                    "Fwd: booking by phone only", "fwd:booking by phone only",
+                    "Re: Fwd: Re: booking by phone only", "  fw:  booking by phone only"):
+        message, _mid = M.build_message(
+            to_email=LEAD["email"], to_name=LEAD["name"], from_email=ACCOUNT["email"],
+            from_name="Umar", reply_to="", subject=wearing,
+            body_text="Hi Rob,\n\nOne thing stands out.", body_html="",
+            unsubscribe_mailto="")
+        assert message["Subject"] == "booking by phone only", (wearing, message["Subject"])
+
+    # And a subject that never wore one is left exactly as it arrived.
+    kept = M.build_message(
+        to_email=LEAD["email"], to_name=LEAD["name"], from_email=ACCOUNT["email"],
+        from_name="Umar", reply_to="", subject="Reviewing your booking page",
+        body_text="Hi Rob,", body_html="", unsubscribe_mailto="")[0]
+    assert kept["Subject"] == "Reviewing your booking page"
+
+    # A hyphen is not a reply delimiter. Treating it as one amputated the first
+    # syllable of every trading name that opens on "Re-" — RE/MAX is one of the
+    # largest agency brands there is, and "Re-Roof" is ordinary in the roofing
+    # trade this tool is pointed at. No mail client emits "re - " as a prefix.
+    for trading_name in ("Re-Max Realty", "Re-Roof Toronto", "Re-Cover Roofing",
+                         "Fwd-Thinking Design", "re - booking by phone only"):
+        intact = M.build_message(
+            to_email=LEAD["email"], to_name=LEAD["name"], from_email=ACCOUNT["email"],
+            from_name="Umar", reply_to="", subject=trading_name,
+            body_text="Hi Rob,", body_html="", unsubscribe_mailto="")[0]
+        assert intact["Subject"] == trading_name, (trading_name, intact["Subject"])
 
 
 # ── Nothing hard-blocks ──────────────────────────────────────────────────────

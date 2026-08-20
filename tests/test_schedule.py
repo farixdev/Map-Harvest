@@ -807,6 +807,276 @@ def test_the_inbox_poll_is_throttled_and_skipped_in_a_dry_run():
         print("the inbox poll is throttled: OK")
 
 
+# ── A dry run is a rehearsal, not a send ─────────────────────────────────────
+
+
+class _Clock:
+    """A clock the test moves, standing in for `time` inside `core.campaign`.
+
+    A campaign is days of wall-clock time by design, so a rehearsal cannot be
+    walked to its end any other way. Only the waiting is taken away: the loop,
+    the window checks, the caps and the queue are the shipped ones.
+    """
+
+    def __init__(self, now: float):
+        self.now = float(now)
+
+    def time(self) -> float:
+        return self.now
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += max(0.0, float(seconds))
+
+
+@contextlib.contextmanager
+def fake_clock(now: float):
+    original = C.time
+    C.time = clock = _Clock(now)
+    try:
+        yield clock
+    finally:
+        C.time = original
+
+
+@contextlib.contextmanager
+def stub_smtp():
+    """Stand in for SmtpSender. Yields (accounts opened, messages handed over).
+
+    Constructing one is the only way this app reaches Gmail, so an empty
+    `opened` is what proves a rehearsal stayed on the machine.
+    """
+    opened, sent = [], []
+
+    class _Sender:
+        def __init__(self, email, app_password, display_name=""):
+            opened.append(email)
+
+        def send(self, message):
+            sent.append(message)
+            return True, ""
+
+        def close(self) -> None:
+            pass
+
+    original = M.SmtpSender
+    M.SmtpSender = _Sender
+    try:
+        yield opened, sent
+    finally:
+        M.SmtpSender = original
+
+
+def _run_to_the_end(worker, conn, campaign_id: int, clock) -> list:
+    """Run `worker.run()` through the whole queue. Returns (lead_id, step) in order.
+
+    `_nap` steps the clock to the next scheduled message instead of sleeping
+    through the days in between; nothing else about the run is touched.
+    """
+    order: list = []
+    worker.message_sent_signal.connect(
+        lambda row: order.append((int(row["lead_id"]), int(row["step"]))))
+    naps = [0]
+
+    def skip_ahead(seconds: float) -> None:
+        naps[0] += 1
+        if naps[0] > 500:                      # a loop that will not finish
+            worker.stop()
+            return
+        clock.now += max(0.0, float(seconds))
+        pending = [row["scheduled_at"] for row in _messages(conn, campaign_id)
+                   if row["status"] == "queued"]
+        if pending:
+            clock.now = max(clock.now, min(pending))
+
+    worker._nap = skip_ahead
+    worker.run()
+    return order
+
+
+def _fits_in_a_test() -> dict:
+    """Plan overrides that put a three-step campaign inside a couple of days."""
+    return {"send_days": [0, 1, 2, 3, 4, 5, 6], "send_start_hour": 0,
+            "send_end_hour": 24, "send_min_gap_sec": 0, "send_max_gap_sec": 0,
+            "followup_gap_days": 1, "followup_max_steps": 2}
+
+
+def test_a_rehearsal_leaves_the_campaign_ready_to_send_for_real():
+    """Prepare, rehearse the whole thing, then start it for real.
+
+    A dry run used to mark every message 'sent' with DRY-RUN in the error
+    column, and nothing in the app read that column. The next real run found
+    all three first touches spent and opened with "Bumping my last email in
+    case it landed in a bad week" to three strangers who had heard nothing —
+    the safety feature producing the worst output in the product.
+    """
+    with temp_db() as conn:
+        plan, campaign_id, settings = _plan_campaign(conn, 3, **_fits_in_a_test())
+        assert (plan["queued"], plan["followups"]) == (3, 6), plan
+        columns = ("step", "lead_id", "scheduled_at", "subject", "body_text")
+        before = {row["id"]: tuple(row[key] for key in columns)
+                  for row in _messages(conn, campaign_id)}
+        assert len(before) == 9
+
+        with fake_clock(time.time()) as clock, stub_smtp() as (opened, wire), \
+                stub_imap() as polled:
+            worker = C.OutreachWorker(campaign_id, settings, dry_run=True)
+            rehearsed = _run_to_the_end(worker, conn, campaign_id, clock)
+
+        assert len(rehearsed) == 9, rehearsed
+        assert opened == [] and wire == [], "a rehearsal opened a socket"
+        assert polled == [], "a rehearsal read a mailbox"
+        assert DB._scalar(conn, "SELECT COUNT(*) FROM sends") == 0, "real quota was spent"
+        assert DB.sent_today(conn, "s0@shop.test", settings.get("send_timezone")) == 0
+
+        rows = _messages(conn, campaign_id)
+        assert {row["id"]: tuple(row[key] for key in columns) for row in rows} == before, \
+            "the rehearsal did not hand the queue back as it found it"
+        assert {row["status"] for row in rows} == {"queued"}, \
+            [(row["step"], row["status"]) for row in rows]
+        assert all(not row["message_id"] and not row["error"] and not row["sent_at"]
+                   for row in rows), rows
+        assert DB.get_campaign(conn, campaign_id)["status"] == "scheduled"
+        leads = {row["lead_id"] for row in rows}
+        assert {DB.get_lead(conn, lead)["status"] for lead in leads} == {"queued"}, \
+            "a rehearsal moved a lead to sent"
+
+        # ── and now for real, on that same campaign ──
+        with fake_clock(time.time()) as clock, stub_smtp() as (opened, wire), stub_imap():
+            worker = C.OutreachWorker(campaign_id, dict(settings, dry_run=False),
+                                      dry_run=False)
+            sent = _run_to_the_end(worker, conn, campaign_id, clock)
+
+        assert len(sent) == 9 and len(wire) == 9, (sent, len(wire))
+        assert sum(1 for _lead, step in sent if step == 0) == 3, sent
+
+        opening: dict = {}
+        for index, (lead_id, step) in enumerate(sent):
+            opening.setdefault(lead_id, (index, step))
+        assert set(opening) == leads, "a lead was left out of the real run"
+        for lead_id, (index, step) in opening.items():
+            address = DB.get_lead(conn, lead_id)["email"]
+            assert step == 0, ("%s was opened with follow-up %d — the first email "
+                               "this stranger ever gets is a chaser" % (address, step))
+            assert address in wire[index]["To"], (address, wire[index]["To"])
+            assert not wire[index]["In-Reply-To"], \
+                "a first touch claimed to answer a message that never existed"
+
+        assert {row["status"] for row in _messages(conn, campaign_id)} == {"sent"}
+        assert DB._scalar(conn, "SELECT COUNT(*) FROM sends") == 9
+        assert DB.get_campaign(conn, campaign_id)["status"] == "done"
+        print("a rehearsal leaves the campaign ready to send for real: OK")
+
+
+def test_a_rehearsed_row_is_never_read_as_a_send():
+    """Every query that asks "has this gone?" has to answer no."""
+    with temp_db() as conn:
+        _plan, campaign_id, settings = _plan_campaign(conn, 1)
+        rows = _messages(conn, campaign_id)
+        first = next(row for row in rows if row["step"] == 0)
+        chaser = next(row for row in rows if row["step"] == 1)
+        lead_id = first["lead_id"]
+
+        worker = C.OutreachWorker(campaign_id, settings, dry_run=True)
+        with stub_smtp() as (opened, wire):
+            worker._send(conn, first, ST.smtp_accounts(settings)[0], time.time())
+        assert opened == [] and wire == [], "a rehearsal opened a socket"
+
+        row = DB._one(conn, "SELECT * FROM messages WHERE id = ?", (first["id"],))
+        assert row["status"] == "rehearsed", row["status"]
+        assert row["message_id"] == "" and row["error"] == "", row
+        assert DB.campaign_stats(conn, campaign_id)["sent"] == 0
+        assert DB.get_lead(conn, lead_id)["status"] == "queued", "the lead reads as mailed"
+        assert DB.sent_today(conn, "s0@shop.test", settings.get("send_timezone")) == 0
+        assert [e for e in DB.recent_events(conn) if e["kind"] == "sent"] == []
+        assert DB.first_touch_message_id(conn, campaign_id, lead_id) == ""
+        assert worker._thread_parent(conn, chaser) == "", \
+            "a chaser threaded onto a message that was never sent"
+        # Pending, not free: a first touch addressed to this lead is still owed,
+        # so a second campaign must not queue another one behind it.
+        assert lead_id in C._contacted_lead_ids(conn)
+
+        assert worker._restore_rehearsal(conn) == 1
+        row = DB._one(conn, "SELECT * FROM messages WHERE id = ?", (first["id"],))
+        assert (row["status"], row["sent_at"]) == ("queued", 0.0), row
+        due = DB.due_messages(conn, first["scheduled_at"])
+        assert first["id"] in [row["id"] for row in due], "the message never came back"
+        print("a rehearsed row is never read as a send: OK")
+
+
+def test_a_rehearsal_that_never_finished_is_put_back_by_the_next_run():
+    """The app is closed mid-rehearsal, and the next run is the live one."""
+    with temp_db() as conn:
+        _plan, campaign_id, settings = _plan_campaign(conn, 2)
+        for row in _messages(conn, campaign_id)[:3]:
+            DB.mark_message(conn, row["id"], "rehearsed", sent_at=time.time())
+
+        worker = C.OutreachWorker(campaign_id, dict(settings, dry_run=False),
+                                  dry_run=False)
+        said = []
+        worker.log_signal.connect(lambda text, level: said.append(text))
+        worker._recover_rehearsed(conn)
+
+        rows = _messages(conn, campaign_id)
+        assert {row["status"] for row in rows} == {"queued"}, rows
+        assert not any(row["sent_at"] for row in rows), rows
+        assert said and "did not finish" in said[0], said
+
+        # An opt-out that lands while a message is rehearsed cancels it, and the
+        # restore must not bring it back.
+        target = _lead_id(conn, "lead000@x.test")
+        theirs = [row for row in rows if row["lead_id"] == target]
+        DB.mark_message(conn, theirs[0]["id"], "rehearsed")
+        DB.suppress(conn, "lead000@x.test", "unsubscribed")
+        assert DB.requeue_rehearsed(conn, campaign_id) == 0
+        after = [row for row in _messages(conn, campaign_id) if row["lead_id"] == target]
+        assert all(row["status"] == "skipped" for row in after), after
+        print("an unfinished rehearsal is put back by the next run: OK")
+
+
+def test_a_stopped_rehearsal_does_not_open_with_a_follow_up():
+    """The measured symptom, end to end, on the ordinary way a dry run is used.
+
+    Nobody watches a rehearsal for four days. The user sees today's first
+    touches go by, stops, turns dry run off and starts again — and the run
+    before this fix put six messages on the wire, every one of them a chaser:
+
+        lead000@x.test first hears: step 1 —
+            'Bumping my last email in case it landed in a bad week.'
+    """
+    with temp_db() as conn:
+        _plan, campaign_id, settings = _plan_campaign(conn, 3, **_fits_in_a_test())
+
+        with fake_clock(time.time()), stub_smtp() as (opened, wire), stub_imap():
+            worker = C.OutreachWorker(campaign_id, settings, dry_run=True)
+            rehearsed: list = []
+            worker.message_sent_signal.connect(
+                lambda row: rehearsed.append((int(row["lead_id"]), int(row["step"]))))
+            # Nothing more is due today, so the user stops there.
+            worker._nap = lambda seconds: worker.stop()
+            worker.run()
+
+        assert [step for _lead, step in rehearsed] == [0, 0, 0], rehearsed
+        assert opened == [] and wire == []
+        assert {row["status"] for row in _messages(conn, campaign_id)} == {"queued"}, \
+            "a stopped rehearsal kept the first touches it walked"
+
+        with fake_clock(time.time()) as clock, stub_smtp() as (opened, wire), stub_imap():
+            worker = C.OutreachWorker(campaign_id, dict(settings, dry_run=False),
+                                      dry_run=False)
+            sent = _run_to_the_end(worker, conn, campaign_id, clock)
+
+        assert len(wire) == 9, "the real run sent %d of 9 messages" % len(wire)
+        opening: dict = {}
+        for lead_id, step in sent:
+            opening.setdefault(lead_id, step)
+        assert len(opening) == 3 and set(opening.values()) == {0}, [
+            (DB.get_lead(conn, lead)["email"], step) for lead, step in opening.items()]
+        print("a stopped rehearsal does not open with a follow-up: OK")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

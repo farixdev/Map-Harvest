@@ -165,15 +165,22 @@ def _codes(result: dict) -> list[str]:
 
 
 def test_catalogue_services_are_real():
-    assert list(A.GAP_CATALOGUE) and set(A.GAP_CATALOGUE) == set(T.GAP_SERVICES), (
-        set(A.GAP_CATALOGUE) ^ set(T.GAP_SERVICES))
+    # `slow_site` and `no_mobile` are the two the catalogue has no answer for —
+    # page speed and a mobile layout are front-end work and the seller does not
+    # sell it. They carry no services here and no entry in `T.GAP_SERVICES`, and
+    # every other code has to be in both tables.
+    no_offer = {code for code, entry in A.GAP_CATALOGUE.items() if not entry["services"]}
+    assert no_offer == {"slow_site", "no_mobile"}, no_offer
+    assert list(A.GAP_CATALOGUE)
+    assert set(A.GAP_CATALOGUE) - no_offer == set(T.GAP_SERVICES), (
+        (set(A.GAP_CATALOGUE) - no_offer) ^ set(T.GAP_SERVICES))
     for code, entry in A.GAP_CATALOGUE.items():
         assert entry["severity"] in (1, 2, 3), code
         # Titles drop into the middle of a sentence, so they start lower-case
         # and stay short enough for a subject line.
         assert entry["title"] and entry["title"][0].islower(), code
         assert len(entry["title"]) <= 40, code
-        assert entry["services"], code
+        assert entry["services"] or code in no_offer, code
         for name in entry["services"]:
             assert name.lower() in CATALOGUE_NAMES, (code, name)
     print("catalogue services are real: OK")
@@ -204,6 +211,9 @@ def test_subject_phrases_are_neutral():
         assert gap["subject_phrase"] == A.GAP_CATALOGUE[gap["code"]]["subject_phrase"], gap
 
     # And every one of the 18 renders inside the subject cap, blunt title absent.
+    # The two the catalogue cannot answer never lead, so their phrase is not in
+    # the subject either — the subject falls back to the business name, which is
+    # what it does for a lead with no gaps at all.
     lead = {"name": "Acme Plumbing Ltd", "email": "mike@acmeplumbing.ca"}
     for code, entry in A.GAP_CATALOGUE.items():
         ctx = T.build_context(lead, {"gaps": [A._gap(code, "evidence")]}, {}, {}, {})
@@ -211,7 +221,10 @@ def test_subject_phrases_are_neutral():
             subject = T.render(T.get_template(template_id), ctx)[0]
             assert subject and len(subject) <= T.SUBJECT_MAX, (code, template_id, subject)
             assert entry["title"] not in subject, (code, template_id, subject)
-            assert entry["subject_phrase"] in subject, (code, template_id, subject)
+            if entry["services"]:
+                assert entry["subject_phrase"] in subject, (code, template_id, subject)
+            else:
+                assert entry["subject_phrase"] not in subject, (code, template_id, subject)
     print("subject phrases are neutral: OK")
 
 
@@ -274,8 +287,11 @@ def test_careers_page():
     assert "careers_manual" in codes, codes
     assert "pdf_forms" in codes, codes
 
+    # Not "HR processes": it is a catalogue entry, but the slot it reaches reads
+    # "the fix is ___", and there it names a department instead of a deliverable.
     gap = next(g for g in result["gaps"] if g["code"] == "careers_manual")
-    assert set(gap["services"]) == {"HR processes", "employee onboarding"}, gap["services"]
+    assert gap["services"] == ["employee onboarding", "AI document/data extraction"], \
+        gap["services"]
 
     # The PDF is named the way the site names it, not the way the server files it.
     paperwork = next(g for g in result["gaps"] if g["code"] == "pdf_forms")
@@ -383,12 +399,18 @@ def test_ordering_and_score():
         (_stale_blog_pages(900), "https://hillsideroofing.ca/"),
     ):
         result = A.audit_from_html(pages, base)
-        severities = [g["severity"] for g in result["gaps"]]
-        assert severities == sorted(severities, reverse=True), severities
-
+        # An offer first, then severity, then catalogue order. `gaps[0]` is what
+        # the email leads with and the paragraph under it is an offer, so a gap
+        # the catalogue cannot answer sorts behind every gap it can, however bad
+        # the finding is.
         order = list(A.GAP_CATALOGUE)
-        keys = [(-g["severity"], order.index(g["code"])) for g in result["gaps"]]
+        keys = [(not g["services"], -g["severity"], order.index(g["code"]))
+                for g in result["gaps"]]
         assert keys == sorted(keys), keys
+
+        offered = [g for g in result["gaps"] if g["services"]]
+        severities = [g["severity"] for g in offered]
+        assert severities == sorted(severities, reverse=True), severities
 
         assert 0 <= result["opportunity_score"] <= 100, result["opportunity_score"]
         assert result["opportunity_score"] >= 10  # reachable
@@ -688,10 +710,19 @@ def test_evidence_never_hands_back_crawler_state():
 
     def _read(code, gap):
         ctx = T.build_context(lead, {"gaps": [gap]}, {}, profile, {})
-        body = T.render(template, ctx)[1]
-        line = next(ln for ln in body.splitlines() if ln.startswith("One thing stands out"))
-        assert "(" in line and line.endswith(")."), (code, line)
-        seen = line.split("(", 1)[1][:-2]
+        if ctx["gap_1_evidence"]:
+            body = T.render(template, ctx)[1]
+            line = next(ln for ln in body.splitlines()
+                        if ln.startswith("One thing stands out"))
+            assert "(" in line and line.endswith(")."), (code, line)
+            seen = line.split("(", 1)[1][:-2]
+        else:
+            # `slow_site` and `no_mobile` have no offer behind them, so they
+            # never become the headline and this bracket is never rendered for
+            # them. The sentence still exists — in the operator's table and in
+            # the model's brief — and the rule it has to keep is the same one.
+            assert not gap["services"], (code, gap)
+            seen = gap["evidence"]
         # It arrived whole, which is what makes the scan mean anything: evidence
         # cut at the 90-character cap could drop the machinery off the end.
         assert seen == gap["evidence"], (code, seen, gap["evidence"])
@@ -759,6 +790,14 @@ def test_every_gap_reads_in_every_template():
 
             for tail in text.split(gap["title"])[1:]:
                 assert not agrees.match(tail), (code, tpl.id, tail[:60])
+            if not gap["services"]:
+                # No offer behind it, so it never leads: the sentence that would
+                # have named it is dropped whole rather than left standing in
+                # front of an offer that answers a different question.
+                assert gap["title"] not in text, (code, tpl.id, text)
+                assert gap["evidence"] not in text, (code, tpl.id, text)
+                assert "\n\n\n" not in text and "()" not in text, (code, tpl.id, text)
+                continue
             if "{{gap_1}}" in tpl.body:
                 # The title arrived whole, inside a sentence that finished.
                 assert gap["title"] in text, (code, tpl.id, text)

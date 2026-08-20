@@ -54,12 +54,12 @@ import re
 import time
 
 from PyQt5.QtCore import QDate, QEvent, QSize, Qt, QThread, QTimer, pyqtSignal
-from PyQt5.QtGui import QColor, QFontDatabase
+from PyQt5.QtGui import QColor, QFontDatabase, QTextCursor
 from PyQt5.QtWidgets import (
     QButtonGroup, QCheckBox, QComboBox, QDateEdit, QFrame, QGridLayout,
     QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox,
     QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSpinBox,
-    QStackedWidget, QTextEdit, QVBoxLayout, QWidget,
+    QSplitter, QStackedWidget, QTextEdit, QToolTip, QVBoxLayout, QWidget,
 )
 
 from core import ai as ai_client
@@ -92,8 +92,13 @@ APP_PASSWORD_HINT = (
 )
 
 # A short curated list; the combo stays editable so any IANA name can be typed.
-# Windows has no tz database, so enumerating zoneinfo would offer a list that
-# resolves on one machine and not the next.
+# Enumerating zoneinfo would offer several hundred names, most of which nobody
+# sells into, and the point of this control is picking the customer's own hour.
+#
+# Windows ships no tz database of its own, which is why `tzdata` is a runtime
+# requirement: without it every name below resolves to nothing and the sending
+# window silently follows this machine's clock — the one thing the window
+# exists to prevent. `_zone_note` says so on screen if it is ever missing.
 COMMON_ZONES = (
     "local", "America/Toronto", "America/New_York", "America/Chicago",
     "America/Denver", "America/Los_Angeles", "America/Vancouver",
@@ -116,6 +121,24 @@ _MAX_STEP = 5
 # Long enough that a fast typist is never fighting the renderer, short enough
 # that the preview still reads as live.
 _PREVIEW_DEBOUNCE_MS = 250
+
+# The shortest preview that still shows an email rather than an envelope,
+# measured off the document `_as_paper` builds: the subject line ends 39px down,
+# the To line 60px, the first line of the message 97px and the line under it
+# 145px. Two lines of the message is the least that says anything about the copy
+# — one is a greeting — so this is the floor the preview is never squeezed past,
+# at any window size and with any number of findings on screen.
+_PREVIEW_FLOOR = 150
+
+# What is left for the boxes once the preview has its floor: the name row, the
+# subject line and the first row of the palette, which is enough to know where
+# in the editor the column has been scrolled to.
+_EDITOR_FLOOR = 150
+
+# Everything a paste can carry that ends a line, with whatever horizontal space
+# sits either side of it: a run of them collapses to the single space a subject
+# field can actually draw.
+_BREAK_RE = re.compile(r"[ \t]*[\r\n\x0b\x0c\x85\u2028\u2029]+[ \t]*")
 
 
 
@@ -303,6 +326,30 @@ def _rich(text: str, colour: str = "") -> str:
     return '<span style="color:%s">%s</span>' % (colour or "#E5E5E7", html.escape(text))
 
 
+def _zone_note(name: str) -> str:
+    """The line under the timezone box: rich text, or "" for the machine clock.
+
+    The question is not whether `name` looks like an IANA name, it is what the
+    scheduler will make of it, so it goes to the scheduler's own resolver rather
+    than to a second one here that could answer differently.
+
+    An unresolvable zone is the dangerous case and it used to pass in silence.
+    `core.campaign._zone` degrades to local time so that a bad name can never
+    take the send loop down, which leaves the user believing their mail goes out
+    at nine in the customer's morning when it goes out at nine in their own.
+    """
+    label = str(name or "").strip()
+    if not label or label.lower() == "local":
+        return ""
+    if _campaign._zone({"send_timezone": label}) is None:
+        return _rich(
+            "%s could not be resolved on this machine, so the window would follow "
+            "this computer's clock instead. Reinstall requirements.txt — it ships "
+            "the tzdata package — and restart." % label, _RED)
+    return _rich("Resolved: the hours above are kept in %s, whatever this machine's "
+                 "clock reads." % label, _GREEN)
+
+
 def _step_name(step: int) -> str:
     step = max(0, _int_of(step))
     return "First touch" if step == 0 else "Follow-up %d" % step
@@ -449,6 +496,37 @@ def _validate_template(template, ctx: dict | None = None) -> list[dict]:
     return [i for i in found if isinstance(i, dict)] if isinstance(found, list) else []
 
 
+def _note(field: str, message: str) -> dict:
+    """A finding this screen raised itself, shaped like one from the store."""
+    return {"level": "warning", "field": field, "message": message}
+
+
+def _merged_subject(template, ctx: dict | None) -> str:
+    """The subject with its fields filled, taken before the send path cuts it.
+
+    `render` hands back the line that will actually be sent, and `_clean_subject`
+    has already cut that to `SUBJECT_MAX` — so anything measured off it is at
+    most the limit, and a counter fed from it can never say the limit was
+    passed. This is the same string `_clean_subject` measures when it decides
+    whether to cut, one step earlier: resolved and tidied, not yet shortened.
+
+    Falls back to what is typed rather than to nothing, so a store that has
+    moved its internals costs the count its accuracy and not its existence.
+    """
+    source = str(getattr(template, "subject", "") or "")
+    merged = dict(ctx or {})
+    if not merged:
+        return source
+    # The same swap `render` makes: a model subject replaces the template's own
+    # on a first touch, so that is the line whose length matters there.
+    if _int_of(getattr(template, "step", 0)) == 0:
+        source = str(merged.get("ai_subject") or "").strip() or source
+    try:
+        return _templates._subject_rules(_templates._resolve(source, merged))
+    except Exception:
+        return source
+
+
 # ── Merge field palette ──────────────────────────────────────────────────────
 
 class _FlexEdit(QTextEdit):
@@ -475,6 +553,12 @@ class _ChipBar(QWidget):
     the long names are cut. So the chips are laid out by hand and the widget
     reports the height that layout actually needed, which is what lets the page
     around it scroll instead of clipping the last row.
+
+    No chip may take the focus — a chip that could would take it on the click
+    too, and the caret the field is inserted at goes with it. That left the
+    whole palette, and every tooltip in it, unreachable from the keyboard. So
+    the bar takes the focus the chips refuse: Tab lands here once, the arrow
+    keys walk the row, and Enter inserts.
     """
 
     insert_requested = pyqtSignal(str)
@@ -484,24 +568,79 @@ class _ChipBar(QWidget):
     # descenders and every underscore in a field name disappears.
     _GAP = 5
     _CHIP_HEIGHT = 28
+    # The sheet's own `#tab:checked` fill, applied by hand, because the chips
+    # are not checkable. A fill and not a ring: `border` is part of the box, so
+    # every chip behind the marked one would shift along the row on each arrow
+    # key, and `outline` costs no width but paints nothing at all once a
+    # background-color has put the button on Qt's own stylesheet painting path.
+    _MARK = "color: #E5E5E7; background-color: #3A3A3C;"
+    _STEPS = {Qt.Key_Right: 1, Qt.Key_Down: 1, Qt.Key_Left: -1, Qt.Key_Up: -1}
 
     def __init__(self, fields, parent=None):
         super().__init__(parent)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setFocusPolicy(Qt.TabFocus)
+        self.setAccessibleName("Merge fields")
         self._chips: list[QPushButton] = []
+        self._at = 0
         for field in fields:
             chip = QPushButton(field, self)
             chip.setObjectName("tab")
             chip.setFixedHeight(self._CHIP_HEIGHT)
             chip.setCursor(Qt.PointingHandCursor)
-            # Without this the click moves focus off the editor and the caret
-            # the field is meant to be inserted at is gone by the time it lands.
             chip.setFocusPolicy(Qt.NoFocus)
             chip.setToolTip(_field_tooltip(field))
             chip.clicked.connect(lambda _checked=False, name=field:
                                  self.insert_requested.emit(name))
             self._chips.append(chip)
         self._reflow()
+
+    def current_field(self) -> str:
+        return self._chips[self._at].text() if self._chips else ""
+
+    def focusInEvent(self, event) -> None:
+        super().focusInEvent(event)
+        self._mark()
+
+    def focusOutEvent(self, event) -> None:
+        super().focusOutEvent(event)
+        self._mark()
+
+    def keyPressEvent(self, event) -> None:
+        key = event.key()
+        if not self._chips:
+            super().keyPressEvent(event)
+            return
+        if key in self._STEPS:
+            self._at = (self._at + self._STEPS[key]) % len(self._chips)
+        elif key == Qt.Key_Home:
+            self._at = 0
+        elif key == Qt.Key_End:
+            self._at = len(self._chips) - 1
+        elif key in (Qt.Key_Space, Qt.Key_Return, Qt.Key_Enter):
+            self.insert_requested.emit(self.current_field())
+            return
+        else:
+            super().keyPressEvent(event)
+            return
+        self._mark()
+
+    def _mark(self) -> None:
+        """Show which chip Enter would insert, and say what that field does.
+
+        The tooltips are the point of the palette — what a field resolves to and
+        what happens to the sentence when it resolves to nothing — and one only a
+        mouse can reach is one half the users never read.
+        """
+        marked = self.hasFocus()
+        for index, chip in enumerate(self._chips):
+            chip.setStyleSheet(self._MARK if marked and index == self._at else "")
+        if not marked:
+            QToolTip.hideText()
+            return
+        chip = self._chips[self._at]
+        QToolTip.showText(chip.mapToGlobal(chip.rect().bottomLeft()),
+                          chip.toolTip(), chip)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -525,6 +664,79 @@ class _ChipBar(QWidget):
         # hand this widget a new width and call straight back in here.
         if wanted and wanted != self.minimumHeight():
             self.setFixedHeight(wanted)
+
+
+class _FlatLine(QLineEdit):
+    """A one-line field whose stored value stays one line.
+
+    A subject pasted out of a document arrives with its newlines still in it and
+    a QLineEdit draws none of them: `displayText` shows spaces, `text` hands back
+    the breaks, and the value written to the store then holds characters the
+    editor cannot render back. Nothing downstream is at risk — `_clean_subject`
+    and the mailer's own header guard both strip them — but a field that saves
+    something other than what it shows is a field that cannot be proof-read.
+    Flattening on the way in makes the two the same thing.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._flattening = False
+        self.textChanged.connect(self._flatten)
+
+    def _flatten(self, text: str) -> None:
+        if self._flattening:
+            return
+        flat = _BREAK_RE.sub(" ", text)
+        if flat == text:
+            return
+        at = self.cursorPosition() - (len(text) - len(flat))
+        self._flattening = True
+        try:
+            self.setText(flat)
+        finally:
+            self._flattening = False
+        self.setCursorPosition(max(0, min(at, len(flat))))
+
+
+class _IssuePane(QScrollArea):
+    """The validation findings, bounded and scrolled instead of unbounded.
+
+    Nothing caps how many findings one template collects, and a word-wrapped
+    label handed a dozen of them grew past 250px and pushed the preview under
+    the bottom of the window — so the pane that shows what the copy will look
+    like disappeared exactly when the copy most needed looking at. A ceiling and
+    a scrollbar of its own keep the findings readable and the preview in place.
+
+    `heightForWidth` rather than a plain maximum: the findings wrap, so how tall
+    they are is a function of how wide the column is, and a fixed height would
+    be either mostly air on one finding or a scrollbar on two.
+    """
+
+    _CEILING = 96
+
+    def __init__(self, body: QLabel, parent=None):
+        super().__init__(parent)
+        self.setWidget(body)
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.setMaximumHeight(self._CEILING)
+        policy = QSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        policy.setHeightForWidth(True)
+        self.setSizePolicy(policy)
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        body, chrome = self.widget(), 2 * self.frameWidth()
+        wanted = body.heightForWidth(max(1, width - chrome)) if body is not None else 0
+        return max(0, min(wanted + chrome, self._CEILING))
+
+    def sizeHint(self) -> QSize:
+        return QSize(super().sizeHint().width(),
+                     self.heightForWidth(max(1, self.width())))
 
 
 class _SecretField(QWidget):
@@ -807,6 +1019,8 @@ class SettingsScreen(QWidget):
         self._template_dirty = False
         self._template_loading = False
         self._merge_target = None
+        self._merge_span = (-1, -1)
+        self._template_notes: list = []
         self._build()
         self._load_into_ui()
 
@@ -1142,9 +1356,38 @@ class SettingsScreen(QWidget):
         scroll.setWidget(editor)
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
+        # No click focus: a merge chip is `Qt.NoFocus` so that clicking one
+        # leaves the caret where the user put it, and a scrolling column that
+        # takes the focus the chip refused undoes that from behind — the box
+        # empties its selection on the way out and the caret stops being drawn
+        # at the very moment the user is aiming a field at it.
+        scroll.setFocusPolicy(Qt.NoFocus)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        columns.addWidget(scroll, stretch=1)
+        scroll.setMinimumHeight(_EDITOR_FLOOR)
+
+        # The split is draggable because which half matters is the user's call,
+        # not this screen's: reading the copy back wants a tall preview and
+        # rewriting it wants tall boxes. Neither half may be dragged away —
+        # both carry a minimum, and the growth goes mostly to the boxes so that
+        # a wider window does not turn into a wall of preview.
+        split = QSplitter(Qt.Vertical)
+        split.setObjectName("template_split")
+        split.setChildrenCollapsible(False)
+        split.setHandleWidth(10)
+        split.setStyleSheet(
+            "QSplitter#template_split::handle { background: transparent; "
+            "border-top: 1px solid #3A3A3C; }")
+        split.addWidget(scroll)
+        split.addWidget(self._build_template_preview_panel())
+        split.setStretchFactor(0, 2)
+        split.setStretchFactor(1, 1)
+        # A proportion rather than two heights: the boxes and the palette ask
+        # for more than either window size has, so the preview opens on its
+        # floor — the whole message is a drag away and the copy being written
+        # keeps the rest.
+        split.setSizes([4 * _EDITOR_FLOOR, _PREVIEW_FLOOR])
+        columns.addWidget(split, stretch=1)
         return page
 
     def _build_template_list_column(self) -> QWidget:
@@ -1155,9 +1398,11 @@ class SettingsScreen(QWidget):
 
         self.template_list = QListWidget()
         self.template_list.setObjectName("saved_list")
-        # Elided, not clipped: a name somebody typed can be any length, and the
-        # marker that says whether it is theirs sits at the end of the row.
-        self.template_list.setTextElideMode(Qt.ElideRight)
+        # Elided, not clipped: a name somebody typed can be any length. From the
+        # middle, because the marker that says whether the row is theirs sits at
+        # the end of it — cut from the right, an 84-character name renders with
+        # nothing to say whether Delete or Reset is the button for it.
+        self.template_list.setTextElideMode(Qt.ElideMiddle)
         self.template_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.template_list.setMinimumHeight(200)
         self.template_list.currentItemChanged.connect(self._on_template_row_changed)
@@ -1239,12 +1484,12 @@ class SettingsScreen(QWidget):
         subject_row.addWidget(self.template_subject_count)
         column.addLayout(subject_row)
 
-        self.template_subject_edit = QLineEdit()
+        self.template_subject_edit = _FlatLine()
         self.template_subject_edit.setPlaceholderText("Lower case, no shouting, under 55 characters")
         self.template_subject_edit.setFixedHeight(34)
         self.template_subject_edit.textChanged.connect(self._mark_template_dirty)
         self.template_subject_edit.returnPressed.connect(lambda: self._save_open_template())
-        self.template_subject_edit.installEventFilter(self)
+        self._watch_caret(self.template_subject_edit)
         column.addWidget(self.template_subject_edit)
 
         self.template_chips = _ChipBar(MERGE_FIELDS)
@@ -1264,33 +1509,65 @@ class SettingsScreen(QWidget):
         self.template_body_edit.setPlaceholderText(
             "Plain text. Blank lines are paragraphs; the footer is added for you.")
         self.template_body_edit.textChanged.connect(self._mark_template_dirty)
-        self.template_body_edit.installEventFilter(self)
+        self._watch_caret(self.template_body_edit)
         column.addWidget(self.template_body_edit, stretch=1)
 
         self.template_issues = QLabel("")
         self.template_issues.setObjectName("muted")
         self.template_issues.setTextFormat(Qt.RichText)
         self.template_issues.setWordWrap(True)
-        self.template_issues.hide()
-        column.addWidget(self.template_issues)
-
-        column.addWidget(_section_label("Preview"))
-        self.template_preview = _FlexEdit()
-        self.template_preview.setObjectName("email_paper")
-        # Read-only rather than a browser: a calendar link in a preview must not
-        # be clickable, and a QTextEdit that cannot be typed in never follows one.
-        self.template_preview.setReadOnly(True)
-        self.template_preview.setMinimumHeight(84)
-        column.addWidget(self.template_preview, stretch=1)
-        column.addWidget(_hint(
-            "Rendered for a sample lead through the same code that sends, footer "
-            "and unsubscribe line included."
-        ))
+        self.template_issues.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.template_issues_pane = _IssuePane(self.template_issues)
+        self.template_issues_pane.hide()
+        column.addWidget(self.template_issues_pane)
 
         self._preview_timer = QTimer(self)
         self._preview_timer.setSingleShot(True)
         self._preview_timer.timeout.connect(self._refresh_template_preview)
         return column
+
+    def _build_template_preview_panel(self) -> QWidget:
+        """The preview, taken out of the scrolling column and pinned under it.
+
+        It used to be the last thing in the same column as the boxes, which
+        reads fine at 1080x760 and fails at the window minimum: the palette, the
+        two boxes and a populated findings pane already ask for more than 620px
+        of window has to give, so the preview began below the fold — and even
+        scrolled all the way down it was 84px of From/To card with no message
+        under it. A pane that only shows up when the copy is already short is
+        the wrong pane to lose, because this is the one thing on the screen that
+        says what will actually be sent.
+
+        So it stops scrolling. The boxes scroll behind it, the preview stays put
+        at every window size, and `_PREVIEW_FLOOR` is the least of the message
+        it may ever be squeezed to.
+        """
+        panel = QWidget()
+        column = QVBoxLayout(panel)
+        column.setContentsMargins(0, 0, 8, 0)
+        column.setSpacing(6)
+        column.addWidget(_section_label("Preview"))
+
+        self.template_preview = _FlexEdit()
+        self.template_preview.setObjectName("email_paper")
+        # Read-only rather than a browser: a calendar link in a preview must not
+        # be clickable, and a QTextEdit that cannot be typed in never follows one.
+        self.template_preview.setReadOnly(True)
+        # The floor is the document's, so the widget needs the sheet's padding
+        # and border on top of it. `ensurePolished` first: those two only reach
+        # `contentsMargins` when the sheet has been applied to the widget, and
+        # unpolished it reports the 1px frame alone — a floor 16px short, which
+        # is exactly the line of the message this is here to guarantee.
+        self.template_preview.ensurePolished()
+        margins = self.template_preview.contentsMargins()
+        self.template_preview.setMinimumHeight(
+            _PREVIEW_FLOOR + margins.top() + margins.bottom())
+        column.addWidget(self.template_preview, stretch=1)
+        column.addWidget(_hint(
+            "Rendered for a sample lead through the same code that sends, footer "
+            "and unsubscribe line included."
+        ))
+        return panel
 
     # ── Templates: the list ──
 
@@ -1339,29 +1616,76 @@ class SettingsScreen(QWidget):
         return None
 
     def _load_template_into_editor(self, template) -> None:
+        """Put `template` on screen, and say whatever the editor could not hold.
+
+        Both notes below come out of a store somebody edited by hand, and both
+        used to be applied in silence: the row opened looking saved, and the
+        first Save wrote the editor's version over a value nobody had chosen to
+        change. They go in the findings panel rather than the header, which is
+        sized for two words, and they mark the editor unsaved so that leaving
+        the row asks first.
+        """
+        stored_step = _int_of(getattr(template, "step", 0))
+        shown_step = max(0, min(_MAX_STEP, stored_step))
+        stored_subject = str(getattr(template, "subject", "") or "")
         self._template_loading = True
         try:
             self.template_name_edit.setText(str(getattr(template, "name", "") or ""))
-            self.template_subject_edit.setText(str(getattr(template, "subject", "") or ""))
+            self.template_subject_edit.setText(stored_subject)
             self.template_body_edit.setPlainText(str(getattr(template, "body", "") or ""))
-            step = max(0, min(_MAX_STEP, _int_of(getattr(template, "step", 0))))
-            self.template_step_combo.setCurrentIndex(step)
+            self.template_step_combo.setCurrentIndex(shown_step)
         finally:
             self._template_loading = False
+
+        # An offset means nothing once the words under it have been replaced, and
+        # a row is switched from the picker with the focus in the list rather
+        # than in either box. Forgotten, a chip clicked from there inserts at
+        # whatever caret the boxes were left holding, which is the top of the
+        # copy that was just loaded.
+        self._merge_span = (-1, -1)
         self._template_dirty = False
+        self._template_notes = []
+        if template is not None and shown_step != stored_step:
+            self._template_notes.append(_note(
+                "step", "Stored as step %d, which is not one this app ever "
+                        "sends. It is shown as %s, and Save writes that."
+                        % (stored_step, _step_name(shown_step))))
+        if self.template_subject_edit.text() != stored_subject:
+            self._template_notes.append(_note(
+                "subject", "The stored subject has line breaks a single line "
+                           "cannot show. They read as spaces here, and Save "
+                           "writes them that way."))
+        if self._template_notes:
+            self._mark_template_dirty()
         self._refresh_template_buttons()
         self._refresh_template_preview()
 
     def _refresh_template_buttons(self) -> None:
+        """Enable what applies, and say why on everything that does not.
+
+        A disabled control that describes what it would do reads as a control
+        that is not working. Both of these say what is true of the template in
+        the editor instead, which is the sentence that answers the question.
+        """
         has = bool(self._template_id)
         builtin = has and _is_builtin(self._template_id)
+        edited = builtin and _is_overridden(self._template_id)
         self.template_copy_btn.setEnabled(has)
         self.template_save_btn.setEnabled(has)
         self.template_delete_btn.setEnabled(has and not builtin)
         self.template_delete_btn.setToolTip(
+            "No template is open" if not has else
             "A built-in template cannot be removed — Reset puts it back instead"
             if builtin else "Remove this template for good")
-        self.template_reset_btn.setEnabled(builtin and _is_overridden(self._template_id))
+        self.template_reset_btn.setEnabled(edited)
+        self.template_reset_btn.setToolTip(
+            "No template is open" if not has else
+            "Put this built-in template back to the wording it shipped with"
+            if edited else
+            "This built-in template is already the wording it shipped with"
+            if builtin else
+            "This template is your own, so there is no shipped wording to go "
+            "back to — Delete removes it")
         for edit in (self.template_name_edit, self.template_subject_edit,
                      self.template_body_edit):
             edit.setEnabled(has)
@@ -1373,14 +1697,40 @@ class SettingsScreen(QWidget):
         if not chosen or chosen == self._template_id:
             return
         if self._template_dirty and not self._offer_to_save():
-            self._template_loading = True
-            try:
-                self._select_row(self._template_id)
-            finally:
-                self._template_loading = False
+            # Only the highlight comes back. Reloading the editor here would
+            # overwrite the unsaved text with the copy on disk, which is the one
+            # thing Cancel was pressed to prevent.
+            self._sync_template_row()
             return
-        self._template_id = chosen
-        self._load_template_into_editor(self._template_by_id(chosen))
+        self._show_template(chosen)
+
+    def _sync_template_row(self) -> None:
+        """Put the highlight on the template the editor is holding."""
+        self._template_loading = True
+        try:
+            self._select_row(self._template_id)
+        finally:
+            self._template_loading = False
+
+    def _show_template(self, template_id: str) -> None:
+        """Put one template under the highlight and in the editor, together.
+
+        Answering the unsaved-changes question with Save writes the template
+        being left, and the reload behind that write rebuilds the list around
+        it — so by the time the switch itself happened the highlight had been
+        put back on the row being left while the editor went on to load the row
+        that was picked. The two then disagreed with nothing on screen saying
+        so, the highlighted row read "Headline gap — edited" over an editor
+        holding a different record, and every keystroke after it was written
+        into that record. Clicking the highlighted row could not undo it either:
+        `currentItemChanged` does not fire for an item that is already current.
+
+        So neither half moves without the other, whichever answer came back and
+        whichever direction the switch went in.
+        """
+        self._template_id = template_id
+        self._sync_template_row()
+        self._load_template_into_editor(self._template_by_id(template_id))
 
     def _select_row(self, template_id: str) -> None:
         for row in range(self.template_list.count()):
@@ -1390,7 +1740,13 @@ class SettingsScreen(QWidget):
                 return
 
     def _offer_to_save(self) -> bool:
-        """Ask before losing edits. False means the user wants to stay put."""
+        """Ask before losing edits. False means the screen stays where it is.
+
+        A Save the store refused counts as staying put. `_store_failed` has just
+        told the user that what is on screen is only on screen and to copy it
+        somewhere safe; switching away underneath that message would throw away
+        the text it was asking them to rescue.
+        """
         name = self.template_name_edit.text().strip() or "This template"
         answer = QMessageBox.question(
             self, "Unsaved changes",
@@ -1400,8 +1756,8 @@ class SettingsScreen(QWidget):
         )
         if answer == QMessageBox.Cancel:
             return False
-        if answer == QMessageBox.Save:
-            self._save_open_template(quiet=True)
+        if answer == QMessageBox.Save and not self._save_open_template(quiet=True):
+            return False
         self._template_dirty = False
         return True
 
@@ -1424,28 +1780,107 @@ class SettingsScreen(QWidget):
             _status(self.save_status, "Unsaved", "busy")
         self._preview_timer.start(_PREVIEW_DEBOUNCE_MS)
 
+    def _watch_caret(self, editor) -> None:
+        """Follow the caret in `editor` wherever it goes.
+
+        A merge field lands where the user is looking, and where they are
+        looking is where the caret is *now* — after the arrow key, after the
+        click inside the box, after the drag that selected a word. Focus events
+        alone cannot see any of that: they fire when the box is entered and
+        left, and every one of those moves happens in between. A field inserted
+        at an offset recorded two gestures ago lands somewhere else and drags
+        the caret with it, so the next keystroke is wrong too.
+        """
+        editor.installEventFilter(self)
+        editor.cursorPositionChanged.connect(lambda *_a: self._caret_moved(editor))
+        editor.selectionChanged.connect(lambda *_a: self._caret_moved(editor))
+
+    def _caret_moved(self, editor) -> None:
+        """Record the caret, but only while the box owns it.
+
+        Losing the focus is itself a caret move as far as Qt is concerned: a
+        `QLineEdit` drops its selection on the way out, and that arrives here as
+        one more `selectionChanged`. Taking it would throw away the selection
+        the user is still looking at, half a second before a chip is asked to
+        replace it. The filter below has already written down the truth by then.
+        """
+        if editor is None or not editor.hasFocus():
+            return
+        self._merge_target = editor
+        self._merge_span = self._caret_of(editor)
+
     def eventFilter(self, obj, event):
-        """Remember which box a merge field should land in.
+        """Remember which box a merge field should land in, and where in it.
 
         The chips insert at the cursor, and the cursor is in whichever of the two
         editors was last used. Without this every field goes into the body, which
         is wrong exactly when somebody is writing a subject line.
+
+        Both edges of the focus matter. Entering a box with Tab selects its whole
+        contents, which is a real selection a field is allowed to replace, and
+        leaving it for the palette is the last instant at which a `QLineEdit`
+        still knows what was selected.
         """
-        if event.type() == QEvent.FocusIn:
-            if obj in (getattr(self, "template_subject_edit", None),
-                       getattr(self, "template_body_edit", None)):
-                self._merge_target = obj
+        if event.type() in (QEvent.FocusIn, QEvent.FocusOut) and obj in (
+                getattr(self, "template_subject_edit", None),
+                getattr(self, "template_body_edit", None)):
+            self._merge_target = obj
+            self._merge_span = self._caret_of(obj)
         return super().eventFilter(obj, event)
 
-    def _insert_merge_field(self, field: str) -> None:
-        token = "{{%s}}" % field
-        if self._merge_target is self.template_subject_edit:
-            self.template_subject_edit.insert(token)
-            self.template_subject_edit.setFocus()
+    def _caret_of(self, editor) -> tuple:
+        """Where the caret sits and what it has hold of, as (anchor, position)."""
+        if editor is self.template_subject_edit:
+            at, start = editor.cursorPosition(), editor.selectionStart()
+            if start < 0:
+                return (at, at)
+            end = start + len(editor.selectedText())
+            return (end, start) if at == start else (start, end)
+        cursor = editor.textCursor()
+        return (cursor.anchor(), cursor.position())
+
+    def _restore_caret(self, editor) -> None:
+        """Put the caret, and any selection with it, back where it was left."""
+        anchor, at = self._merge_span
+        if at < 0:
             return
-        self.template_body_edit.insertPlainText(token)
-        self.template_body_edit.setFocus()
-        self._merge_target = self.template_body_edit
+        if editor is self.template_subject_edit:
+            end = len(editor.text())
+            anchor, at = min(max(anchor, 0), end), min(max(at, 0), end)
+            if anchor == at:
+                editor.setCursorPosition(at)
+            else:
+                editor.setSelection(min(anchor, at), abs(at - anchor))
+            return
+        end = len(editor.toPlainText())
+        cursor = editor.textCursor()
+        cursor.setPosition(min(max(anchor, 0), end))
+        cursor.setPosition(min(max(at, 0), end), QTextCursor.KeepAnchor)
+        editor.setTextCursor(cursor)
+
+    def _insert_merge_field(self, field: str) -> None:
+        """Drop `field` in at the caret, over whatever the caret has hold of.
+
+        Nothing is moved when the box still has the focus — a chip is
+        `Qt.NoFocus` and the column behind it takes no click focus either, so a
+        clicked chip leaves the caret and the selection exactly as they are on
+        screen and the insert goes straight in. The restore is for the keyboard
+        route, where reaching the palette with Tab genuinely takes the focus out
+        of the box and a `QLineEdit` forgets what was selected on the way.
+        """
+        token = "{{%s}}" % field
+        target = (self.template_subject_edit
+                  if self._merge_target is self.template_subject_edit
+                  else self.template_body_edit)
+        if not target.hasFocus():
+            self._restore_caret(target)
+        if target is self.template_subject_edit:
+            target.insert(token)
+        else:
+            target.insertPlainText(token)
+        target.setFocus()
+        self._merge_target = target
+        self._merge_span = self._caret_of(target)
 
     def _save_open_template(self, quiet: bool = False) -> bool:
         if not self._template_id:
@@ -1588,9 +2023,12 @@ class SettingsScreen(QWidget):
         self._show_template_issues(_validate_template(template, ctx))
 
         limit = getattr(_templates, "SUBJECT_MAX", 55)
+        merged = len(_merged_subject(template, ctx))
+        over = merged > limit
         self.template_subject_count.setText(_rich(
-            "%d / %d once merged" % (len(subject), limit),
-            _RED if len(subject) > limit else _GREEN))
+            "%d / %d once merged%s" % (merged, limit,
+                                       " — cut before sending" if over else ""),
+            _RED if over else _GREEN))
 
         if not body_text.strip():
             self._show_paper(
@@ -1602,7 +2040,9 @@ class SettingsScreen(QWidget):
 
     def _show_template_issues(self, issues) -> None:
         lines = []
-        for issue in issues:
+        # The screen's own notes first: they are about what loading the row
+        # already changed, which is older news than anything about the copy.
+        for issue in list(self._template_notes) + list(issues):
             level = str(issue.get("level") or "").strip().lower()
             field = str(issue.get("field") or "").strip()
             message = str(issue.get("message") or "").strip()
@@ -1611,7 +2051,8 @@ class SettingsScreen(QWidget):
             colour = _RED if level.startswith("err") else _AMBER
             lines.append(_rich("%s: %s" % (field, message) if field else message, colour))
         self.template_issues.setText("<br>".join(lines))
-        self.template_issues.setVisible(bool(lines))
+        self.template_issues_pane.setVisible(bool(lines))
+        self.template_issues_pane.updateGeometry()
 
     def _as_paper(self, subject: str, body_text: str) -> str:
         """The message laid out as the recipient's mail client would show it.
@@ -1738,10 +2179,13 @@ class SettingsScreen(QWidget):
         layout.addLayout(window_row)
         layout.addSpacing(6)
         layout.addWidget(_hint(
-            "Local time unless you name an IANA zone. Windows resolves IANA names "
-            "only when the tzdata package is installed; anything unresolvable "
-            "falls back to this machine's clock."
+            "Local time unless you name an IANA zone. Naming one sends at those "
+            "hours in the customer's day rather than in yours."
         ))
+        self.timezone_note = _hint("")
+        self.timezone_note.setVisible(False)
+        layout.addWidget(self.timezone_note)
+        self.timezone_combo.currentTextChanged.connect(self._refresh_timezone_note)
         layout.addSpacing(22)
 
         layout.addWidget(_section_label("Pacing"))
@@ -1947,6 +2391,10 @@ class SettingsScreen(QWidget):
         self.start_hour_spin.setValue(self._int(settings.get("send_start_hour"), 9))
         self.end_hour_spin.setValue(self._int(settings.get("send_end_hour"), 17))
         self.timezone_combo.setEditText(str(settings.get("send_timezone") or "local"))
+        # Explicitly as well as on the signal: setting the same text the combo
+        # already holds emits nothing, and a saved zone that stopped resolving
+        # would then load with no note under it.
+        self._refresh_timezone_note()
         self.min_gap_spin.setValue(self._int(settings.get("send_min_gap_sec"), 60))
         self.max_gap_spin.setValue(self._int(settings.get("send_max_gap_sec"), 240))
         self.daily_cap_spin.setValue(self._int(settings.get("daily_cap_per_account"), 40))
@@ -2053,6 +2501,11 @@ class SettingsScreen(QWidget):
             if name and item.checkState() == Qt.Checked:
                 out.append(str(name))
         return out
+
+    def _refresh_timezone_note(self) -> None:
+        note = _zone_note(self.timezone_combo.currentText())
+        self.timezone_note.setText(note)
+        self.timezone_note.setVisible(bool(note))
 
     def _refresh_budget(self) -> None:
         cap = max(0, self._int(self.settings.get("ai_monthly_token_cap"), 0))

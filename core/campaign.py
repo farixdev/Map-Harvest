@@ -520,13 +520,93 @@ def apply_compliance(ctx: dict, settings: dict) -> dict:
     return ctx
 
 
+# ── Opt-out routes, and whether anything reads them ──────────────────────────
+
+def reads_inbox(account: dict) -> bool:
+    """Whether `_poll_inboxes` will ever open this account's mailbox.
+
+    IMAP has to be switched on for the account and the App Password has to be
+    stored, because the poll is a login. One predicate rather than two so the
+    set the worker actually polls and the set `optout_warnings` measures against
+    cannot drift apart — a warning that named a mailbox the app does read, or
+    stayed quiet about one it does not, would be worse than no warning.
+    """
+    return bool(account.get("imap_enabled") and _text(account.get("email")).strip()
+                and _text(account.get("app_password")))
+
+
+def polled_mailboxes(settings: dict) -> set[str]:
+    """Lowercased addresses of every mailbox this app reads opt-outs out of."""
+    accounts = _settings.smtp_accounts(settings if isinstance(settings, dict) else {})
+    return {_text(a.get("email")).strip().lower() for a in accounts if reads_inbox(a)}
+
+
+def _optout_routes(settings: dict, profile: dict) -> list[str]:
+    """Every mailbox a reader could reasonably send an opt-out to, in order.
+
+    Three of them, and they need not be the same address: the footer sentence
+    and `List-Unsubscribe` share one (see `core.templates.unsubscribe_address`),
+    the footer also says to reply — which lands on `Reply-To` — and `Reply-To`
+    falls back to the account the message left from.
+    """
+    routes = []
+    reply_to = _text(profile.get("reply_to")).strip()
+    for account in _settings.smtp_accounts(settings):
+        sender = _text(account.get("email")).strip()
+        routes.append(_templates.unsubscribe_address(profile, settings, sender))
+        routes.append(reply_to or sender)
+    seen, out = set(), []
+    for route in routes:
+        key = route.strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(route.strip())
+    return out
+
+
+def optout_warnings(settings: dict, profile: dict | None = None) -> list[str]:
+    """One sentence per opt-out route the reader is offered that nothing reads.
+
+    Which mailboxes get opened is the user's own Gmail setup, so this cannot be
+    fixed from in here. What can be fixed is the silence: a recipient who does
+    everything right and keeps getting the chasers is the compliance failure
+    that matters most, and from inside the app it looks exactly like a campaign
+    nobody objected to.
+
+    Addresses, not counts. "An opt-out route is unread" is not something anyone
+    can act on, and the fix is per mailbox.
+    """
+    settings = settings if isinstance(settings, dict) else {}
+    profile = profile if isinstance(profile, dict) else (settings.get("sender_profile") or {})
+    polled = polled_mailboxes(settings)
+    known = {_text(a.get("email")).strip().lower()
+             for a in _settings.smtp_accounts(settings)}
+
+    out = []
+    for route in _optout_routes(settings, profile):
+        key = route.lower()
+        if key in polled:
+            continue
+        if key in known:
+            out.append(
+                "Opt-outs sent to %s will not be read: that account is set up to "
+                "send but not to receive. Switch IMAP on for it in Settings." % route)
+        else:
+            out.append(
+                "Opt-outs sent to %s will not be read: it is not one of the Gmail "
+                "accounts this app can open, so a lead who asks to be removed there "
+                "stays in the campaign and keeps getting the follow-ups." % route)
+    return out
+
+
 # ── Planning a campaign ──────────────────────────────────────────────────────
 
 def _blank_plan(campaign_id: int) -> dict:
     return {"campaign_id": _int(campaign_id), "leads": 0, "queued": 0, "followups": 0,
             "skipped": 0, "skip_reasons": {}, "generic": 0, "generic_reasons": {},
             "accounts": [], "days": 0, "per_day": {}, "first_send": 0.0,
-            "last_send": 0.0, "daily_cap": 0, "error": "", "cancelled": False}
+            "last_send": 0.0, "daily_cap": 0, "error": "", "cancelled": False,
+            "warnings": []}
 
 
 def _skip(plan: dict, reason: str, count: int = 1) -> None:
@@ -625,6 +705,13 @@ def _plan(conn, plan: dict, leads: list, template_id: str, profile: dict,
     if not profile:
         profile = settings.get("sender_profile") or {}
 
+    # Said here because this is where the user decides to go ahead, and written
+    # to the event log as well because it is a fact about their mail setup
+    # rather than about this campaign — it will be just as true of the next one.
+    plan["warnings"] = optout_warnings(settings, profile)
+    for warning in plan["warnings"]:
+        _db.log_event(conn, "unread_optout", warning)
+
     rows = _eligible_leads(conn, leads, plan)
     plan["leads"] = len(rows)
     if not rows:
@@ -667,8 +754,8 @@ def _plan(conn, plan: dict, leads: list, template_id: str, profile: dict,
     # from, and how much of the opening day is already spent.
     schedule = {"accounts": accounts, "ramp_start": ramp, "sent_today": sent_today,
                 "start_day": _local_date(now, _zone(settings))}
-    _queue_pass(conn, plan, prepared, slots, settings, total, progress, schedule,
-                should_stop)
+    _queue_pass(conn, plan, prepared, slots, settings, profile, total, progress,
+                schedule, should_stop)
     plan["days"] = len(plan["per_day"])
     if plan["queued"]:
         _db.set_campaign_status(conn, campaign_id, "scheduled")
@@ -687,11 +774,17 @@ def _contacted_lead_ids(conn) -> set[int]:
     about messages: a lead whose status was reset by a re-import is still a
     person who has had one cold email, and a second one is the compliance
     failure this guards against.
+
+    'rehearsed' counts as pending, not as sent. Nobody has heard from that lead
+    yet, but a first touch addressed to them is sitting in the store waiting to
+    be put back on the queue, and queueing a second one behind it would mail
+    the same stranger twice.
     """
     try:
         rows = conn.execute(
             "SELECT DISTINCT lead_id FROM messages WHERE step = 0 "
-            "AND status IN ('queued', 'sending', 'sent', 'replied', 'bounced')"
+            "AND status IN ('queued', 'sending', 'rehearsed', 'sent', "
+            "               'replied', 'bounced')"
         ).fetchall()
     except sqlite3.Error:
         return set()
@@ -818,8 +911,24 @@ def _note_send(plan: dict, zone, when: float) -> None:
     plan["last_send"] = max(plan["last_send"], when)
 
 
+def _for_account(text: str, html: str, profile: dict, settings: dict,
+                 account_email: str) -> tuple[str, str]:
+    """The rendered body with its footer pointed at `account_email`'s opt-out route.
+
+    The copy is written before the schedule is drawn, so the footer arrives here
+    naming whichever account came first. The account this message is placed on
+    is known now, and `core.mailer.build_message` re-points the footer once more
+    at whatever account it finally leaves from — so the queue reads honestly and
+    the wire is right even when a capped account hands the message on.
+    """
+    address = _templates.unsubscribe_address(profile, settings, account_email)
+    return (_templates.retarget_unsubscribe(text, address),
+            _templates.retarget_unsubscribe(html, address))
+
+
 def _queue_pass(conn, plan: dict, prepared: list, slots: list, settings: dict,
-                total: int, progress, schedule: dict, should_stop) -> None:
+                profile: dict, total: int, progress, schedule: dict,
+                should_stop) -> None:
     zone = _zone(settings)
     placed = []
 
@@ -829,6 +938,7 @@ def _queue_pass(conn, plan: dict, prepared: list, slots: list, settings: dict,
             return
         try:
             lead_id = _int(row.get("id"))
+            text, html = _for_account(text, html, profile, settings, account_email)
             message_id = _db.queue_message(conn, {
                 "campaign_id": plan["campaign_id"], "lead_id": lead_id, "step": 0,
                 "subject": subject, "body_text": text, "body_html": html,
@@ -849,10 +959,10 @@ def _queue_pass(conn, plan: dict, prepared: list, slots: list, settings: dict,
             _skip(plan, "could not be queued (%s)" % type(exc).__name__)
 
     if placed and settings.get("followup_enabled", True):
-        _queue_followups(conn, plan, placed, settings, schedule)
+        _queue_followups(conn, plan, placed, settings, profile, schedule)
 
 
-def _queue_followups(conn, plan: dict, placed: list, settings: dict,
+def _queue_followups(conn, plan: dict, placed: list, settings: dict, profile: dict,
                      schedule: dict) -> None:
     """Place every follow-up step through `next_send_times`, like a first touch.
 
@@ -930,7 +1040,8 @@ def _queue_followups(conn, plan: dict, placed: list, settings: dict,
                     break
                 start += overrun
             for (lead_id, ctx, _first), (when, _email) in zip(items, slots):
-                if not _queue_followup(conn, plan, ctx, lead_id, step, email, when):
+                if not _queue_followup(conn, plan, ctx, lead_id, step, email, when,
+                                       profile, settings):
                     # The first touch is already queued, so this is one chaser
                     # missing from an otherwise healthy campaign — invisible
                     # until the day it does not arrive.
@@ -949,13 +1060,15 @@ def _spend(used: dict, history: dict, zone, email: str, when: float) -> None:
 
 
 def _queue_followup(conn, plan: dict, ctx: dict, lead_id: int, step: int,
-                    account_email: str, when: float) -> bool:
+                    account_email: str, when: float, profile: dict,
+                    settings: dict) -> bool:
     options = _templates.templates_for_step(step)
     if not options:
         return False
     subject, text, html = _templates.render(options[0], ctx)
     if not subject or not text:
         return False
+    text, html = _for_account(text, html, profile, settings, account_email)
     return bool(_db.queue_message(conn, {
         "campaign_id": plan["campaign_id"], "lead_id": lead_id, "step": step,
         "subject": subject, "body_text": text, "body_html": html,
@@ -1081,8 +1194,36 @@ class OutreachWorker(QThread):
         except Exception as exc:
             self.error_signal.emit(str(exc))
         finally:
+            # Every way out of a rehearsal comes through here — finished,
+            # stopped, or thrown out of — and every one of them owes the
+            # campaign its queue back.
+            self._restore_rehearsal(None)
             self._close_senders()
             self.done_signal.emit()
+
+    def _restore_rehearsal(self, conn) -> int:
+        """Hand back everything a dry run marked. Returns how many rows moved.
+
+        Nothing rehearsed was ever sent, so the messages are still owed to their
+        leads. Leaving them consumed is what made the safety feature dangerous:
+        the next real run found every first touch already spent and opened with
+        "Bumping my last email" to somebody who had heard nothing.
+        """
+        return _db.requeue_rehearsed(conn, self.campaign_id)
+
+    def _recover_rehearsed(self, conn) -> None:
+        """Put back what a dry run that never finished left behind.
+
+        A rehearsal killed by the app closing cannot run its own restore, so
+        every run does it on the way in as well — including a live run, which
+        is the one that would otherwise send the follow-ups on their own.
+        """
+        restored = self._restore_rehearsal(conn)
+        if restored:
+            self.log_signal.emit(
+                "%d message%s left over from a dry run that did not finish are back "
+                "on the queue — none of them was sent."
+                % (restored, "" if restored == 1 else "s"), "info")
 
     def _recover_claimed(self, conn) -> None:
         """Resolve messages claimed by a previous run that never came back.
@@ -1109,11 +1250,14 @@ class OutreachWorker(QThread):
     def _loop(self) -> None:
         conn = _db.connect()
         self._ramp_start = campaign_start_day(conn, self.campaign_id, self._settings)
+        self._recover_rehearsed(conn)
         self._recover_claimed(conn)
         _db.set_campaign_status(conn, self.campaign_id, "running")
         if self.dry_run:
             self.log_signal.emit(
-                "DRY RUN — messages are marked sent and nothing leaves this machine", "info")
+                "DRY RUN — every message is built and logged, nothing leaves this "
+                "machine, and the queue is handed back untouched at the end", "info")
+        self._warn_unread_optouts()
         self._emit_progress(conn)
 
         while self._running:
@@ -1123,11 +1267,8 @@ class OutreachWorker(QThread):
 
             self._poll_inboxes(conn, time.time())
 
-            stats = _db.campaign_stats(conn, self.campaign_id)
-            if _int(stats.get("queued")) <= 0:
-                self.stats_signal.emit(stats)
-                self.log_signal.emit("Campaign finished — nothing left in the queue", "done")
-                _db.set_campaign_status(conn, self.campaign_id, "done")
+            if _int(_db.campaign_stats(conn, self.campaign_id).get("queued")) <= 0:
+                self._finish(conn)
                 return
 
             now = time.time()
@@ -1137,8 +1278,32 @@ class OutreachWorker(QThread):
                 continue
             self._dispatch(conn, due, now)
 
+        # Stopped half way through a rehearsal is still a rehearsal: the part
+        # of the queue it walked goes back before the campaign is left alone.
+        self._restore_rehearsal(conn)
         _db.set_campaign_status(conn, self.campaign_id, "stopped")
         self.log_signal.emit("Stopped", "done")
+        self._emit_progress(conn)
+
+    def _finish(self, conn) -> None:
+        """Close out a run that has emptied the queue.
+
+        A live run leaves the campaign 'done'. A rehearsal must not: the user
+        pressed Start on a dry run to see the whole thing happen and then send
+        it for real, so the queue goes back exactly as it was and the campaign
+        returns to 'scheduled', ready for that second press.
+        """
+        restored = self._restore_rehearsal(conn)
+        self.stats_signal.emit(_db.campaign_stats(conn, self.campaign_id))
+        if restored:
+            _db.set_campaign_status(conn, self.campaign_id, "scheduled")
+            self.log_signal.emit(
+                "Dry run finished — %d message%s rehearsed and none sent. The queue is "
+                "back as it was; turn dry run off in Settings to send it for real."
+                % (restored, "" if restored == 1 else "s"), "done")
+            return
+        self.log_signal.emit("Campaign finished — nothing left in the queue", "done")
+        _db.set_campaign_status(conn, self.campaign_id, "done")
 
     def _due(self, conn, now: float) -> list[dict]:
         return [row for row in _db.due_messages(conn, now, limit=200)
@@ -1226,10 +1391,9 @@ class OutreachWorker(QThread):
     def _thread_parent(self, conn, row: dict) -> str:
         """The first touch's Message-ID, for a chaser to reply into.
 
-        Returns "" for a first touch, and for a chaser whose parent never got a
-        Message-ID because it has not been sent yet — in which case the chaser
-        stands on its own rather than pointing at a conversation that does not
-        exist.
+        Returns "" for a first touch, and for a chaser whose parent has not
+        been sent — rehearsed included — in which case the chaser stands on its
+        own rather than pointing at a conversation that does not exist.
         """
         if _int(row.get("step")) <= 0:
             return ""
@@ -1261,7 +1425,7 @@ class OutreachWorker(QThread):
         )
 
         if self.dry_run:
-            ok, error = True, "DRY-RUN"
+            ok, error = True, ""
         else:
             # Claim it before the hand-off. A crash between the server taking
             # the message and this process writing the result would otherwise
@@ -1290,15 +1454,22 @@ class OutreachWorker(QThread):
 
         if ok:
             self._conn_failures = 0
-            _db.mark_message(conn, message_id, "sent", sent_at=now, message_id=header_id,
-                             account_email=account_email, error=error if self.dry_run else "")
-            _db.upsert_lead(conn, {"email": to_email, "status": "sent"})
-            _db.log_event(conn, "sent", "%s via %s" % (to_email, account_email),
+            # A rehearsal writes its own status and no Message-ID. Both matter:
+            # the status is what every "has this gone?" query reads, and a
+            # header id on an unsent row would hand this lead's chaser an
+            # `In-Reply-To` pointing at a message that does not exist. The lead
+            # stays 'queued' for the same reason — nobody has heard from them.
+            status = "rehearsed" if self.dry_run else "sent"
+            header_id = "" if self.dry_run else header_id
+            _db.mark_message(conn, message_id, status, sent_at=now, message_id=header_id,
+                             account_email=account_email, error="")
+            if not self.dry_run:
+                _db.upsert_lead(conn, {"email": to_email, "status": "sent"})
+            _db.log_event(conn, status, "%s via %s" % (to_email, account_email),
                           _int(row.get("lead_id")))
-            self.message_sent_signal.emit(dict(row, status="sent", sent_at=now,
+            self.message_sent_signal.emit(dict(row, status=status, sent_at=now,
                                                message_id=header_id,
-                                               account_email=account_email,
-                                               error=error if self.dry_run else ""))
+                                               account_email=account_email, error=""))
             self.log_signal.emit("%s to %s%s" % ("Would send" if self.dry_run else "Sent",
                                                  to_email,
                                                  "" if self.dry_run else " via " + account_email),
@@ -1360,10 +1531,18 @@ class OutreachWorker(QThread):
 
     # ── reading the inbox back ──
 
+    def _warn_unread_optouts(self) -> None:
+        """Name every opt-out route this run offers and will never read.
+
+        Said at the start of the run as well as in the plan, and in red, because
+        the plan summary is minutes old by the time Start is pressed and this is
+        the last moment before the promise in the footer is made to a stranger.
+        """
+        for warning in optout_warnings(self._settings):
+            self.log_signal.emit(warning, "error")
+
     def _imap_accounts(self) -> list[dict]:
-        return [a for a in _settings.smtp_accounts(self._settings)
-                if a.get("imap_enabled") and _text(a.get("email")).strip()
-                and _text(a.get("app_password"))]
+        return [a for a in _settings.smtp_accounts(self._settings) if reads_inbox(a)]
 
     def _poll_inboxes(self, conn, now: float) -> None:
         """Fold bounces, unsubscribes and replies back into the queue.
@@ -1444,14 +1623,19 @@ class OutreachWorker(QThread):
         return {"id": rows[0][0], "lead_id": rows[0][1], "status": rows[0][2]} if rows else {}
 
     def _cancel_queued(self, conn, lead_id: int, reason: str) -> int:
-        """Drop everything still queued for one lead. Returns how many."""
+        """Drop everything still owed to one lead. Returns how many.
+
+        A rehearsed row is one of them: it was never sent, so it is on its way
+        back to the queue, and a sequence stopped without it would restart on
+        the next dry run.
+        """
         lead_id = _int(lead_id)
         if not lead_id:
             return 0
         try:
             rows = conn.execute(
                 "SELECT id FROM messages WHERE lead_id = ? "
-                "AND status IN ('queued', 'sending')", (lead_id,)).fetchall()
+                "AND status IN ('queued', 'sending', 'rehearsed')", (lead_id,)).fetchall()
         except sqlite3.Error:
             return 0
         for row in rows:

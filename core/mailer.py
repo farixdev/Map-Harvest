@@ -49,6 +49,8 @@ from email.header import decode_header, make_header
 from email.message import EmailMessage
 from email.utils import formataddr, formatdate, parseaddr
 
+from core import templates as _templates
+
 GMAIL_SMTP_HOST = "smtp.gmail.com"
 GMAIL_SMTP_PORT = 587
 GMAIL_IMAP_HOST = "imap.gmail.com"
@@ -56,6 +58,11 @@ GMAIL_IMAP_PORT = 993
 
 _ADDRESS_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 _APP_PASSWORD_RE = re.compile(r"^[A-Za-z0-9]{16}$")
+# A colon is the only thing that delimits a reply prefix. Accepting a hyphen too
+# read "Re-Max Realty" as a reply to "Max Realty" and put the amputated name on
+# the wire — and the trades this app sells into are full of "Re-Roof" and
+# "Re-Cover". No mail client has ever written "Re-" to mean a reply.
+_SUBJECT_PREFIX_RE = re.compile(r"^\s*(?:re|fw|fwd)\s*:\s*", re.I)
 
 
 # ── Small shared helpers ─────────────────────────────────────────────────────
@@ -74,6 +81,24 @@ def _addr(name: str, email: str) -> str:
     email = _header_safe(email)
     name = _header_safe(name)
     return formataddr((name, email)) if name and email else email
+
+
+def _plain_subject(value: str) -> str:
+    """`value` with any `Re:`/`Fwd:` prefix taken off, however many it wears.
+
+    `core.templates.render` already strips these and both queue paths go through
+    it, so nothing reaches here wearing one today. The guarantee should not rest
+    on every future caller remembering that route: a manufactured `Re:` on a
+    first cold email is the misleading subject line CAN-SPAM prohibits, and a
+    chaser carries its thread in `In-Reply-To` rather than in its wording. The
+    loop is what stops "Re: Fwd: Re:" leaving one prefix standing.
+    """
+    subject = _header_safe(value)
+    while True:
+        stripped = _SUBJECT_PREFIX_RE.sub("", subject, count=1)
+        if stripped == subject:
+            return subject.strip()
+        subject = stripped
 
 
 def _normalize_app_password(value: str) -> str:
@@ -141,6 +166,11 @@ def build_message(*, to_email: str, to_name: str, from_email: str,
 
     An empty `unsubscribe_mailto` falls back to the sending address, which is
     the settings default and always a working unsubscribe route.
+
+    The footer already in `body_text` and `body_html` is re-pointed at whichever
+    address that resolves to, so the sentence the reader is offered and the
+    `List-Unsubscribe` their client acts on are one mailbox. They are resolved
+    apart nowhere: this is the only place either is decided.
     """
     from_email = _header_safe(from_email)
     to_email = _header_safe(to_email)
@@ -148,7 +178,7 @@ def build_message(*, to_email: str, to_name: str, from_email: str,
     msg = EmailMessage()
     msg["From"] = _addr(from_name, from_email)
     msg["To"] = _addr(to_name, to_email)
-    msg["Subject"] = _header_safe(subject)
+    msg["Subject"] = _plain_subject(subject)
     msg["Date"] = formatdate(localtime=True)
 
     mid = _normalize_message_id(message_id) or _message_id(from_email)
@@ -160,7 +190,12 @@ def build_message(*, to_email: str, to_name: str, from_email: str,
         msg["In-Reply-To"] = parent
         msg["References"] = parent
 
-    unsubscribe = _header_safe(unsubscribe_mailto) or from_email
+    # Through the same resolver the footer was written with, so "the setting, or
+    # else the account this is leaving from" cannot mean two things. It is also
+    # what unpacks a setting typed as a whole `mailto:` URL, which reaching
+    # straight for the raw value used to nest inside a second one.
+    unsubscribe = _header_safe(_templates.unsubscribe_address(
+        {}, {"unsubscribe_mailto": unsubscribe_mailto}, from_email))
     if unsubscribe:
         msg["List-Unsubscribe"] = "<mailto:%s?subject=unsubscribe>" % urllib.parse.quote(
             unsubscribe, safe="@")
@@ -171,10 +206,11 @@ def build_message(*, to_email: str, to_name: str, from_email: str,
         msg["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
     msg["Auto-Submitted"] = "auto-generated"
 
-    text = str(body_text or "").replace("\r\n", "\n")
+    text = _templates.retarget_unsubscribe(
+        str(body_text or "").replace("\r\n", "\n"), unsubscribe)
     msg.set_content(text, subtype="plain", charset="utf-8", cte=_cte(text))
 
-    html = str(body_html or "").strip()
+    html = _templates.retarget_unsubscribe(str(body_html or "").strip(), unsubscribe)
     if html:
         # Order matters: set_content lays down the plain part, add_alternative
         # promotes the message to multipart/alternative and appends the HTML

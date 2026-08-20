@@ -11,6 +11,8 @@ they get edited.
 import atexit
 import contextlib
 import hashlib
+import html as _html
+import itertools
 import json
 import os
 import re
@@ -148,6 +150,14 @@ def test_catalogue():
     print("catalogue: OK")
 
 
+# The gap codes the catalogue has no honest answer for. Page speed and a missing
+# mobile layout are front-end work; the seller automates the business behind the
+# site and does not build sites. Mapping them anyway is what produced "a slow
+# site, so we build approval systems", so they are absent from `GAP_SERVICES` on
+# purpose and `core.audit` records them with no services of their own.
+NO_OFFER_CODES = frozenset({"slow_site", "no_mobile"})
+
+
 def test_gap_services():
     spec_codes = {
         "no_online_booking", "no_live_chat", "contact_form_only", "no_crm_signals",
@@ -156,26 +166,219 @@ def test_gap_services():
         "no_social_presence", "stale_site", "slow_site", "no_mobile", "no_schema",
         "price_opaque",
     }
-    assert spec_codes <= set(T.GAP_SERVICES), spec_codes - set(T.GAP_SERVICES)
+    assert NO_OFFER_CODES < spec_codes
+    assert spec_codes - NO_OFFER_CODES == set(T.GAP_SERVICES), \
+        set(T.GAP_SERVICES) ^ (spec_codes - NO_OFFER_CODES)
+    assert {c for c, e in A.GAP_CATALOGUE.items() if not e["services"]} == NO_OFFER_CODES
 
-    # The two flagged lines must be reachable from the gap map, not just the catalogue.
+    # Nothing is invented for them here either, so they contribute no offer and
+    # `build_context` will not let them lead an email.
+    for code in NO_OFFER_CODES:
+        gap = dict(A.GAP_CATALOGUE[code], code=code, evidence="the page says so")
+        assert T.services_for_gaps([gap]) == [], code
+
+    # Entries only. A heading in this table reaches `service_1` and offers the
+    # reader a section of the seller's catalogue instead of a piece of work.
+    for code, names in T.GAP_SERVICES.items():
+        for name in names:
+            assert name not in T.AUTO_ARMY_SERVICES, (code, name)
+
+    # The two flagged lines must still be reachable from the gap map, not just
+    # from the catalogue — as the work under them, which is what is sold.
     for wanted in T.PRIORITY_CATEGORIES:
-        hits = [code for code, names in T.GAP_SERVICES.items() if wanted in names]
+        hits = [code for code, names in T.GAP_SERVICES.items()
+                if any(wanted in T._CATEGORIES_OF.get(n.lower(), ()) for n in names)]
         assert hits, f"{wanted} is not surfaced by any gap"
 
     services = T.services_for_gaps(AUDIT["gaps"])
     assert services[0] == "appointment booking", services  # audit order wins, catalogue spelling
-    assert "Lead Automation" in services[:3], services
+    assert "automatic follow-ups" in services[:3], services
     assert len(services) == len({s.lower() for s in services}), services
 
     # A gap with no services of its own still pitches something.
     bare = T.services_for_gaps([{"code": "no_analytics", "title": "no analytics"}])
-    assert bare[:3] == ["automated reports", "reporting", "Web Scraping & Data Automation"], bare
+    assert bare[:3] == ["automated reports", "competitor monitoring",
+                        "data collection and cleaning"], bare
 
     # An unknown code degrades to the top-up list rather than to nothing.
     assert T.services_for_gaps([{"code": "who_knows"}], extra=["invoice processing"]) == \
         ["invoice processing"]
     print("gap services: OK")
+
+
+def test_no_catalogue_heading_is_offered_to_a_prospect():
+    """The keys of `AUTO_ARMY_SERVICES` are section headings over the services,
+    and the templates read `service_1..3` inside a sentence. "The fix is Lead
+    Automation" offers the reader a line from the seller's own filing instead of
+    something that could be built for them, so no heading may survive as far as
+    the copy — including the ones `core.audit` legitimately records against a
+    gap, and the ones a user can type into their own profile."""
+    headings = set(T.AUTO_ARMY_SERVICES)
+    entries = {s.lower() for s in T.DEFAULT_SERVICES}
+    assert set(T.CATEGORY_SERVICE) == headings, headings ^ set(T.CATEGORY_SERVICE)
+    for category, stand_in in T.CATEGORY_SERVICE.items():
+        assert stand_in in T.AUTO_ARMY_SERVICES[category], (category, stand_in)
+    cases = [(code, dict(entry, code=code, evidence="the page says so"))
+             for code, entry in A.GAP_CATALOGUE.items()]
+    cases.append(("<no gaps at all>", None))
+    assert len(cases) == 19, len(cases)
+
+    for code, gap in cases:
+        ctx = T.build_context(LEAD, {"gaps": [gap]} if gap else {}, AI, PROFILE, SETTINGS)
+        for slot in ("service_1", "service_2", "service_3"):
+            value = ctx[slot]
+            assert value not in headings, (code, slot, value)
+            assert value.lower() in entries, (code, slot, value)
+        for tpl in T.TEMPLATES:
+            subject, text, _ = T.render(tpl, ctx)
+            for heading in headings:
+                assert heading not in subject and heading not in text, (code, tpl.id, heading)
+
+    # A whole line resolves to the work under it that this gap already picked,
+    # and to the line's stand-in when there is no gap to go on. A name the
+    # catalogue has never heard of is the user's own and is left alone.
+    assert T.spoken_service("lead automation", "no_online_booking") == "appointment booking"
+    assert T.spoken_service("Web Scraping & Data Automation", "no_schema") == "competitor monitoring"
+    assert T.spoken_service("Document Automation") == "automatic document generation"
+    assert T.spoken_service("carrier pigeons") == "carrier pigeons"
+
+    profile = dict(PROFILE, services=["Marketing Automation"])
+    assert T.build_context(LEAD, {}, {}, profile, SETTINGS)["service_1"] == "email campaigns"
+    print("no catalogue heading is offered: OK")
+
+
+def test_every_value_that_reaches_a_service_slot_is_a_service():
+    """The mechanical form of the rule the copy depends on.
+
+    `service_1..3` are read inside a sentence the template already wrote — "the
+    fix is ___", "we build ___ and ___" — so whatever lands there has to be a
+    thing that gets built. A key of `AUTO_ARMY_SERVICES` is not: it is the
+    seller's own filing, and "the fix is Business Process Automation" sells the
+    reader a section heading.
+
+    The earlier test walks one gap at a time through one profile. This one walks
+    every source a value can come from — the three lookup tables, the audit's own
+    per-gap lists, a full multi-gap audit, and five shapes of sender profile
+    including one whose services are nothing *but* headings — because a heading
+    that only surfaces on an unusual combination is still a heading in a live
+    email, and the combination that surfaces it is the one nobody rendered."""
+    headings = set(T.AUTO_ARMY_SERVICES)
+    entries = {s.lower() for s in T.DEFAULT_SERVICES}
+
+    # The tables first, so a bad row is caught where it was written rather than
+    # only when some lead happens to reach it.
+    tables = [("DEFAULT_PITCH_SERVICES", T.DEFAULT_PITCH_SERVICES),
+              ("CATEGORY_SERVICE", list(T.CATEGORY_SERVICE.values()))]
+    tables += [("GAP_SERVICES[%s]" % code, names) for code, names in T.GAP_SERVICES.items()]
+    for where, names in tables:
+        assert names, where
+        for name in names:
+            assert name not in headings, (where, name)
+            assert name.lower() in entries, (where, name)
+
+    # `core.audit` is allowed to record a whole line against a gap; nothing that
+    # comes back out of `spoken_service` may still be one.
+    for code, entry in A.GAP_CATALOGUE.items():
+        for name in T.services_for_gaps([dict(entry, code=code, evidence="e")]):
+            assert name not in headings, (code, name)
+            assert name.lower() in entries, (code, name)
+
+    every = [dict(entry, code=code, evidence="the page says so")
+             for code, entry in A.GAP_CATALOGUE.items()]
+    audits = [("no gaps", {})] + [(g["code"], {"gaps": [g]}) for g in every]
+    audits.append(("all eighteen at once", {"gaps": every}))
+    profiles = (
+        ("no profile", {}),
+        ("shipped", PROFILE),
+        # The seeded list: every entry, so it is not a choice and the curated
+        # pitch leads.
+        ("whole catalogue", dict(PROFILE, services=list(T.DEFAULT_SERVICES))),
+        # The worst case the GUI can produce: a narrowed list of nothing but
+        # headings, which then leads.
+        ("headings only", dict(PROFILE, services=list(T.AUTO_ARMY_SERVICES))),
+        ("one heading", dict(PROFILE, services=["Business Process Automation"])),
+    )
+    for label, audit in audits:
+        for shape, profile in profiles:
+            ctx = T.build_context(LEAD, audit, AI, profile, SETTINGS)
+            for slot in ("service_1", "service_2", "service_3"):
+                value = ctx[slot]
+                assert value, (label, shape, slot)
+                assert value not in headings, (label, shape, slot, value)
+                assert value.lower() in entries, (label, shape, slot, value)
+            for tpl in T.TEMPLATES:
+                subject, text, html = T.render(tpl, ctx)
+                for heading in headings:
+                    assert heading not in subject, (label, shape, tpl.id, heading)
+                    assert heading not in text, (label, shape, tpl.id, heading)
+                    assert heading not in html, (label, shape, tpl.id, heading)
+
+    # A name the catalogue has never heard of is the user's own wording and is
+    # left exactly as typed — it is still not a heading, which is the rule.
+    ctx = T.build_context(LEAD, {}, {}, dict(PROFILE, services=["carrier pigeons"]),
+                          SETTINGS)
+    assert ctx["service_1"] == "carrier pigeons", ctx["service_1"]
+    assert ctx["service_1"] not in headings
+    print("every value that reaches a service slot is a service: OK")
+
+
+def test_a_gap_only_leads_when_there_is_an_offer_behind_it():
+    """The email names one finding and then names what would be built. A reader
+    who cannot draw the line between the two does not read a weak pitch, they
+    read a broken mail merge — "a slow site, so we build approval systems" — and
+    that is worse than an email that said nothing about their site.
+
+    Page speed and a mobile layout are front-end work and the catalogue does not
+    sell it, so those two gaps carry no services, sort behind every gap that
+    does, and never reach `gap_1`. Everything the reader is shown as a finding
+    has an offer standing behind it, and the two that do not still count towards
+    the score and still reach the model's brief."""
+    for code in NO_OFFER_CODES:
+        assert A.GAP_CATALOGUE[code]["services"] == [], code
+        assert code not in T.GAP_SERVICES, code
+
+    for code, entry in A.GAP_CATALOGUE.items():
+        gap = dict(entry, code=code, evidence="the page says so")
+        ctx = T.build_context(LEAD, {"gaps": [gap]}, {}, PROFILE, SETTINGS)
+        leads = code not in NO_OFFER_CODES
+        assert bool(ctx["gap_1"]) is leads, (code, ctx["gap_1"])
+        assert bool(ctx["gap_1_evidence"]) is leads, code
+        assert bool(ctx["gap_1_subject"]) is leads, code
+        for tpl in T.TEMPLATES:
+            subject, text, _ = T.render(tpl, ctx)
+            assert subject and re.search(r"[A-Za-z0-9?]$", subject), (code, tpl.id, subject)
+            if leads:
+                continue
+            # Dropped whole, with the punctuation that belonged to it.
+            assert entry["title"] not in text, (code, tpl.id, text)
+            assert entry["subject_phrase"] not in subject, (code, tpl.id, subject)
+            assert "()" not in text and "\n\n\n" not in text, (code, tpl.id, text)
+
+    # Behind a gap that does map, an unmappable one is supporting detail, not the
+    # headline — whichever order it arrives in, because a CSV import or a
+    # hand-built lead does not go through `core.audit`'s sort.
+    slow = dict(A.GAP_CATALOGUE["slow_site"], code="slow_site", evidence="it takes a while")
+    booking = dict(A.GAP_CATALOGUE["no_online_booking"], code="no_online_booking",
+                   evidence="the form is the only way to ask for a time")
+    for order in ([slow, booking], [booking, slow]):
+        ctx = T.build_context(LEAD, {"gaps": order}, {}, PROFILE, SETTINGS)
+        assert ctx["gap_1"] == "no online booking", (order, ctx["gap_1"])
+        assert ctx["gap_2"] == "a slow site", ctx["gap_2"]
+        assert ctx["service_1"] == "appointment booking", ctx["service_1"]
+
+    # And `core.audit` sorts them the same way, so the operator's table and the
+    # email agree about which finding is the headline.
+    fired = A._gaps(
+        {"cms": "custom", "ecommerce": "", "analytics": ["ga4"], "chat": "tawk",
+         "booking": "calendly", "crm": "hubspot", "forms": 1, "frameworks": []},
+        dict(A._blank("https://x.test/")["signals"], has_contact_form=True,
+             has_online_booking=True, has_live_chat=True, has_schema=True,
+             has_pricing=True, has_social=True, mobile_viewport=False, slow=True),
+        {"call_cta": True, "appointment_shaped": True})
+    codes = [g["code"] for g in fired]
+    assert set(codes) >= {"no_mobile", "slow_site"}, codes
+    assert [c for c in codes if c in NO_OFFER_CODES] == codes[-2:], codes
+    print("a gap only leads when there is an offer behind it: OK")
 
 
 # ── The token-leak guarantee ──
@@ -571,21 +774,31 @@ def test_every_gap_reads_as_a_reason_in_the_question_template():
         ctx = T.build_context(LEAD, {"gaps": [gap]}, {}, PROFILE, SETTINGS)
         _, text, _ = T.render(T.get_template("question"), ctx)
         body = _core_body(text, ctx)
-        assert ctx["gap_1"] == spec["title"], code
+        seen += 1
 
         reason = [ln for ln in body.splitlines() if "I ask because" in ln]
         assert len(reason) == 1, (code, body)
         # The reason stands on its own: it does not carry the gap, and it does
         # not become a non-sequitur when the gap it used to carry is unrelated.
-        assert ctx["gap_1"] not in reason[0], (code, reason[0])
         assert reason[0].endswith("."), (code, reason[0])
+
+        if code in NO_OFFER_CODES:
+            # Nothing to offer against it, so it is never the finding the email
+            # opens on — and the sentence that would have carried it goes with
+            # it whole, rather than standing there naming a problem the next
+            # paragraph does not answer.
+            assert ctx["gap_1"] == "", code
+            assert spec["title"] not in body, (code, body)
+            continue
+
+        assert ctx["gap_1"] == spec["title"], code
+        assert ctx["gap_1"] not in reason[0], (code, reason[0])
 
         # The gap is reported, in a sentence of its own, ending on a full stop.
         finding = [ln for ln in body.splitlines() if ctx["gap_1"] in ln]
         assert len(finding) == 1, (code, body)
         assert finding[0].endswith(ctx["gap_1"] + "."), (code, finding[0])
         assert finding[0] != reason[0], code
-        seen += 1
     assert seen == 18, seen
 
 
@@ -1004,7 +1217,7 @@ def test_subject_rules():
 
     # A subject that resolved fully keeps every word it was written with.
     assert T.render(T.get_template("time_saved"), dict(FULL_CTX, ai_subject=""))[0] \
-        == "the minutes after every enquiry"
+        == "the same few minutes, over and over"
 
     # A subject whose value is missing loses the word that pointed at it, and
     # falls back to the business name when nothing is left.
@@ -1286,7 +1499,7 @@ def test_a_business_name_arrives_as_text_not_as_markup():
     ctx = T.build_context(dict(LEAD, name="Acme &amp; Sons"), AUDIT, {}, PROFILE, SETTINGS)
     assert ctx["business_name"] == "Acme & Sons"
     subject, text, html = T.render(T.get_template("time_saved"), ctx)
-    assert "before anyone at Acme & Sons opens the inbox" in text, text
+    assert "on the tools Acme & Sons already has" in text, text
     assert T.render(T.get_template("gap_direct"), ctx)[0] == "online booking at Acme & Sons"
     # And the HTML part escapes it exactly once, as it does any other name.
     assert "Acme &amp; Sons" in html and "&amp;amp;" not in html
@@ -1421,6 +1634,58 @@ def test_html_shape():
     assert again.count("<hr") == 1 and again.count(PROFILE["postal_address"]) == 1
     assert again == html, "to_html is not idempotent over its own footer"
     print("html shape: OK")
+
+
+# What `campaign.apply_compliance` empties when a switch is turned off. Written
+# out rather than imported so this stays a test of core.templates alone.
+_SWITCHED_OFF = ("unsubscribe_line", "unsubscribe_email", "postal_address")
+
+
+def _visible(html: str) -> str:
+    """The copy a reader sees, with the markup taken back off."""
+    text = re.sub(r"(?i)<br\s*/?>", "\n", html)
+    text = re.sub(r"(?i)</p\s*>", "\n\n", text)
+    return _blocks(_html.unescape(re.sub(r"<[^>]+>", "", text)))
+
+
+def _blocks(text: str) -> str:
+    return re.sub(r"\n{2,}", "\n\n", str(text)).strip()
+
+
+def test_the_two_mime_parts_carry_the_same_copy():
+    """One message goes out as plain text and HTML together and a filter scores
+    the pair, so the two have to say the same thing on every profile the app
+    will send from — including the incomplete ones it now accepts. With no
+    sender name and no sender title the sign-off tidies down to the company on
+    its own, which with no postal address is the footer's identity line word for
+    word, and a de-dup that recognised the footer by its wording deleted the
+    sign-off from the HTML part only."""
+    axes = ("sender_name", "sender_title", "postal_address", "company", "switches")
+    for bits in itertools.product((False, True), repeat=len(axes)):
+        blank = [name for name, off in zip(axes, bits) if off]
+        profile = dict(PROFILE, **{k: "" for k in blank if k != "switches"})
+        ctx = T.build_context(LEAD, AUDIT, AI, profile, SETTINGS)
+        if "switches" in blank:
+            ctx.update({k: "" for k in _SWITCHED_OFF})
+        for tpl in T.TEMPLATES:
+            _, text, html = T.render(tpl, ctx)
+            assert _visible(html) == _blocks(text), (tpl.id, blank or ["full profile"])
+
+    # The profile that used to split them, named so the failure reads straight
+    # off the assertion: the company appears twice in the message, and the HTML
+    # part is the one that used to be short of it.
+    ctx = T.build_context(LEAD, AUDIT, AI, dict(PROFILE, sender_name="",
+                                                sender_title="", postal_address=""), SETTINGS)
+    _, text, html = T.render(T.get_template("gap_direct"), ctx)
+    assert text.count(PROFILE["company"]) == 2, text
+    assert _visible(html).count(PROFILE["company"]) == 2, html
+    assert T.to_html(text, ctx) == html, "to_html is not idempotent over its own footer"
+
+    # And the de-dup takes the footer off the end, once. The same words standing
+    # anywhere else are body copy and stay there.
+    bare = {"company": "Auto Army", "postal_address": "", "unsubscribe_line": ""}
+    assert T.to_html("Auto Army\n\nOne line.\n\nAuto Army", bare).count("Auto Army") == 2
+    print("mime parts agree: OK")
 
 
 # ── Context ──
@@ -2019,11 +2284,11 @@ def test_all_templates_ordering_is_stable():
 # a refactor that quietly changes a live email fails here first.
 BUILTIN_RENDERS = (
     ("gap_direct", "online booking at Acme Plumbing & Heating",
-     "39d04db54635635928e02125fadbc2c6a758dbcb",
-     "d6e6ecfb5cbfa9f63f56024f25490294a75b4e86"),
-    ("time_saved", "the minutes after every enquiry",
-     "e00fc0ba24885c2a9a57e408683aa77f1840c4ea",
-     "6878504ba08cf9e41b22a796460e7021f694a56c"),
+     "750d8a495a225cee456ae05a516e23e6afe5df94",
+     "7be49db9f2328114d225cb6bb00aa27cf54d8bf5"),
+    ("time_saved", "the same few minutes, over and over",
+     "86216f218f47eb3bf0fa49250128dd8e9e930c52",
+     "4ca0250ea61cf7fcaa8a06686cb11dc86ba0529d"),
     ("question", "how do messages reach Acme Plumbing & Heating?",
      "5fa378135442251f7f4321ac0df29036aadf7ed5",
      "3dbdbcd6d570b0ebffd91f4db07ce3fa9ef92c9c"),
@@ -2228,6 +2493,9 @@ def test_validate_template_never_raises_whatever_it_is_handed():
 if __name__ == "__main__":
     test_catalogue()
     test_gap_services()
+    test_no_catalogue_heading_is_offered_to_a_prospect()
+    test_every_value_that_reaches_a_service_slot_is_a_service()
+    test_a_gap_only_leads_when_there_is_an_offer_behind_it()
     test_no_tokens_survive()
     test_render_degrades_cleanly()
     test_no_orphan_back_references()
@@ -2254,6 +2522,7 @@ if __name__ == "__main__":
     test_first_touch_length()
     test_copy_conventions()
     test_html_shape()
+    test_the_two_mime_parts_carry_the_same_copy()
     test_build_context()
     test_never_raises()
     test_the_proof_point_obeys_the_no_exclamation_rule()
