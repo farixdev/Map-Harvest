@@ -6,14 +6,25 @@ them: a QSS rule can be beaten by a more specific one and a layout can hand a
 widget less than it asked for, and in both cases the only honest witness is what
 the screen actually shows.
 
-Qt runs on the offscreen platform. That platform paints no glyphs — a label
-renders as empty ground — but it does report real font metrics, so widths,
-`sizeHint()` and `elidedText()` all mean what they say. Colour assertions are
-therefore about painted shapes only, which is exactly what the check indicator
-is.
+Qt runs on the offscreen platform. With `QT_QPA_FONTDIR` unset it paints no
+glyphs — a label renders as empty ground — but it does report real font metrics
+either way, so widths, `sizeHint()` and `elidedText()` all mean what they say.
+Every colour assertion is therefore either about a painted shape, or is scoped
+to a rect no glyph can reach: the tick is measured inside the check indicator
+alone, so a run with fonts installed and a run without measure the same thing.
+
+Every colour, size and height an assertion expects is read from `ui.theme`.
+This file used to spell out a #1C1C1E page, a #2C2C2E card, a white focus ring
+and six button heights, and every one of them was one palette's answer to a
+question the tokens now own; the app ships two palettes and two densities, so a
+pinned hex is a test that will pass right up until the interface changes and
+then describe one nobody sees. Where an assertion is a claim about a ratio or an
+ordering it runs against both palettes.
 
 `SETTINGS_DIR` is redirected into a temp directory before any screen is built,
-so constructing one can never read or write a developer's real ~/.mapharvest.
+so constructing one can never read or write a developer's real ~/.mapharvest —
+`core.outreach_db` resolves its own path through it on every call, so the
+database goes to the same place.
 """
 import contextlib
 import itertools
@@ -32,14 +43,15 @@ from PyQt5.QtTest import QTest  # noqa: E402
 from PyQt5.QtWidgets import (  # noqa: E402
     QApplication, QCheckBox, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMessageBox, QProgressBar, QPushButton,
-    QScrollArea, QSplitter, QStyleOptionButton, QWidget,
+    QScrollArea, QSplitter, QStyle, QStyleOptionButton, QStyleOptionViewItem,
+    QWidget,
 )
 
 from core import outreach_db as DB  # noqa: E402
 from core import settings as ST  # noqa: E402
 from core import templates as TPL  # noqa: E402
 from core.campaign import OutreachWorker  # noqa: E402
-from ui import app as APP  # noqa: E402
+from ui import theme as TH  # noqa: E402
 from ui import screen_outreach as SO  # noqa: E402
 from ui import screen_settings as SS  # noqa: E402
 from ui.screen_input import InputScreen  # noqa: E402
@@ -49,6 +61,18 @@ from ui.screen_settings import SettingsScreen  # noqa: E402
 _TMP = tempfile.mkdtemp(prefix="mapharvest-ui-chrome-")
 _APP = None
 _SCREENS: dict = {}
+
+THEME = TH.theme()
+
+# Both palettes, for every assertion that is a claim about a relationship
+# rather than about a widget's wiring.
+THEMES = (TH.theme("dark"), TH.theme("light"))
+
+# Which palette the process is wearing right now. Held in a variable rather than
+# worked out from the sheet, because every helper here calls `_app()` on its way
+# past and one that restored the default would strip the theme under test off
+# the widget between the grab that set it and the grab that measured it.
+_WEARING = THEME
 
 ACCOUNT = "samantha.whitfield@gmail.com"
 FROM_LINE = ("To Zeta Roofing <zeta@example.com>  ·  "
@@ -63,7 +87,7 @@ DEFAULT_SIZE, MINIMUM_SIZE = (1080, 760), (880, 620)
 def _app() -> QApplication:
     """The one QApplication for this module, styled exactly as `ui.app.run`.
 
-    Through `install_style`, not by hand: the check indicators are painted by
+    Through `theme.apply`, not by hand: the check indicators are painted by
     `TickStyle` and the sheet deliberately says nothing about them, so an app
     that only gets the sheet is not the app the user runs.
     """
@@ -72,8 +96,25 @@ def _app() -> QApplication:
         ST.SETTINGS_DIR = _TMP
         ST.SETTINGS_PATH = os.path.join(_TMP, "settings.json")
         _APP = QApplication.instance() or QApplication([])
-    APP.install_style(_APP)
+    TH.apply(_APP, _WEARING)
     return _APP
+
+
+@contextlib.contextmanager
+def _wearing(theme):
+    """The whole process in `theme`, and back to the default afterwards.
+
+    `setStyleSheet` repolishes every widget alive in the process, which is the
+    point: a screen built under one palette has to be measured in the one under
+    test, not in the one it was constructed in.
+    """
+    global _WEARING
+    saved, _WEARING = _WEARING, theme
+    try:
+        yield _app()
+    finally:
+        _WEARING = saved
+        _app()
 
 
 def _screen(kind: str):
@@ -125,8 +166,29 @@ def _histogram(widget, rect=None) -> dict:
     return counts
 
 
-def _near_white(counts: dict, floor: int = 200) -> int:
-    """Pixels bright enough in every channel to read as the tick."""
+# Every colour `theme.TickStyle` puts inside a check indicator except the tick
+# itself: the two fills, the three edges, and the dead grey.
+_INDICATOR_COLOURS = ("inset", "accent.default", "surface", "border.subtle",
+                      "border.default", "border.strong")
+
+
+def _tick_floor(theme) -> int:
+    """The channel value nothing but the tick can reach inside an indicator.
+
+    One brighter than the brightest channel of anything else painted in there,
+    so the count below cannot be padded by an edge or a fill — and antialiasing
+    between two of those colours only ever lands between them, so it cannot
+    reach the floor either. 191 in dark, 231 in light; the literal 200 this
+    replaced happened to sit between the two and would have counted the light
+    theme's own well as a tick.
+    """
+    return 1 + max(int(theme.color[name][start:start + 2], 16)
+                   for name in _INDICATOR_COLOURS for start in (1, 3, 5))
+
+
+def _tick_pixels(counts: dict, theme) -> int:
+    """Pixels inside an indicator bright enough to be the tick and nothing else."""
+    floor = _tick_floor(theme)
     return sum(count for colour, count in counts.items()
                if all(int(colour[start:start + 2], 16) >= floor
                       for start in (1, 3, 5)))
@@ -138,79 +200,113 @@ def _indicator_rect(box: QCheckBox):
     return box.style().subElementRect(box.style().SE_CheckBoxIndicator, option, box)
 
 
+def _row_indicator_rect(listing: QListWidget, index: int):
+    """Where a checkable row's indicator sits, in viewport coordinates.
+
+    Asked of the style rather than guessed at from the row, because the row is
+    the whole width of the list and the label lives in it: a count taken over
+    the row would score `text.secondary` — #C9D4E8, every channel over 200 — as
+    a tick on every row that has any words in it.
+    """
+    option = QStyleOptionViewItem()
+    option.initFrom(listing)
+    option.rect = listing.visualItemRect(listing.item(index))
+    option.features |= QStyleOptionViewItem.HasCheckIndicator
+    return listing.style().subElementRect(
+        QStyle.SE_ItemViewItemCheckIndicator, option, listing)
+
+
 # ── U1: every checkbox must draw a tick ──────────────────────────────────────
 
 def test_a_checked_box_paints_a_tick_and_an_unchecked_one_does_not():
     """The whole defect: checked and unchecked differed only in brightness.
 
-    Measured inside the indicator alone, so the label cannot contribute — and
-    on this platform it could not anyway, since no glyph is ever painted.
+    Measured inside the indicator alone, so the label cannot contribute, and
+    against a floor computed from the palette rather than a fixed 200 — the
+    light theme's own input well is #E0E3E6 and would have cleared that.
     """
-    app = _app()
-    box = QCheckBox("Dry run — build and log every email, send none")
-    box.resize(box.sizeHint())
-    box.show()
+    for theme in THEMES:
+        with _wearing(theme) as app:
+            box = QCheckBox("Dry run — build and log every email, send none")
+            box.resize(box.sizeHint())
+            box.show()
 
-    marks = {}
-    for state in (False, True):
-        box.setChecked(state)
-        app.processEvents()
-        rect = _indicator_rect(box)
-        assert rect.width() >= 12 and rect.height() >= 12, \
-            "there is no indicator left to measure: %s" % rect
-        marks[state] = _near_white(_histogram(box, rect))
+            marks = {}
+            for state in (False, True):
+                box.setChecked(state)
+                app.processEvents()
+                rect = _indicator_rect(box)
+                assert rect.width() >= 12 and rect.height() >= 12, \
+                    "there is no indicator left to measure: %s" % rect
+                marks[state] = _tick_pixels(_histogram(box, rect), theme)
 
-    assert marks[False] == 0, \
-        "an unchecked box paints %d near-white pixels" % marks[False]
-    assert marks[True] >= 10, (
-        "a checked box paints only %d near-white pixels — that is the tickless "
-        "indicator again" % marks[True])
+            assert marks[False] == 0, "%s: an unchecked box paints %d tick pixels" % (
+                theme.name, marks[False])
+            assert marks[True] >= 10, (
+                "%s: a checked box paints only %d tick pixels — that is the "
+                "tickless indicator again" % (theme.name, marks[True]))
+            box.hide()
 
 
 def test_a_checked_list_row_paints_the_same_tick():
     """The 21 'Data to scrape' boxes are list items, a different primitive."""
-    app = _app()
-    listing = QListWidget()
-    listing.setObjectName("service_list")
-    for label, state in (("Email", Qt.Unchecked), ("Phone", Qt.Checked)):
-        item = QListWidgetItem(label)
-        item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
-        item.setCheckState(state)
-        listing.addItem(item)
-    listing.resize(220, 90)
-    listing.show()
-    app.processEvents()
+    for theme in THEMES:
+        with _wearing(theme) as app:
+            listing = QListWidget()
+            listing.setObjectName("service_list")
+            for label, state in (("Email", Qt.Unchecked), ("Phone", Qt.Checked)):
+                item = QListWidgetItem(label)
+                item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+                item.setCheckState(state)
+                listing.addItem(item)
+            listing.resize(220, 90)
+            listing.show()
+            app.processEvents()
 
-    unchecked = _near_white(_histogram(listing, listing.visualItemRect(listing.item(0))))
-    checked = _near_white(_histogram(listing, listing.visualItemRect(listing.item(1))))
-    assert unchecked == 0, "an unchecked row paints %d near-white pixels" % unchecked
-    assert checked >= 10, "a checked row paints only %d near-white pixels" % checked
+            marks = []
+            for index in (0, 1):
+                rect = _row_indicator_rect(listing, index)
+                assert rect.width() >= 12 and rect.height() >= 12, \
+                    "there is no row indicator left to measure: %s" % rect
+                marks.append(_tick_pixels(
+                    _histogram(listing.viewport(), rect), theme))
+
+            assert marks[0] == 0, "%s: an unchecked row paints %d tick pixels" % (
+                theme.name, marks[0])
+            assert marks[1] >= 10, "%s: a checked row paints only %d tick pixels" % (
+                theme.name, marks[1])
+            listing.hide()
 
 
 def test_the_sheet_leaves_the_indicator_to_the_style():
     """A single `::indicator` rule anywhere would beat `TickStyle` again."""
-    sheet = re.sub(r"/\*.*?\*/", "", APP.QSS, flags=re.S)
-    rules = [line for line in sheet.splitlines() if "::indicator" in line]
-    assert rules == [], "the sheet styles an indicator again: %s" % rules
+    for theme in THEMES:
+        rules = [line for line in _sheet(theme).splitlines()
+                 if "::indicator" in line]
+        assert rules == [], "the %s sheet styles an indicator again: %s" % (
+            theme.name, rules)
 
 
 def test_the_dry_run_toggle_itself_draws_a_tick():
     """The safety switch, on the real screen, at both window sizes."""
-    app = _app()
     screen = _screen("settings")
     box = screen.dry_run_cb
     # Unchecking it opens a confirmation dialog; this test is about paint.
     box.blockSignals(True)
     try:
-        for size in (DEFAULT_SIZE, MINIMUM_SIZE):
-            _sized(screen, size)
-            marks = {}
-            for state in (False, True):
-                box.setChecked(state)
-                app.processEvents()
-                marks[state] = _near_white(_histogram(box, _indicator_rect(box)))
-            assert marks[False] == 0 and marks[True] >= 10, \
-                "dry run reads the same either way at %dx%d: %s" % (size + (marks,))
+        for theme in THEMES:
+            with _wearing(theme) as app:
+                for size in (DEFAULT_SIZE, MINIMUM_SIZE):
+                    _sized(screen, size)
+                    marks = {}
+                    for state in (False, True):
+                        box.setChecked(state)
+                        app.processEvents()
+                        marks[state] = _tick_pixels(
+                            _histogram(box, _indicator_rect(box)), theme)
+                    assert marks[False] == 0 and marks[True] >= 10, (
+                        "%s: dry run reads the same either way at %dx%d: %s"
+                        % ((theme.name,) + size + (marks,)))
     finally:
         box.setChecked(True)
         box.blockSignals(False)
@@ -537,12 +633,24 @@ def test_the_browse_button_is_wide_enough_for_its_own_label():
         assert button.width() >= button.sizeHint().width(), (
             "the browse button is %dpx wide and needs %d at %dx%d, so it "
             "renders '..'" % (button.width(), button.sizeHint().width()) + size)
-        assert button.height() == 40, "it must stay square-ish beside the field"
+        assert button.height() == THEME.control["lg"], (
+            "it must stay square-ish beside the field: %dpx against the %dpx "
+            "the search field beside it takes from control.lg"
+            % (button.height(), THEME.control["lg"]))
 
 
 # ── U8: every colour the sheet writes text in has to clear its ground ────────
 
-_PAGE, _CARD, _AA, _COMPONENT = "#1C1C1E", "#2C2C2E", 4.5, 3.0
+_AA, _COMPONENT = 4.5, 3.0
+
+# CIE76. `ui/theme.py` builds both palettes so that no two tokens sit inside 2.0
+# of one another, which is the floor "these are two different colours" means.
+_JND = 2.0
+
+
+def _grounds(theme) -> tuple:
+    """(page, card) — the two the sheet's transparent text can land on."""
+    return theme.color["canvas"].upper(), theme.color["surface"].upper()
 
 
 def _luminance(colour: str) -> float:
@@ -560,11 +668,33 @@ def _contrast(one: str, other: str) -> float:
     return (max(first, second) + 0.05) / (min(first, second) + 0.05)
 
 
-def _sheet() -> str:
-    return re.sub(r"/\*.*?\*/", "", APP.QSS, flags=re.S)
+def _sheet(theme=None) -> str:
+    return re.sub(r"/\*.*?\*/", "", TH.stylesheet(theme or _WEARING), flags=re.S)
 
 
-def _ink_rules() -> list:
+def _lab(colour: str) -> tuple:
+    """CIE L*a*b* under D65, the space delta-E 76 is defined in."""
+    def linear(value):
+        return (value / 12.92 if value <= 0.03928
+                else ((value + 0.055) / 1.055) ** 2.4)
+
+    r, g, b = (linear(int(colour[i:i + 2], 16) / 255) for i in (1, 3, 5))
+    x = (0.4124564 * r + 0.3575761 * g + 0.1804375 * b) / 0.95047
+    y = 0.2126729 * r + 0.7151522 * g + 0.0721750 * b
+    z = (0.0193339 * r + 0.1191920 * g + 0.9503041 * b) / 1.08883
+
+    def f(t):
+        return t ** (1 / 3) if t > 216 / 24389 else (841 / 108) * t + 4 / 29
+
+    fx, fy, fz = f(x), f(y), f(z)
+    return 116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz)
+
+
+def _delta_e(one: str, other: str) -> float:
+    return sum((a - b) ** 2 for a, b in zip(_lab(one), _lab(other))) ** 0.5
+
+
+def _ink_rules(theme) -> list:
     """(selector, colour, grounds) for every rule that paints text.
 
     A rule that names its own background is measured against that; anything
@@ -573,13 +703,13 @@ def _ink_rules() -> list:
     inactive component — not because those greys would pass.
     """
     rules = []
-    for selector, body in re.findall(r"([^{}]+)\{([^{}]*)\}", _sheet()):
+    for selector, body in re.findall(r"([^{}]+)\{([^{}]*)\}", _sheet(theme)):
         selector = " ".join(selector.split())
         ink = re.search(r"(?<!-)\bcolor:\s*(#[0-9A-Fa-f]{6})", body)
         if ink is None or ":disabled" in selector:
             continue
         own = re.search(r"background(?:-color)?:\s*(#[0-9A-Fa-f]{6})", body)
-        grounds = [own.group(1).upper()] if own else [_PAGE, _CARD]
+        grounds = [own.group(1).upper()] if own else list(_grounds(theme))
         rules.append((selector, ink.group(1).upper(), grounds))
     return rules
 
@@ -589,66 +719,110 @@ def test_the_two_grounds_are_the_ones_that_actually_paint():
 
     Both are read off rendered pixels rather than off the sheet, since a card
     that turned out to paint something else would make every ratio in this
-    section a different number.
+    section a different number — and both are compared against `color.canvas`
+    and `color.surface` rather than against a hex, so a palette change moves
+    the expectation with the paint instead of leaving this describing a page
+    the app stopped drawing.
     """
-    page = _histogram(_sized(_screen("input"), DEFAULT_SIZE))
-    assert max(page, key=page.get) == _PAGE, \
-        "the page paints %s" % max(page, key=page.get)
+    for theme in THEMES:
+        with _wearing(theme):
+            wanted_page, wanted_card = _grounds(theme)
+            page = _histogram(_sized(_screen("input"), DEFAULT_SIZE))
+            assert max(page, key=page.get) == wanted_page, (
+                "%s: the page paints %s and canvas is %s"
+                % (theme.name, max(page, key=page.get), wanted_page))
 
-    outreach = _screen("outreach")
-    outreach._goto_tab(1)
-    frame = outreach.prepare_btn.parentWidget()
-    assert frame.objectName() == "card", \
-        "this is measuring %r, not a card" % frame.objectName()
-    card = _histogram(frame)
-    assert max(card, key=card.get) == _CARD, \
-        "a card paints %s" % max(card, key=card.get)
+            outreach = _screen("outreach")
+            outreach._goto_tab(1)
+            frame = outreach.prepare_btn.parentWidget()
+            assert frame.objectName() == "card", \
+                "this is measuring %r, not a card" % frame.objectName()
+            card = _histogram(frame)
+            assert max(card, key=card.get) == wanted_card, (
+                "%s: a card paints %s and surface is %s"
+                % (theme.name, max(card, key=card.get), wanted_card))
 
 
 def test_no_text_colour_falls_under_aa_on_either_ground():
     """The defect: a grey chosen on the page and then used on a card.
 
-    #8E8E93 measures 5.22:1 on #1C1C1E and 4.27:1 on #2C2C2E, so every label
-    that moved onto a card took a passing colour under the floor with it. The
-    sweep is over the whole sheet because fixing the two labels that were
-    reported and leaving the next one for the next pass is how this got here.
+    #8E8E93 measured 5.22:1 on the old page and 4.27:1 on the old card, so
+    every label that moved onto a card took a passing colour under the floor
+    with it. The sweep is over the whole sheet because fixing the two labels
+    that were reported and leaving the next one for the next pass is how this
+    got here — and over both sheets, because which of the two grounds is the
+    harder one is not the same in each: the light page is a mid grey, so there
+    the card is the easier of the two.
     """
-    under = ["%s — %s on %s is %.2f:1" % (selector, ink, ground,
-                                          _contrast(ink, ground))
-             for selector, ink, grounds in _ink_rules() for ground in grounds
-             if _contrast(ink, ground) < _AA]
+    under = ["%s %s — %s on %s is %.2f:1"
+             % (theme.name, selector, ink, ground, _contrast(ink, ground))
+             for theme in THEMES
+             for selector, ink, grounds in _ink_rules(theme)
+             for ground in grounds if _contrast(ink, ground) < _AA]
     assert not under, "text under %.1f:1:\n  %s" % (_AA, "\n  ".join(under))
 
 
 def test_the_primary_button_reads_in_every_state_it_paints():
     """Start Scraping, Audit all, Prepare campaign, Start sending, Save.
 
-    14px/600 is not WCAG large text, so its label needs 4.5:1 on all three
-    live fills — and the fills themselves need to stay 3:1 clear of the cards
-    they sit on, or the button stops looking like one. Those two pull in
-    opposite directions, which is the trap: darkening the green until white
-    passes walks the fill straight into the card.
+    Its label is `font.h3` — 14px/600, which is not WCAG large text — so it
+    needs 4.5:1 on all three live fills. That half is unchanged and is now
+    measured in both palettes: 5.84 / 4.68 / 7.16 in dark, 7.16 / 8.22 / 9.44
+    in light.
+
+    The other half is inverted, and the contract inverted it. This used to
+    require the fill itself to stay 3:1 clear of a card, and its own docstring
+    named the trap: "darkening the green until white passes walks the fill
+    straight into the card". `docs/DESIGN_SYSTEM.md` resolves that tension the
+    other way — rule 2 makes the ink on the fill mandatory, and `ui/theme.py`
+    writes down the price at the token that pays it, `accent.border` measuring
+    2.60:1 on `surface`. So the accent fill is 2.34:1 on a card in dark and the
+    old assertion cannot be met by any green that also carries white text.
+
+    What replaces it is the thing that actually keeps the button findable, and
+    it is stricter than a single ratio: the button has to have an edge in every
+    state it paints, from either its fill or the 1px rim it carries in all of
+    them, against the page these primary actions are laid on — 3.70:1 at worst
+    — and its fill has to be a different colour from a card by a wide margin of
+    the palette's own just-noticeable difference, since on a card what tells it
+    apart is hue rather than luminance.
     """
-    sheet = _sheet()
-    ink = re.search(r"QPushButton#start_btn\s*\{[^}]*?(?<!-)\bcolor:\s*"
-                    r"(#[0-9A-Fa-f]{6})", sheet).group(1).upper()
-    fills = [fill.upper() for fill in re.findall(
-        r"QPushButton#start_btn(?::(?:hover|pressed))?\s*\{[^}]*?"
-        r"background-color:\s*(#[0-9A-Fa-f]{6})", sheet)]
-    assert len(fills) == 3, "base, :hover and :pressed, not %s" % fills
+    for theme in THEMES:
+        sheet = _sheet(theme)
+        ink = re.search(r"QPushButton#start_btn\s*\{[^}]*?(?<!-)\bcolor:\s*"
+                        r"(#[0-9A-Fa-f]{6})", sheet).group(1).upper()
+        rim = re.search(r"QPushButton#start_btn\s*\{[^}]*?\bborder:\s*\d+px"
+                        r"\s+\w+\s+(#[0-9A-Fa-f]{6})", sheet).group(1).upper()
+        fills = [fill.upper() for fill in re.findall(
+            r"QPushButton#start_btn(?::(?:hover|pressed))?\s*\{[^}]*?"
+            r"background-color:\s*(#[0-9A-Fa-f]{6})", sheet)]
+        assert len(fills) == 3, "base, :hover and :pressed, not %s" % fills
+        page, card = _grounds(theme)
 
-    for fill in fills:
-        assert _contrast(ink, fill) >= _AA, \
-            "%s on %s is %.2f:1" % (ink, fill, _contrast(ink, fill))
-        assert _contrast(fill, _CARD) >= _COMPONENT, (
-            "%s on a card is %.2f:1, so the button has no edge left"
-            % (fill, _contrast(fill, _CARD)))
+        for fill in fills:
+            assert _contrast(ink, fill) >= _AA, "%s: %s on %s is %.2f:1" % (
+                theme.name, ink, fill, _contrast(ink, fill))
+            edge = max(_contrast(fill, page), _contrast(rim, page))
+            assert edge >= _COMPONENT, (
+                "%s: %s on the page is %.2f:1 and its %s rim %.2f:1, so the "
+                "button has no edge left in that state"
+                % (theme.name, fill, _contrast(fill, page), rim,
+                   _contrast(rim, page)))
+            assert _delta_e(fill, card) >= 10 * _JND, (
+                "%s: %s is delta-E %.1f from a card, which is close enough "
+                "that the button stops being a shape on one"
+                % (theme.name, fill, _delta_e(fill, card)))
 
-    base, hover, pressed = fills
-    for state, fill in (("hover", hover), ("pressed", pressed)):
-        assert _contrast(base, fill) >= 1.15, (
-            ":%s is %s against a %s base — %.2f:1, which is no feedback at "
-            "all" % (state, fill, base, _contrast(base, fill)))
+        base, hover, pressed = fills
+        for state, fill in (("hover", hover), ("pressed", pressed)):
+            # Delta-E rather than a contrast ratio, and the light theme is why:
+            # its hover moves 4.95 of just-noticeable difference and is plainly
+            # a different green, while measuring 1.148:1 in luminance — a
+            # ratio floor would have called a visible state invisible.
+            assert _delta_e(base, fill) >= 2 * _JND, (
+                "%s: :%s is %s against a %s base — delta-E %.2f, which is no "
+                "feedback at all"
+                % (theme.name, state, fill, base, _delta_e(base, fill)))
 
 
 # ── U9: the template editor ──────────────────────────────────────────────────
@@ -1524,15 +1698,15 @@ def test_a_disabled_reset_says_why_it_is_unavailable():
 
 # ── U10: the keyboard focus ring ─────────────────────────────────────────────
 
-# Every button variant the sheet defines, with the height the app builds it at.
-# "" is the default one, which carries no id.
-_VARIANTS = (("", 30), ("outlined", 30), ("danger", 30), ("tab", 28),
-             ("start_btn", 44), ("live", 28), ("rehearsal", 28), ("reveal", 34))
-
-# The ring is 2px, so a pixel it paints sits 0 or 1 in from the edge — plus one
-# more for the antialiasing the rounded corners blend across.
-_RING_DEPTH = 3
-_RING_INK = 200
+# Every button variant the sheet defines, with the control token whose height
+# the sheet builds it at. "" is the default one, which carries no id. The
+# heights used to be written out — 30, 28, 44, 34 — and every one of them is a
+# number `control` now owns and the contract fixes at one height per size:
+# "QPushButton#outlined renders at one height. A caller wanting another size
+# picks a size token; it may not set a pixel height."
+_VARIANTS = (("", "md"), ("outlined", "md"), ("danger", "md"), ("tab", "sm"),
+             ("start_btn", "lg"), ("live", "md"), ("rehearsal", "md"),
+             ("reveal", "md"))
 
 # The hosts outlive the calls that build them. A host dropped on return takes
 # its child button down with it the moment Python collects it, and grabbing a
@@ -1540,7 +1714,47 @@ _RING_INK = 200
 _HOSTS: list = []
 
 
-def _variant(name, height, checkable=False, text="Send campaign"):
+def _ring_inks(theme) -> dict:
+    """objectName -> the colour that button's focus ring is painted in.
+
+    Read out of the generated sheet rather than assumed to be one token,
+    because it is not quite one: `#start_btn` rests on `accent.border` already,
+    so its ring steps to `accent.subtle` — a ring painted in the colour the
+    border already was changes no pixels, which is the defect and not the rule.
+    The empty key is the plain QPushButton, and later rules win, which is Qt's
+    own tie-break on equal specificity.
+    """
+    inks = {}
+    for selectors, body in re.findall(r"([^{}]+)\{([^{}]*)\}", _sheet(theme)):
+        found = re.search(r"\bborder:\s*\d+px\s+\w+\s+(#[0-9A-Fa-f]{6})", body)
+        if found is None:
+            continue
+        for selector in " ".join(selectors.split()).split(","):
+            named = re.fullmatch(r"\s*QPushButton(?:#(\w+))?:focus\s*", selector)
+            if named:
+                inks[named.group(1) or ""] = found.group(1).upper()
+    return inks
+
+
+def _ring_width(theme) -> int:
+    """How many pixels wide the sheet says a focus ring is."""
+    widths = {int(width) for width in re.findall(
+        r"QPushButton[^{}]*:focus[^{}]*\{[^{}]*?\bborder:\s*(\d+)px", _sheet(theme))}
+    assert len(widths) == 1, "the sheet draws rings of %s px" % sorted(widths)
+    return widths.pop()
+
+
+def _ring_depth(theme) -> int:
+    """How far in from an edge a ring pixel may legitimately sit.
+
+    The ring is `_ring_width` of border, so it paints at depth 0 through
+    width-1; the two extra are the antialiasing the `radius.md` corners blend
+    it across. Measured deepest today: 2.
+    """
+    return _ring_width(theme) + 2
+
+
+def _variant(name, size, checkable=False, text="Send campaign"):
     """One button of `name`'s variant, alone on a host wide enough to hold it.
 
     The host exists so the button is laid out rather than sized by hand: a
@@ -1551,12 +1765,13 @@ def _variant(name, height, checkable=False, text="Send campaign"):
     host = QWidget()
     host.resize(420, 100)
     row = QHBoxLayout(host)
-    row.setContentsMargins(20, 20, 20, 20)
+    margin = _WEARING.space["5"]
+    row.setContentsMargins(margin, margin, margin, margin)
     button = QPushButton(text)
     if name:
         button.setObjectName(name)
     button.setCheckable(checkable)
-    button.setFixedHeight(height)
+    button.setFixedHeight(_WEARING.control[size])
     row.addWidget(button)
     row.addStretch()
     host.show()
@@ -1632,10 +1847,34 @@ def _contents_rect(button) -> QRect:
         button.style().SE_PushButtonContents, option, button)
 
 
-def _is_ink(image, point) -> bool:
-    colour = image.pixelColor(*point)
-    return all(channel >= _RING_INK for channel in
-               (colour.red(), colour.green(), colour.blue()))
+def _painted(image, changed, colour: str) -> list:
+    """The points among `changed` that came out exactly `colour`."""
+    wanted = colour.upper()
+    return [point for point in changed
+            if image.pixelColor(*point).name().upper() == wanted]
+
+
+def _dominant(image, changed) -> str:
+    """The colour most of the changed pixels came out."""
+    counts: dict = {}
+    for point in changed:
+        name = image.pixelColor(*point).name().upper()
+        counts[name] = counts.get(name, 0) + 1
+    return max(counts, key=counts.get) if counts else ""
+
+
+def _ring_floor(button) -> int:
+    """The fewest exact-ink pixels a ring on `button` can honestly be.
+
+    One full side of the button, which is a length rather than a share on
+    purpose. The corners cost a fixed ~58 pixels of blend whatever the button
+    measures — `radius.md` is `radius.md` on a 496px header button and on a
+    38px tab — so a fraction of the changed pixels is a floor that tightens as
+    the control gets smaller, and the smallest control here is a 38x31 tab
+    where it would leave 10% of headroom. Measured margins against one side:
+    57% at the tightest and 200% at the widest.
+    """
+    return max(button.width(), button.height())
 
 
 def test_the_sheet_draws_no_button_ring_with_outline():
@@ -1646,12 +1885,28 @@ def test_the_sheet_draws_no_button_ring_with_outline():
     out exactly as wide as the label — a line struck through the text. The
     `outline: none` declarations elsewhere in the sheet are the opposite
     instruction and are fine; anything that draws is not.
+
+    The lookahead used to sit after `\\s*`, which backtracks to nothing, so the
+    space in `outline: none` satisfied "not none" and every correct declaration
+    read as a violation. It went unnoticed while no QPushButton rule wrote
+    `outline` at all; the generated sheet writes one in each of its focus rules
+    and the bug fired on all three at once. The whitespace is inside the
+    lookahead now, and the two spellings are asserted against directly so the
+    next reader can see which way round it goes.
     """
-    drawn = [" ".join(rule.split()) for rule in
-             re.findall(r"QPushButton[^{}]*\{[^{}]*\}", _sheet())
-             if re.search(r"\boutline(?:-\w+)?\s*:\s*(?!none\b)", rule)]
-    assert drawn == [], \
-        "a button ring is drawn with outline again:\n  %s" % "\n  ".join(drawn)
+    banned = re.compile(r"\boutline(?:-\w+)?\s*:(?!\s*none\b)")
+    assert not banned.search("outline: none;") and \
+        not banned.search("outline:none;"), "the guard no longer allows none"
+    assert banned.search("outline: 2px solid #FFFFFF;"), \
+        "the guard no longer catches a ring"
+
+    for theme in THEMES:
+        drawn = [" ".join(rule.split()) for rule in
+                 re.findall(r"QPushButton[^{}]*\{[^{}]*\}", _sheet(theme))
+                 if banned.search(rule)]
+        assert drawn == [], (
+            "a button ring is drawn with outline again in %s:\n  %s"
+            % (theme.name, "\n  ".join(drawn)))
 
 
 def test_every_button_variant_lights_up_at_its_own_edge():
@@ -1661,28 +1916,40 @@ def test_every_button_variant_lights_up_at_its_own_edge():
     defect was a rule that said 2px around the control and painted 2px through
     the words. Each edge is checked on its own: a ring that lost one side would
     still pass a bounding-box test.
+
+    The ring is 1px now rather than 2, so the depth it may reach comes from the
+    sheet instead of a constant, and the band the label is checked against is
+    the contents rect with that depth taken off it. Both of those are the same
+    slack this test always carried; what has changed is that the ring's own
+    pixels now sit *on* the contents rect's outermost row, because a 1px border
+    is flush against it — and `#rehearsal` is dashed, which Qt paints one row
+    inside the solid ring that replaces it. Neither is a line through a label,
+    and the deep-pixel check above is what actually catches one: an `outline`
+    ring draws its left and right edges 17px in.
     """
     app = _app()
-    for name, height in _VARIANTS:
-        button = _variant(name, height)
+    depth = _ring_depth(THEME)
+    for name, size in _VARIANTS:
+        button = _variant(name, size)
         changed, _, lit = _focused(button, app)
         variant = name or "the default button"
 
         assert changed, "%s paints nothing at all when it takes the focus" % variant
 
-        buried = [point for point in changed if _depth(point, lit) > _RING_DEPTH]
+        buried = [point for point in changed if _depth(point, lit) > depth]
         assert not buried, (
             "%s changes %d pixels more than %dpx in from its edge, the deepest "
             "at %s — that is the ring painting inside the control"
-            % (variant, len(buried), _RING_DEPTH,
+            % (variant, len(buried), depth,
                max(buried, key=lambda point: _depth(point, lit))))
 
-        contents = _contents_rect(button)
-        struck = [point for point in changed if contents.contains(*point)]
+        label = _contents_rect(button).intersected(
+            lit.rect().adjusted(depth, depth, -depth, -depth))
+        struck = [point for point in changed if label.contains(*point)]
         assert not struck, (
-            "%s draws %d of its %d ring pixels inside the contents rect %s, "
-            "where the label is — that is the line through the text"
-            % (variant, len(struck), len(changed), contents))
+            "%s draws %d of its %d ring pixels inside %s, where the label is "
+            "— that is the line through the text"
+            % (variant, len(struck), len(changed), label))
 
         wide, tall = lit.width(), lit.height()
         for edge, near in (("left", lambda x, y: x <= 1),
@@ -1693,37 +1960,65 @@ def test_every_button_variant_lights_up_at_its_own_edge():
                 "%s draws no ring along its %s edge" % (variant, edge)
 
 
-def test_the_ring_is_white_on_every_variant():
-    """One ink everywhere, or the ring stops reading as one thing.
+def test_the_ring_is_the_accent_ring_on_every_variant_and_white_on_none():
+    """The reversal. This used to require the ring to come out white.
 
-    White is also the only one that clears 3:1 on all of them — 5.99:1 on the
-    default grey, 3.18:1 on #start_btn's green, 6.54:1 on #live's red. The
-    floor sits short of every changed pixel because the rounded corners blend
-    the ring into the fill over a pixel or two.
+    White was chosen because it was the only ink that cleared 3:1 on every
+    variant — 5.99:1 on the default grey, 3.18:1 on #start_btn's green, 6.54:1
+    on #live's red. `docs/DESIGN_SYSTEM.md` measured what that cost: 17.01:1 on
+    the page beside a selected tab at 1.50:1, a focus mark eleven times the
+    selection it competed with, and it rules that no focus treatment may ever
+    outweigh the selection beside it — never white, never 2px, never brighter.
+    So a white pixel on a focused button is the failure now, and what the ring
+    has to be instead is the ink the sheet names for that variant, which is
+    read back out of the sheet so the two cannot drift apart.
+
+    "One ink everywhere" survives with one documented exception, and it is the
+    exception that proves the rule: `#start_btn` rests on `accent.border`, so a
+    ring in `accent.border` repainted its border in the colour it already was
+    and changed zero of its 5,800 pixels. It rings in `accent.subtle` instead.
+
+    The old floor was a share of the changed pixels; this one is a length, for
+    the reason `_ring_floor` gives, and it is paired with the stronger claim
+    the share never made: the ink has to be the colour *most* of the ring came
+    out, so a ring that is mostly something else fails even if enough of it is
+    right.
     """
     app = _app()
-    for name, height in _VARIANTS:
-        button = _variant(name, height)
+    for name, size in _VARIANTS:
+        button = _variant(name, size)
         changed, _, lit = _focused(button, app)
-        ink = [point for point in changed if _is_ink(lit, point)]
-        assert len(ink) >= 0.85 * len(changed), (
-            "%s lights only %d of its %d changed pixels white — the ring is "
-            "some other colour" % (name or "the default button", len(ink),
-                                   len(changed)))
+        variant = name or "the default button"
+        ink = _ring_inks(THEME)[name]
+
+        bleached = _painted(lit, changed, THEME.color["text.onAccent"])
+        assert not bleached, (
+            "%s turns %d pixels %s when it takes the focus — the ring is white "
+            "again" % (variant, len(bleached), THEME.color["text.onAccent"]))
+
+        assert _dominant(lit, changed) == ink, (
+            "%s rings in %s and the sheet says %s"
+            % (variant, _dominant(lit, changed), ink))
+        ringed = _painted(lit, changed, ink)
+        assert len(ringed) >= _ring_floor(button), (
+            "%s lights %d pixels of %s and its longest side is %d, so less "
+            "than one side of it is ringed"
+            % (variant, len(ringed), ink, _ring_floor(button)))
 
 
 def test_no_button_moves_by_a_pixel_when_the_focus_arrives():
     """Why the ring is a border already there rather than one that grows.
 
-    A border added on `:focus` would widen the box by 4px the moment a button
-    was tabbed to and shove its whole row along, so the width is held at 2px in
-    every state and only the colour moves. Both the geometry the layout gave the
-    button and the size it asks for are checked, since a changed sizeHint is a
-    shove that lands on the next relayout rather than immediately.
+    A border added on `:focus` would widen the box the moment a button was
+    tabbed to and shove its whole row along, so the width is held at whatever
+    the sheet says in every state and only the colour moves. Both the geometry
+    the layout gave the button and the size it asks for are checked, since a
+    changed sizeHint is a shove that lands on the next relayout rather than
+    immediately.
     """
     app = _app()
-    for name, height in _VARIANTS:
-        button = _variant(name, height)
+    for name, size in _VARIANTS:
+        button = _variant(name, size)
         wanted = button.sizeHint()
         _, (dark, bright), _ = _focused(button, app)
         variant = name or "the default button"
@@ -1747,9 +2042,10 @@ def test_the_ring_survives_the_two_states_it_must_not_be_confused_with():
     It comes last, and this is what says so.
     """
     app = _app()
-    for name, height in (("reveal", 34), ("tab", 28), ("outlined", 30)):
-        button = _variant(name, height, checkable=True)
+    for name, size in (("reveal", "md"), ("tab", "sm"), ("outlined", "md")):
+        button = _variant(name, size, checkable=True)
         changed, _, _ = _focused(button, app)
+        ink = _ring_inks(THEME)[name]
 
         for state in ("hovered", "checked"):
             if state == "hovered":
@@ -1760,10 +2056,12 @@ def test_the_ring_survives_the_two_states_it_must_not_be_confused_with():
             button.style().polish(button)
             button.setFocus(Qt.TabFocusReason)
             lit = _pixels(button, app)
-            ink = [point for point in changed if _is_ink(lit, point)]
-            assert len(ink) >= 0.85 * len(changed), (
-                "a %s #%s keeps only %d of its %d ring pixels white"
-                % (state, name, len(ink), len(changed)))
+            ringed = _painted(lit, changed, ink)
+            assert _dominant(lit, changed) == ink and \
+                len(ringed) >= _ring_floor(button), (
+                    "a %s #%s keeps %d of its %d ring pixels %s, and rings "
+                    "mostly in %s" % (state, name, len(ringed), len(changed),
+                                      ink, _dominant(lit, changed)))
             button.clearFocus()
             button.setChecked(False)
             button.setAttribute(Qt.WA_UnderMouse, False)
@@ -1785,6 +2083,7 @@ def test_every_focusable_button_on_every_screen_wears_the_ring():
     holding the focus when the app opens was among the broken ones.
     """
     app, struck, seen = _app(), [], 0
+    depth, inks = _ring_depth(THEME), _ring_inks(THEME)
     for kind in ("input", "results", "outreach", "settings"):
         screen = _sized(_screen(kind), DEFAULT_SIZE)
         pages = getattr(screen, "pages", None)
@@ -1795,16 +2094,27 @@ def test_every_focusable_button_on_every_screen_wears_the_ring():
                 _sized(screen, DEFAULT_SIZE)
             for button in _focusable(screen):
                 seen += 1
-                changed, (dark, bright), lit = _focused(button, app)
-                contents = _contents_rect(button)
+                changed, (unlit, focused), lit = _focused(button, app)
+                ink = inks.get(button.objectName(), inks[""])
+                label = _contents_rect(button).intersected(
+                    lit.rect().adjusted(depth, depth, -depth, -depth))
                 if not changed:
                     fault = "paints no ring"
-                elif [p for p in changed if contents.contains(*p)]:
+                elif [p for p in changed if label.contains(*p)]:
                     fault = "draws its ring through the label"
-                elif [p for p in changed if _depth(p, lit) > _RING_DEPTH]:
+                elif [p for p in changed if _depth(p, lit) > depth]:
                     fault = "draws its ring inside the control"
-                elif dark != bright:
-                    fault = "moves from %s to %s" % (dark, bright)
+                elif unlit != focused:
+                    fault = "moves from %s to %s" % (unlit, focused)
+                elif _painted(lit, changed, THEME.color["text.onAccent"]):
+                    fault = "rings in white"
+                elif _dominant(lit, changed) != ink:
+                    fault = "rings mostly in %s, not %s" % (
+                        _dominant(lit, changed), ink)
+                elif len(_painted(lit, changed, ink)) < _ring_floor(button):
+                    fault = "rings %d pixels of %s down a %dpx side" % (
+                        len(_painted(lit, changed, ink)), ink,
+                        _ring_floor(button))
                 else:
                     continue
                 struck.append("%s/%s %r %s" % (kind, button.objectName()

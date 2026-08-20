@@ -52,7 +52,7 @@ from core import mailer as M  # noqa: E402
 from core import outreach_db as DB  # noqa: E402
 from core import settings as ST  # noqa: E402
 from core import templates as T  # noqa: E402
-from ui import app as APP  # noqa: E402
+from ui import theme as TH  # noqa: E402
 from ui import screen_outreach as SO  # noqa: E402
 
 _TMP = tempfile.mkdtemp(prefix="mapharvest-compliance-")
@@ -600,8 +600,7 @@ def _app() -> QApplication:
         ST.SETTINGS_DIR = _TMP
         ST.SETTINGS_PATH = os.path.join(_TMP, "settings.json")
         _APP = QApplication.instance() or QApplication([])
-        _APP.setStyle("Fusion")
-        _APP.setStyleSheet(APP.QSS)
+        TH.apply(_APP, TH.theme())
     return _APP
 
 

@@ -10,9 +10,20 @@ here is therefore written to be independent of text metrics — colours are
 sampled, and widths are compared against each widget's own `sizeHint()` rather
 than against fixed pixel counts.
 
+Every colour those samples are compared against comes from `ui.theme`. The
+hexes this file used to spell out — a #1C1C1E page, a #2C2C2E card, a Stop
+button whose red began "#FF6" — were one palette's values, and the app now
+ships two; a test that pins a colour cannot survive a theme change, and pinning
+one is how a passing suite ends up describing an interface nobody sees any more.
+Where an assertion is about a ratio rather than about a widget's wiring it runs
+against both palettes.
+
 `SETTINGS_DIR` is redirected into a temp directory before the screen is built,
-so constructing it can never read or write a developer's real ~/.mapharvest.
+so constructing it can never read or write a developer's real ~/.mapharvest —
+`core.outreach_db` resolves its own path through it on every call, so the
+database goes to the same place.
 """
+import contextlib
 import os
 import sys
 import tempfile
@@ -31,11 +42,30 @@ from PyQt5.QtWidgets import (  # noqa: E402
 from core import outreach_db as DB  # noqa: E402
 from core import settings as ST  # noqa: E402
 from ui import app as APP  # noqa: E402
+from ui import theme as TH  # noqa: E402
 from ui import screen_outreach as SO  # noqa: E402
 
 _TMP = tempfile.mkdtemp(prefix="mapharvest-outreach-ui-")
 _APP = None
 _SCREEN = None
+
+THEME = TH.theme()
+
+# Both palettes, for the assertions that are a claim about a relationship. One
+# that only holds in the dark theme is half a contract.
+THEMES = (TH.theme("dark"), TH.theme("light"))
+
+_WEARING = THEME
+
+# The two sizes every screen has to survive: what `MainWindow` opens at, and the
+# minimum it will let the user drag down to. Window geometry, not design tokens
+# — `ui.theme` has no say in how big the window is.
+DEFAULT_SIZE, MINIMUM_SIZE = (1080, 760), (880, 620)
+
+# Bench geometry for the card built from scratch below — big enough to hold a
+# row of children and small enough to sample whole, and deliberately not a
+# token: it is a frame for a measurement, not a size the app ever paints.
+_BENCH_CARD = QSize(240, 80)
 
 
 def _app() -> QApplication:
@@ -45,9 +75,26 @@ def _app() -> QApplication:
         ST.SETTINGS_DIR = _TMP
         ST.SETTINGS_PATH = os.path.join(_TMP, "settings.json")
         _APP = QApplication.instance() or QApplication([])
-        _APP.setStyle("Fusion")
-        _APP.setStyleSheet(APP.QSS)
+    if _APP.styleSheet() != TH.stylesheet(_WEARING):
+        TH.apply(_APP, _WEARING)
     return _APP
+
+
+@contextlib.contextmanager
+def _wearing(theme):
+    """The whole process in `theme`, and back to the default afterwards.
+
+    `setStyleSheet` repolishes every widget alive in the process, which is the
+    point: a screen built under one palette has to be measured in the one under
+    test, not in the one it was constructed in.
+    """
+    global _WEARING
+    saved, _WEARING = _WEARING, theme
+    try:
+        yield _app()
+    finally:
+        _WEARING = saved
+        _app()
 
 
 def _screen():
@@ -69,7 +116,7 @@ def _screen():
                                   "status": "audited", "source": "test"})
         DB.suppress(conn, "nobody@example.com", "test fixture")
         _SCREEN = SO.OutreachScreen()
-        _SCREEN.resize(QSize(1080, 760))
+        _SCREEN.resize(QSize(*DEFAULT_SIZE))
         _SCREEN.show()
         app.processEvents()
     return _SCREEN
@@ -107,6 +154,12 @@ def _contrast(one: str, two: str) -> float:
     return max(first, second) / min(first, second)
 
 
+# What an unpainted pixel comes back as. A widget with a transparent
+# background yields a grab whose buffer was never written to, and that is Qt's
+# own answer, not a colour any palette names.
+_UNPAINTED = "#000000"
+
+
 def _accent(widget) -> str:
     """The colour `widget` paints most, ignoring the unpainted ground.
 
@@ -119,7 +172,7 @@ def _accent(widget) -> str:
         for x in range(image.width()):
             name = image.pixelColor(x, y).name().upper()
             counts[name] = counts.get(name, 0) + 1
-    counts.pop("#000000", None)
+    counts.pop(_UNPAINTED, None)
     return max(counts, key=counts.get) if counts else ""
 
 
@@ -157,10 +210,10 @@ def test_labels_inside_a_card_do_not_paint_their_own_background():
     """Every label on a #card must leave the card's fill showing behind it.
 
     The global sheet's `QWidget` rule matches QLabel too, so without an
-    explicit transparent rule each label paints an opaque #1C1C1E rectangle on
-    the #2C2C2E card. Sampled from the card's own render at the label's corner:
-    a transparent label grabbed on its own yields an unpainted buffer, so the
-    parent is the only honest witness.
+    explicit transparent rule each label paints an opaque `canvas` rectangle on
+    the `surface` card. Sampled from the card's own render at the label's
+    corner: a transparent label grabbed on its own yields an unpainted buffer,
+    so the parent is the only honest witness.
     """
     screen = _screen()
     app = _app()
@@ -189,8 +242,11 @@ def test_labels_inside_a_card_do_not_paint_their_own_background():
 
 def test_the_sheet_still_lets_a_label_carry_its_own_fill():
     """#toast and #warning set a background under an id selector, which wins."""
-    assert "QLabel {\n    background: transparent;\n}" in APP.QSS
-    assert "QLabel#toast" in APP.QSS and "background-color: #2C2C2E" in APP.QSS
+    for theme in THEMES:
+        sheet = TH.stylesheet(theme)
+        assert "QLabel {\n    background: transparent;\n}" in sheet
+        assert "QLabel#toast" in sheet
+        assert "background-color: %s;" % theme.color["raised"] in sheet
 
 
 # ── D20: a disabled Stop must look disabled ──────────────────────────────────
@@ -200,25 +256,42 @@ def test_disabled_danger_button_dims():
 
     Pause is the reference: it is the outlined button beside Stop, it dims
     correctly, and the two are enabled and disabled together.
+
+    "Red" is `danger.border` and `danger.text` now rather than a hex beginning
+    "#FF6", and the two are read out of whichever palette is loaded: Stop is a
+    transparent outlined button, so the colour it paints most is its border,
+    which is what carries the state. Both palettes, because a rule about what a
+    disabled control may not still be painting is a rule in both.
     """
-    screen = _screen()
-    app = _app()
-    screen._goto_tab(2)
-    app.processEvents()
+    for theme in THEMES:
+        with _wearing(theme) as app:
+            screen = _screen()
+            screen._goto_tab(2)
+            app.processEvents()
 
-    screen.stop_btn.setEnabled(True)
-    app.processEvents()
-    assert _accent(screen.stop_btn).startswith("#FF6"), \
-        "an enabled Stop should still be red"
+            live = {theme.color[name].upper()
+                    for name in ("danger.border", "danger.text",
+                                 "danger.default")}
+            screen.stop_btn.setEnabled(True)
+            app.processEvents()
+            assert _accent(screen.stop_btn) == theme.color["danger.border"].upper(), (
+                "%s: an enabled Stop paints %s, not the danger outline %s"
+                % (theme.name, _accent(screen.stop_btn),
+                   theme.color["danger.border"]))
 
-    screen.stop_btn.setEnabled(False)
-    screen.pause_btn.setEnabled(False)
-    app.processEvents()
-    dead = _colours(screen.stop_btn)
-    assert not any(c.startswith("#FF6") for c in dead), \
-        "a disabled Stop still paints its live red: %s" % sorted(dead)
-    assert _accent(screen.stop_btn) == _accent(screen.pause_btn), \
-        "Stop and Pause must dim to the same thing when both are disabled"
+            screen.stop_btn.setEnabled(False)
+            screen.pause_btn.setEnabled(False)
+            app.processEvents()
+            dead = _colours(screen.stop_btn)
+            assert not (dead & live), (
+                "%s: a disabled Stop still paints its live danger colours: %s"
+                % (theme.name, sorted(dead & live)))
+            assert _accent(screen.stop_btn) == _accent(screen.pause_btn), \
+                "Stop and Pause must dim to the same thing when both are disabled"
+            assert _accent(screen.stop_btn) == theme.color["border.subtle"].upper(), (
+                "%s: a disabled button outlines itself in %s, not %s"
+                % (theme.name, _accent(screen.stop_btn),
+                   theme.color["border.subtle"]))
 
 
 # ── D21: the lead table's sort order ─────────────────────────────────────────
@@ -266,7 +339,7 @@ def test_campaign_buttons_are_never_clipped():
     """
     screen = _screen()
     app = _app()
-    for width, height in ((1080, 760), (880, 620)):
+    for width, height in (DEFAULT_SIZE, MINIMUM_SIZE):
         screen.resize(QSize(width, height))
         screen._goto_tab(1)
         screen.goto_sending_btn.show()
@@ -277,7 +350,7 @@ def test_campaign_buttons_are_never_clipped():
                 "%r is %dpx wide but needs %d at %dx%d"
                 % (button.text(), button.width(), button.sizeHint().width(),
                    width, height))
-    screen.resize(QSize(1080, 760))
+    screen.resize(QSize(*DEFAULT_SIZE))
 
 
 # ── D22: the activity log's empty state ──────────────────────────────────────
@@ -365,34 +438,44 @@ def test_a_plain_container_paints_nothing_on_a_card():
 
     A QLayout needs a widget to live on, so cards end up holding bare QWidgets
     whose only job is to hold a row of children. The sheet's `QWidget` rule
-    matches every one of them and gives it the page's own #1C1C1E, which lands
+    matches every one of them and gives it the page's own `canvas`, which lands
     on top of the card fill — the labels inside are transparent and therefore
     innocent, so sampling them alone finds nothing. Asserted here so a card that
     nests a container tomorrow is covered without anyone remembering to check.
-    """
-    app = _app()
-    frame = QFrame()
-    frame.setObjectName("card")
-    box = QVBoxLayout(frame)
-    box.setContentsMargins(16, 14, 16, 14)
-    holder = QWidget()
-    inner = QVBoxLayout(holder)
-    inner.setContentsMargins(0, 0, 0, 0)
-    label = QLabel("sam@example.com")
-    label.setObjectName("muted")
-    inner.addWidget(label)
-    box.addWidget(holder)
-    frame.resize(QSize(240, 80))
-    frame.show()
-    app.processEvents()
 
-    image = frame.grab().toImage()
-    counts = _histogram(image, image.rect())
-    assert counts.get("#1C1C1E", 0) == 0, (
-        "a container painted %d px of page colour onto the card"
-        % counts["#1C1C1E"])
-    assert image.pixelColor(image.width() // 2, 3).name().upper() == "#2C2C2E"
-    frame.hide()
+    Both palettes, since the rule is about which of two grounds wins and both
+    of them move when the theme does.
+    """
+    for theme in THEMES:
+        with _wearing(theme) as app:
+            page = theme.color["canvas"].upper()
+            card = theme.color["surface"].upper()
+            frame = QFrame()
+            frame.setObjectName("card")
+            box = QVBoxLayout(frame)
+            box.setContentsMargins(theme.space["4"], theme.space["3"],
+                                   theme.space["4"], theme.space["3"])
+            holder = QWidget()
+            inner = QVBoxLayout(holder)
+            inner.setContentsMargins(0, 0, 0, 0)
+            label = QLabel("sam@example.com")
+            label.setObjectName("muted")
+            inner.addWidget(label)
+            box.addWidget(holder)
+            frame.resize(_BENCH_CARD)
+            frame.show()
+            app.processEvents()
+
+            image = frame.grab().toImage()
+            counts = _histogram(image, image.rect())
+            assert counts.get(page, 0) == 0, (
+                "%s: a container painted %d px of page colour onto the card"
+                % (theme.name, counts[page]))
+            assert image.pixelColor(image.width() // 2, 3).name().upper() == card, (
+                "%s: the card itself paints %s, not %s"
+                % (theme.name, image.pixelColor(image.width() // 2, 3).name(),
+                   card))
+            frame.hide()
 
 
 def test_no_card_paints_page_colour_behind_a_label_with_an_account_set_up():
@@ -405,6 +488,7 @@ def test_no_card_paints_page_colour_behind_a_label_with_an_account_set_up():
     """
     screen = _screen()
     app = _app()
+    page = THEME.color["canvas"].upper()
     data = ST.load_settings()
     data["smtp_accounts"] = [{"email": "sam@example.com", "app_password": "app-pw",
                               "display_name": "Sam", "daily_cap": 10,
@@ -429,9 +513,9 @@ def test_no_card_paints_page_colour_behind_a_label_with_an_account_set_up():
                     rect = label.rect().translated(
                         label.mapTo(frame, label.rect().topLeft()))
                     counts = _histogram(image, rect)
-                    assert counts.get("#1C1C1E", 0) == 0, (
+                    assert counts.get(page, 0) == 0, (
                         "%d of %d px behind %r are page colour, not the %s card"
-                        % (counts["#1C1C1E"], sum(counts.values()),
+                        % (counts[page], sum(counts.values()),
                            label.text()[:32], fill))
                     seen.append(label.text())
     finally:
@@ -463,7 +547,7 @@ def test_the_activity_log_never_scrolls_sideways():
     screen._goto_tab(2)
     screen.setMinimumSize(QSize(1, 1))
     try:
-        for width, height in ((1080, 760), (880, 620)):
+        for width, height in (DEFAULT_SIZE, MINIMUM_SIZE):
             screen.resize(QSize(width, height))
             screen.layout().activate()
             app.processEvents()
@@ -486,7 +570,7 @@ def test_the_activity_log_never_scrolls_sideways():
             screen._clear_log()
     finally:
         screen.setMinimumSize(QSize(0, 0))
-        screen.resize(QSize(1080, 760))
+        screen.resize(QSize(*DEFAULT_SIZE))
         screen._clear_log()
         app.processEvents()
 
@@ -494,25 +578,37 @@ def test_the_activity_log_never_scrolls_sideways():
 # ── R16: hint text has to be readable on both of its grounds ─────────────────
 
 def test_hint_text_clears_wcag_aa_on_the_page_and_on_a_card():
-    """#hint sentences sit on #1C1C1E on some screens and #2C2C2E on cards.
+    """#hint sentences sit on `canvas` on some screens and `surface` on cards.
 
     Read back off a real label rather than out of the sheet, because a more
-    specific rule could always be beating the one that names the colour. The
-    card is the harder ground of the two, and it stopped being hidden behind the
-    label's own fill once labels went transparent.
+    specific rule could always be beating the one that names the colour. Both
+    grounds and both texts now come from the palette that is loaded, and the
+    sweep runs over both palettes: the ratios are 10.24:1 and 7.20:1 in dark,
+    4.56:1 and 6.56:1 in light, and which of the two grounds is the harder one
+    is not the same in each — the light page is a mid grey, so there the card is
+    the *easier* ground and a test written against the dark theme's ordering
+    would have measured the wrong one.
     """
-    screen = _screen()
-    app = _app()
-    screen._goto_tab(2)
-    app.processEvents()
-    hint = screen.send_note.palette().color(QPalette.WindowText).name().upper()
-    for ground in ("#1C1C1E", "#2C2C2E"):
-        assert _contrast(hint, ground) >= 4.5, (
-            "%s on %s is %.2f:1, under WCAG AA's 4.5:1"
-            % (hint, ground, _contrast(hint, ground)))
-    body = "#E5E5E7"
-    assert _contrast(body, "#2C2C2E") > _contrast(hint, "#2C2C2E"), \
-        "a hint must stay quieter than the body text beside it"
+    for theme in THEMES:
+        with _wearing(theme) as app:
+            screen = _screen()
+            screen._goto_tab(2)
+            app.processEvents()
+            hint = screen.send_note.palette().color(
+                QPalette.WindowText).name().upper()
+            assert hint == theme.color["text.tertiary"].upper(), (
+                "%s: a hint paints %s and the hint token is %s"
+                % (theme.name, hint, theme.color["text.tertiary"]))
+            for name in ("canvas", "surface"):
+                ground = theme.color[name]
+                assert _contrast(hint, ground) >= 4.5, (
+                    "%s: %s on %s (%s) is %.2f:1, under WCAG AA's 4.5:1"
+                    % (theme.name, hint, name, ground, _contrast(hint, ground)))
+            body, card = theme.color["text.primary"], theme.color["surface"]
+            assert _contrast(body, card) > _contrast(hint, card), (
+                "%s: a hint must stay quieter than the body text beside it — "
+                "%.2f:1 against %.2f:1"
+                % (theme.name, _contrast(hint, card), _contrast(body, card)))
 
 
 def test_every_hint_on_the_screen_uses_that_colour():
