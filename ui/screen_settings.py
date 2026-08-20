@@ -2259,8 +2259,11 @@ class SettingsScreen(QWidget):
         layout.addLayout(follow_grid)
         layout.addSpacing(6)
         layout.addWidget(_hint(
-            "A reply, a bounce or an unsubscribe cancels every remaining follow-up "
-            "for that lead."
+            "The wait is a floor, not an exact gap: a follow-up is placed no sooner "
+            "than this, then queued behind whatever the day's caps and sending "
+            "window allow, so on a long list it usually lands later than the number "
+            "above. A reply, a bounce or an unsubscribe cancels every remaining "
+            "follow-up for that lead."
         ))
         layout.addStretch()
         return page
@@ -2325,9 +2328,10 @@ class SettingsScreen(QWidget):
         layout.addWidget(self.live_warning)
         layout.addSpacing(6)
         layout.addWidget(_hint(
-            "A dry run walks the whole schedule, renders every message and records "
-            "it as sent, but opens no SMTP connection. Use it once before any new "
-            "campaign."
+            "A dry run walks the whole schedule and renders every message, but "
+            "opens no SMTP connection and spends none of the day's quota. The "
+            "queue goes back exactly as it was, so the campaign is still ready "
+            "to send for real afterwards. Use it once before any new campaign."
         ))
         layout.addStretch()
         return page

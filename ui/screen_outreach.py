@@ -1129,6 +1129,7 @@ class OutreachScreen(QWidget):
             self._refresh_profile()
             self._refresh_accounts()
             self._refresh_stats()
+            self._refresh_plan_summary()
         except Exception:
             pass
 
@@ -2018,6 +2019,20 @@ class OutreachScreen(QWidget):
         self._reload_leads()
         self._refresh_stats()
 
+    def _refresh_plan_summary(self) -> None:
+        """Describe the schedule before there is a plan to describe.
+
+        The card was blank until a campaign had been prepared, which is the one
+        moment the user is deciding whether to prepare it — so the window, the
+        caps and the follow-up spacing were invisible exactly when they were
+        being agreed to. A real plan replaces this the moment there is one.
+        """
+        if self._plan:
+            return
+        self.plan_summary.setText(html.escape(
+            "Nothing queued yet. When you prepare a campaign it will send %s."
+            % self._rules_summary()))
+
     def _plan_sentence(self, plan: dict) -> str:
         queued = _int_of(plan.get("queued"))
         days = max(1, _int_of(plan.get("days")))
@@ -2077,9 +2092,10 @@ class OutreachScreen(QWidget):
             self.send_badge.setText("DRY RUN — nothing is actually sent")
             self.send_badge.setObjectName("rehearsal")
             self.send_note.setText(
-                "Messages are rendered, queued and marked sent, but no SMTP "
-                "connection is opened and nothing leaves this machine. Turn "
-                "dry run off in Settings when you are ready to send for real.\n"
+                "Messages are rendered and logged, but no SMTP connection is "
+                "opened, nothing leaves this machine and no quota is spent. The "
+                "queue goes back as it was, so the campaign is still ready to "
+                "send for real. Turn dry run off in Settings when you are.\n"
                 "%s. All of it is editable in Settings." % self._rules_summary())
         else:
             self.send_badge.setText("LIVE — real emails will be sent")
