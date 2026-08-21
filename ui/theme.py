@@ -29,6 +29,38 @@ and to two more the audit's critical finding demands: the selected ground clears
 3:1 against canvas, surface and inset and carries readable ink, and the focus
 ring never measures louder than the selection it sits beside.
 
+`surfaceActive` is the sixth ground, and the two rules the contract writes for
+it — every `text.*` at 4.5:1 on it, `border.default` at 3:1 on it — are the two
+this palette cannot keep. Both are out of range rather than badly chosen, and
+the range is what `tests/test_theme.py` measures rather than takes on trust:
+
+  * the ink. A selected ground has to clear 3:1 against the ground it replaces,
+    and the dimmest text tier has to clear 4.5:1 against the selected ground, so
+    the dimmest tier ends up 13.5x the row it is read on. `surface` sits at
+    l=0.0769 (l is L+0.05, the WCAG offset), which puts that tier at l>=1.038 —
+    brighter than white. What is achievable is one ink rather than four, and the
+    sheet paints exactly that: every rule that grounds on `surfaceActive` names
+    `text.onAccent`, which measures 4.52:1 in dark and 14.22:1 in light, and
+    `test_a_selected_ground_never_carries_ink_it_cannot_read` holds it there.
+  * the outline. `border.default` and `surfaceActive` both sit at least 3x above
+    `surface`, so putting 3:1 between the two of them needs one of them 9x above
+    `surface` — l>=0.63, a near-white hairline on every control — while the ink
+    rule caps the selected ground at l<=0.2333. The sheet answers it a rule at a
+    time instead: a control whose ground becomes `surfaceActive` takes its edge
+    in `text.onAccent` too.
+
+The same arithmetic is why the focus ring is dimmer than the resting border in
+dark and cannot be lifted above it. Rule 5 puts `border.default` at 3x the
+lightest ground it touches (3 x l raised = 0.342) and the readable-selection cap
+puts any subordinate mark at or under l=0.233, so the resting border is 46%
+louder than the loudest ring the ordering permits. Spelled as a span, the dark
+theme is asked for 1.4 x 1.4 (the surface ladder) x 3 (the border on `raised`)
+x 4.5 (white on the selection) = 26.46:1 between the page and its brightest ink,
+and black to white is 21:1. It is 26% short before a single colour is chosen.
+The light theme has the range — its page is a mid grey with 9.2:1 of room below
+it — and carries the full ordering: rest 3.83, focus 4.81, selection 6.22 on the
+page, and the same order on all five grounds.
+
 Where a rule could not be met, the reason is arithmetic and is written down at
 the token that gives way — see `_DARK`'s surfaceActive and accent.border.
 """
@@ -41,6 +73,7 @@ from dataclasses import dataclass
 from string import Template
 from typing import Mapping
 
+from PyQt5 import sip
 from PyQt5.QtCore import QPointF, QRectF, Qt
 from PyQt5.QtGui import (
     QColor, QFont, QFontDatabase, QPainter, QPalette, QPen, QPolygonF,
@@ -73,7 +106,10 @@ _DARK = {
     # it at L 0.1833 (4.5:1) and 3:1 against `surface` floors it at L 0.1807;
     # #707782 measures L 0.1825, which is 4.52:1 for the ink and 3.03:1 for the
     # ground. There is no room above or below, which is the price of a selection
-    # that is both legible and unmistakable on a dark page.
+    # that is both legible and unmistakable on a dark page — and it is why the
+    # ink on this one ground is `text.onAccent` and not the four-tier text ramp:
+    # the ramp's dimmest tier would have to measure l >= 1.038, and white is
+    # 1.05. Every rule in the sheet that grounds here says so.
     "surfaceActive": "#707782",
     "raised": "#43484F",
     "inset": "#1A1C20",
@@ -96,12 +132,23 @@ _DARK = {
     "accent.default": "#15743D",
     "accent.hover": "#1A8547",
     "accent.active": "#116534",
-    # The focus ring. 3.70:1 on canvas and 3.24:1 on inset, against a selection
-    # that measures 4.31:1 and 3.78:1 on the same two grounds — subordinate
+    # The focus ring. 3.70:1 on canvas and 3.25:1 on inset, against a selection
+    # that measures 4.30:1 and 3.78:1 on the same two grounds — subordinate
     # everywhere, which is the rule. It cannot also clear 3:1 on `surface`
-    # (it measures 2.60:1 there): doing so would need a ring above 4.31:1 on
+    # (it measures 2.60:1 there): doing so would need a ring above 4.28:1 on
     # canvas, and the selection cannot go higher without dropping its ink under
     # 4.5:1. Ordering wins, because the audit's critical finding is the ordering.
+    #
+    # It is also dimmer than the border it replaces — 3.70:1 against
+    # `border.default`'s 6.50:1 on canvas — and that is the one defect in this
+    # file with no colour that fixes it. A ring above the resting border has to
+    # clear 3 x l(raised) = 0.342, and a ring at or under the selection cannot
+    # pass l = 0.233; the two bounds cross by 46%, so the whole window is empty
+    # and every green in it is a green that outranks the selection. What is left
+    # is holding the ring at the top of the window it does have: it measures 86%
+    # of the selection on every ground, and
+    # `test_the_focus_ring_is_as_loud_as_the_ordering_lets_it_be` keeps it there.
+    # The light palette has the range and carries the full ordering.
     "accent.border": "#177C42",
     "accent.text": "#5CD98F",
 
@@ -523,6 +570,22 @@ QWidget#results_header {
     border-bottom: 1px solid ${color.border.subtle};
 }
 
+/* The shell's two rows. The first is a surface so the one bar in the app reads
+   as chrome rather than as the top of the page — the audit found four screens
+   with four different top bars, and the reason none of them read as the same
+   object is that each was the page colour with a different height. The second
+   row carries the sub-tabs and sits on the page, so a screen's own tabs read as
+   belonging to the screen and not to the product. */
+QWidget#app_bar {
+    background-color: ${color.surface};
+    border-bottom: 1px solid ${color.border.subtle};
+}
+
+QWidget#sub_bar {
+    background-color: ${color.canvas};
+    border-bottom: 1px solid ${color.border.subtle};
+}
+
 /* ── Fields ──────────────────────────────────────────────────────────────── */
 /* Every control carries a 1px border in every state and only its colour moves,
    so the contents rect never shifts under a focus ring. */
@@ -644,9 +707,20 @@ QPushButton:hover {
     border-color: ${color.border.strong};
 }
 
+/* The selected ground takes the outline with it. `border.default` measures
+   1.51:1 on `surfaceActive` in dark and 1.62:1 in light, so a control that is
+   pressed or checked lost its edge at exactly the moment it was being acted on
+   — and no border token can fix that, because one that clears 3:1 on the
+   selected ground has to sit either three times above it (L >= 0.65, a
+   near-white hairline round every control in the app) or three times below it
+   (L <= 0.028, which then fails 3:1 on `surface`). What does clear it is the
+   ink the ground already carries: `text.onAccent` measures 4.52:1 on the dark
+   selection and 14.22:1 on the light one, so on this ground the edge and the
+   label are the same colour. */
 QPushButton:pressed {
     background-color: ${color.surfaceActive};
     color: ${color.text.onAccent};
+    border-color: ${color.text.onAccent};
 }
 
 QPushButton:disabled {
@@ -669,6 +743,7 @@ QPushButton#outlined:hover {
 QPushButton#outlined:pressed {
     background-color: ${color.surfaceActive};
     color: ${color.text.onAccent};
+    border-color: ${color.text.onAccent};
 }
 
 QPushButton#outlined:disabled {
@@ -783,6 +858,7 @@ QPushButton#reveal:hover {
 QPushButton#reveal:checked {
     color: ${color.text.onAccent};
     background-color: ${color.surfaceActive};
+    border-color: ${color.text.onAccent};
 }
 
 /* ── Tabs: selection is the louder signal ────────────────────────────────── */
@@ -1149,6 +1225,19 @@ class TickStyle(QProxyStyle):
 
     def __init__(self, base, t: Theme):
         super().__init__(base)
+        self.wear(t)
+
+    def wear(self, t: Theme) -> None:
+        """Take `t`'s colours, in place of a second style being installed.
+
+        `QApplication.setStyle` hands the style it replaces to `deleteLater`,
+        and a deferred delete is only collected by an event loop — so a theme
+        toggle that builds a new style each time leaves the old ones queued, and
+        every one of them is asked to polish every widget in the process. The
+        cost grows with each switch: measured on a window with 701 widgets, four
+        changes in a row took 683ms, 695ms, 2070ms and 2609ms. Worn in place
+        they are 683ms every time.
+        """
         self._box = t.control["xs"] - 8          # 16px at comfortable
         self._radius = t.radius["sm"]
         self._off = t.color["inset"]
@@ -1271,6 +1360,13 @@ def base_font() -> QFont:
     return QFont(_BASE_FONT)
 
 
+# (application, its TickStyle, the theme it is wearing). One tuple rather than
+# a lookup because Qt allows one QApplication at a time; the app is held with it
+# so a process that outlives one — the test suite does not, but a future one
+# might — cannot be handed a style belonging to an application that has gone.
+_WORN: tuple = ()
+
+
 def apply(app: QApplication, t: Theme) -> None:
     """The app's whole look in one call: DPI, font, style, palette, sheet.
 
@@ -1284,18 +1380,30 @@ def apply(app: QApplication, t: Theme) -> None:
     paints opaque, and it takes `text.tertiary` so an empty field still reads as
     empty next to a filled one.
 
-    Applying the theme the app already wears returns without touching anything.
-    `setStyleSheet` repolishes every widget alive in the process — around 0.7s
-    once four screens are built — and the geometry sweeps call this once per
-    helper, a few hundred times per run.
+    Applying the theme the app already wears returns without touching anything,
+    and `_WORN` is how it knows, because the obvious test does not work: once a
+    stylesheet is set, `app.style()` answers with Qt's own QStyleSheetStyle
+    wrapper and never with the TickStyle underneath it, so the `isinstance`
+    guard this replaces was always False and every call did the full work.
+    `setStyleSheet` repolishes every widget alive in the process — 550ms once
+    four screens are built — and the geometry sweeps call this once per helper,
+    a few hundred times per run.
     """
+    global _WORN
+
     sheet = stylesheet(t)
-    if app.styleSheet() == sheet and isinstance(app.style(), TickStyle):
+    style = (_WORN[1] if _WORN and _WORN[0] is app
+             and not sip.isdeleted(_WORN[1]) else None)
+    if style is not None and _WORN[2] == t and app.styleSheet() == sheet:
         return
 
     enable_high_dpi()
     app.setFont(base_font())
-    app.setStyle(TickStyle(QStyleFactory.create("Fusion"), t))
+    if style is None:
+        style = TickStyle(QStyleFactory.create("Fusion"), t)
+        app.setStyle(style)
+    else:
+        style.wear(t)
 
     palette = app.palette()
     palette.setColor(QPalette.PlaceholderText, QColor(t.color["text.tertiary"]))
@@ -1305,3 +1413,4 @@ def apply(app: QApplication, t: Theme) -> None:
     palette.setColor(QPalette.ToolTipText, QColor(t.color["text.primary"]))
     app.setPalette(palette)
     app.setStyleSheet(sheet)
+    _WORN = (app, style, t)

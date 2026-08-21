@@ -707,8 +707,13 @@ def test_the_check_switched_off_asks_nothing_at_all():
             screen._on_prepare_clicked()
             assert not never.calls, "the switch is off and it still asked"
             assert screen._planning, "the switch is off and it still refused"
-            assert "unfinished profile" in screen.toast_label.text().lower(), \
-                "nothing said the profile is still unfinished: %r" % screen.toast_label.text()
+            # `components.Toaster` in place of the one six-second QLabel that
+            # used to be the whole feedback channel. Same guarantee, read off
+            # the message that is actually on screen.
+            said = " ".join(toast.text_label.text()
+                            for toast in screen.toaster.toasts())
+            assert "unfinished profile" in said.lower(), \
+                "nothing said the profile is still unfinished: %r" % said
     finally:
         SO.plan_campaign = original_plan
         if screen.plan_worker is not None:
@@ -784,8 +789,12 @@ def test_no_control_is_disabled_without_saying_why():
         assert button.toolTip(), "a disabled control with nothing to read"
 
     screen.lead_table.clearSelection()
-    screen._refresh_audit_button()
+    # One method for the whole bulk row now — Audit, Suppress and Copy all read
+    # the same selection, so they are all refreshed by the same call.
+    screen._refresh_lead_actions()
     assert screen.audit_btn.toolTip(), "the audit button says nothing about itself"
+    for button in (screen.suppress_btn, screen.copy_btn):
+        assert button.toolTip(), "a bulk action with nothing to read"
 
 
 def test_a_template_written_elsewhere_is_pickable_without_a_restart():

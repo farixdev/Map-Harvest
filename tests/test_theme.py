@@ -31,13 +31,19 @@ from PyQt5.QtWidgets import (  # noqa: E402
     QApplication, QHBoxLayout, QPushButton, QWidget,
 )
 
+from core import settings as ST  # noqa: E402
 from ui import theme as TH  # noqa: E402
 
 AA, LARGE, COMPONENT, LADDER, JND = 4.5, 3.0, 3.0, 1.4, 2.0
 
-# Every ground a text token can actually be painted on. `surfaceActive` is not
-# one of them: it is a fill, and the ink it carries is `text.onAccent`.
+# Every ground the four-tier text ramp can be painted on. `surfaceActive` is the
+# sixth ground and is deliberately not in this list: the contract asks for the
+# whole ramp on it, and the arithmetic below — see
+# `test_the_selected_ground_cannot_carry_the_text_ramp` — puts the dimmest tier
+# brighter than white. What the selected ground carries is one ink,
+# `text.onAccent`, and the two tests after it hold the sheet to that.
 GROUNDS = ("canvas", "surface", "surfaceHover", "raised", "inset")
+SELECTED = "surfaceActive"
 FAMILIES = ("accent", "success", "warning", "danger", "info")
 FILL_STATES = ("default", "hover", "active")
 
@@ -323,6 +329,215 @@ def test_the_focus_ring_is_not_white_in_either_theme():
         assert theme.color["accent.border"].upper() != "#FFFFFF"
 
 
+# ── Focus against rest, which is the other half of the ordering ──────────────
+#
+# `l` below is the WCAG offset luminance, L+0.05, because every bound in this
+# section is a ratio of two of them and writing it that way is what makes the
+# arithmetic checkable rather than assertable.
+
+
+def _l(colour: str) -> float:
+    return _luminance(colour) + 0.05
+
+
+def test_taking_focus_is_a_gain_in_emphasis_where_the_palette_can_afford_one():
+    """Focus has to outrank REST, not only sit under selection.
+
+    A control that takes the keyboard and comes out *less* outlined than it was
+    at rest has answered "you are here" with a dimming, and for a red-green
+    colour-blind reader — for whom the green ring and the grey border it
+    replaces differ mostly in luminance — that is the whole signal going the
+    wrong way.
+
+    The light palette carries the full ordering on every ground and this is
+    what pins it: rest 3.83, focus 4.81, selection 6.22 on the page. The dark
+    palette cannot, and the test below measures why rather than excusing it.
+    """
+    for theme in _themes():
+        for ground in GROUNDS:
+            rest = _contrast(theme.color["border.default"], theme.color[ground])
+            ring = _contrast(theme.color["accent.border"], theme.color[ground])
+            picked = _contrast(theme.color[SELECTED], theme.color[ground])
+            if 3 * _l(theme.color["raised"]) > _l(theme.color["text.onAccent"]) / AA:
+                continue                      # out of range; measured below
+            assert rest < ring <= picked, (
+                "%s on %s: rest %.2f, focus %.2f, selection %.2f"
+                % (theme.name, ground, rest, ring, picked))
+
+
+def test_the_dark_palette_has_no_room_for_a_ring_above_its_resting_border():
+    """The bound, computed from the tokens, so nobody re-attempts it blind.
+
+    Two rules pin the two ends. Rule 5 puts `border.default` at 3:1 on the
+    lightest ground it touches, and a subordinate mark cannot measure louder
+    than a selected ground that still has to carry readable ink at 4.5:1. In
+    dark those come out at l >= 0.342 and l <= 0.233 — the window between them
+    is empty, and it is empty by 46%.
+
+    As a span: the dark theme is asked for 1.4 x 1.4 (the surface ladder) x 3
+    (the border on `raised`) x 4.5 (white on the selection) = 26.46:1 from the
+    page to its brightest ink. Black to white is 21:1.
+    """
+    dark, light = TH.theme("dark"), TH.theme("light")
+
+    floor = 3 * _l(dark.color["raised"])
+    ceiling = _l(dark.color["text.onAccent"]) / AA
+    assert floor > ceiling, (
+        "the dark palette now has room for a ring above its resting border "
+        "(floor %.4f, ceiling %.4f) — assert the ordering instead of this"
+        % (floor, ceiling))
+    assert round(floor / ceiling, 2) == 1.46
+
+    demanded = LADDER * LADDER * COMPONENT * AA
+    assert round(demanded, 2) == 26.46
+    assert demanded > _contrast("#FFFFFF", "#000000")
+
+    # And the reason the light palette can: its page is a mid grey, so a mark
+    # has room to get louder by going *down*, and the ladder runs the other way.
+    assert _l(light.color["canvas"]) / _l(light.color["text.primary"]) > 8.0
+    assert _l(light.color["border.default"]) > _l(light.color["accent.border"]) \
+        > _l(light.color[SELECTED])
+
+
+def test_the_focus_ring_is_as_loud_as_the_ordering_lets_it_be():
+    """Subordinate is a ceiling, not a target — the ring sits just under it.
+
+    Dark measures 86% of the selection on every ground and light 77%. Without
+    a floor here, "focus is subordinate" reads as a licence to dim the ring,
+    which is how a ring ends up at 3.70:1 beside a resting border at 6.50:1.
+    """
+    for theme in _themes():
+        for ground in GROUNDS:
+            ring = _contrast(theme.color["accent.border"], theme.color[ground])
+            picked = _contrast(theme.color[SELECTED], theme.color[ground])
+            assert ring >= 0.75 * picked, (
+                "%s: the ring is %.2f:1 on %s where the selection it may go up "
+                "to is %.2f:1" % (theme.name, ring, ground, picked))
+
+
+# ── The sixth ground ─────────────────────────────────────────────────────────
+
+
+def test_the_selected_ground_cannot_carry_the_text_ramp():
+    """Why `surfaceActive` is one ink and not four, as arithmetic.
+
+    A selected ground clears 3:1 against the row it replaces and the dimmest
+    text tier clears 4.5:1 against the selected ground, so that tier ends up
+    13.5x the ground the rest of the ramp is read on. Against `surface` at
+    l=0.0769 that is l >= 1.038, and white is 1.05 — the ramp would be four
+    whites, which rule 4 forbids and a reader cannot tell apart anyway.
+    """
+    for theme in _themes():
+        ground = max(_l(theme.color[name]) for name in ("surface", "inset"))
+        needed = AA * COMPONENT * ground
+        assert needed > _l(theme.color["text.tertiary"]), (
+            "%s: the ramp now reaches the selected ground (needs l %.4f, "
+            "tertiary is %.4f) — assert the ramp on it instead of this"
+            % (theme.name, needed, _l(theme.color["text.tertiary"])))
+        # What is achievable, and what the sheet is held to below.
+        assert _contrast(theme.color["text.onAccent"], theme.color[SELECTED]) >= AA
+
+
+def _rules(sheet: str) -> list:
+    """(selector, body) for every rule in `sheet`, comments stripped."""
+    sheet = re.sub(r"/\*.*?\*/", "", sheet, flags=re.S)
+    found = []
+    for selectors, body in re.findall(r"([^{}]+)\{([^{}]*)\}", sheet):
+        for one in selectors.split(","):
+            one = " ".join(one.split())
+            if one:
+                found.append((one, body))
+    return found
+
+
+def _resting(selector: str) -> str:
+    """The same selector with its states taken off: `#tab:checked` -> `#tab`.
+
+    `::item` survives and `:selected` does not, which is the distinction: one
+    names a sub-element the sheet styles in its own right, the other names a
+    state of it.
+    """
+    return re.sub(r"(?<!:):(?!:)[a-zA-Z-]+", "", selector)
+
+
+def _declared(body: str, prop: str) -> str:
+    found = re.search(r"(?<![\w-])%s:\s*(#[0-9A-Fa-f]{6})" % prop, body)
+    return found.group(1).upper() if found else ""
+
+
+def test_a_selected_ground_never_carries_ink_it_cannot_read():
+    """Every rule that paints on the selected ground, checked against it.
+
+    The token rule the contract asks for is out of range — the test above
+    measures by how much — so this is the guarantee that replaces it, and it is
+    the stronger one: a future rule that grounds on `surfaceActive` and reaches
+    for `text.primary` fails here whatever the palette says.
+    """
+    for theme in _themes():
+        picked = theme.color[SELECTED].upper()
+        seen = 0
+        for selector, body in _rules(TH.stylesheet(theme)):
+            # A widget's own fill and the highlight it draws behind selected
+            # text are two different grounds in one rule — `QLineEdit` sets both
+            # — so each is asked for its own ink rather than for whichever
+            # declaration happens to come first.
+            for fill, ink in (("background-color", "color"),
+                              ("background", "color"),
+                              ("selection-background-color", "selection-color")):
+                if _declared(body, fill) != picked:
+                    continue
+                seen += 1
+                painted = _declared(body, ink)
+                assert painted, \
+                    "%s: %s grounds on the selection and names no %s" % (
+                        theme.name, selector, ink)
+                ratio = _contrast(painted, picked)
+                assert ratio >= AA, \
+                    "%s: %s paints %s on the selection at %.2f:1" % (
+                        theme.name, selector, painted, ratio)
+        assert seen >= 8, "only %d rules ground on the selection" % seen
+
+
+def test_a_control_that_is_pressed_or_checked_keeps_its_own_outline():
+    """`border.default` measures 1.51:1 on the dark selection and 1.62:1 on the
+    light one, so a control that was outlined at rest lost its edge at the
+    moment it was pressed. No border token fixes it — one clearing 3:1 on the
+    selected ground sits either 3x above it (a near-white hairline on every
+    control) or 3x below it, which then fails 3:1 on `surface` — so the rule is
+    that a control whose ground becomes the selection re-declares its edge.
+
+    Scoped to the outline and not to a rail: `border-left` on a selected row is
+    a mark against the row beside it, not the row's own outline.
+    """
+    for theme in _themes():
+        picked = theme.color[SELECTED].upper()
+        rules = _rules(TH.stylesheet(theme))
+        resting = {selector: body for selector, body in rules}
+        checked = 0
+        for selector, body in rules:
+            if _declared(body, "background-color") != picked:
+                continue
+            base = _resting(selector)
+            if base == selector:
+                continue
+            outline = re.search(r"(?<![\w-])border:\s*\d+px\s+\w+\s+"
+                                r"(#[0-9A-Fa-f]{6})", resting.get(base, ""))
+            if outline is None:
+                continue                      # nothing was there to lose
+            checked += 1
+            edge = _declared(body, "border-color") or _declared(body, "border")
+            assert edge, (
+                "%s: %s takes the selected ground and keeps %s's %s outline, "
+                "which measures %.2f:1 on it"
+                % (theme.name, selector, base, outline.group(1),
+                   _contrast(outline.group(1), picked)))
+            ratio = _contrast(edge, picked)
+            assert ratio >= COMPONENT, (
+                "%s: %s outlines in %s on the selection at %.2f:1"
+                % (theme.name, selector, edge, ratio))
+        assert checked >= 3, "only %d rules were measured" % checked
+
+
 # ── The token set itself ─────────────────────────────────────────────────────
 
 REQUIRED_COLOURS = (
@@ -408,6 +623,32 @@ def test_token_reads_by_path_and_refuses_a_path_that_is_not_one():
         except KeyError:
             continue
         raise AssertionError("%r resolved to something" % path)
+
+
+def test_a_settings_file_can_actually_ask_for_a_theme():
+    """The two keys `from_settings` reads were not in the settings schema.
+
+    `core.settings` keeps only the keys `DEFAULT_SETTINGS` names, so writing
+    {"theme": "light", "density": "compact"} into settings.json and reading it
+    back returned dark and comfortable — the light palette and the compact
+    density were both built, both measured, and unreachable from the app.
+    """
+    assert ST.DEFAULT_SETTINGS["theme"] == TH.DEFAULT_THEME
+    assert ST.DEFAULT_SETTINGS["density"] == TH.DEFAULT_DENSITY
+
+    saved = ST.load_settings()
+    try:
+        ST.save_settings(dict(saved, theme="light", density="compact"))
+        back = ST.load_settings()
+        assert (back["theme"], back["density"]) == ("light", "compact"), \
+            "the file said light/compact and it read back %r/%r" % (
+                back["theme"], back["density"])
+        wanted = TH.from_settings(back)
+        assert (wanted.name, wanted.density) == ("light", "compact")
+        assert wanted.control["md"] == TH.theme("light", "compact").control["md"]
+    finally:
+        ST.save_settings(saved)
+    assert TH.from_settings(ST.load_settings()).name == saved["theme"]
 
 
 def test_an_unreadable_preference_still_starts_the_app():

@@ -25,6 +25,31 @@ Four things here are safety features rather than decoration:
   folder and inside the law, so each one is on by default and each one says in
   plain words what turning it off costs. None of them stops a send.
 
+Three more are what the design-system audit measured on this screen and what
+this file now answers with:
+
+* **Save and Discard are the only two ways out.** Back used to save everything
+  on the way past and put "Saved" on a screen the user had already left, so a
+  half-finished sending window was committed by the act of leaving and nothing
+  the user could see said so. Both commands sit in a footer that is on screen
+  whenever the settings are, the footer says whether there is anything
+  outstanding, and navigating away no longer decides anything.
+* **The scheduler's own limits are shown beside the numbers that ask for them.**
+  `core.campaign` composes the global cap, the per-account cap and the warm-up
+  ramp as a minimum, forces an inverted window to one hour and reads an empty
+  day set as Monday to Friday. The UI used to report the requested value back as
+  if it were in force; where the two differ, both are on screen.
+* **Appearance is a section rather than a hand edit.** Both palettes and both
+  densities exist in `ui/theme.py` and neither could be reached: writing
+  `theme` or `density` into settings.json was the only route and `_merge` used
+  to drop them. They are controls now, and they take effect while you watch.
+
+Every value this screen paints comes from `ui.theme` through `ui.components`.
+There is no hex literal, font size, spacing number or fixed height in this file
+that did not come out of a token — the one exception is the preview document,
+which is an email and not a piece of this application's chrome, and which says
+so at `_PAPER` below.
+
 The Templates tab is the largest thing on this screen, and it is a real editor
 rather than a text box for three reasons:
 
@@ -56,10 +81,10 @@ import time
 from PyQt5.QtCore import QDate, QEvent, QSize, Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QFontDatabase, QTextCursor
 from PyQt5.QtWidgets import (
-    QButtonGroup, QCheckBox, QComboBox, QDateEdit, QFrame, QGridLayout,
+    QApplication, QCheckBox, QComboBox, QDateEdit, QFrame, QGridLayout,
     QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox,
-    QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSpinBox,
-    QSplitter, QStackedWidget, QTextEdit, QToolTip, QVBoxLayout, QWidget,
+    QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSpinBox, QSplitter,
+    QStackedWidget, QTextEdit, QToolTip, QVBoxLayout, QWidget,
 )
 
 from core import ai as ai_client
@@ -71,6 +96,8 @@ from core.settings import (
     save_settings, set_secret,
 )
 from core.templates import AUTO_ARMY_SERVICES, MERGE_FIELDS
+from ui import components as C
+from ui import theme as _theme
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -107,12 +134,55 @@ COMMON_ZONES = (
     "Australia/Sydney",
 )
 
-# Every colour below already appears in the global QSS — the green and red from
-# the status labels, the amber from QLabel#warning — so a validation line reads
-# as the same language as the rest of the app rather than a fourth accent.
-_GREEN = "#34C759"
-_AMBER = "#FFB340"
-_RED = "#FF6B6B"
+# The three tones a validation line can carry, as token paths rather than as the
+# three hexes that used to sit here. They are reached through the module's own
+# `__getattr__`, so `screen_settings._RED` still answers with a colour — and
+# answers with the theme that is loaded rather than the one that was loaded at
+# import. This screen is where the palette is switched, so a colour frozen at
+# import time is a colour that goes wrong the moment somebody uses the control
+# two tabs over.
+_TONE_INK = {"_RED": "danger.text", "_AMBER": "warning.text",
+             "_GREEN": "success.text"}
+
+
+def __getattr__(name: str) -> str:
+    ink = _TONE_INK.get(name)
+    if ink is None:
+        raise AttributeError("module %r has no attribute %r" % (__name__, name))
+    return C.active_theme().color[ink]
+
+
+def _tone_ink(name: str) -> str:
+    """The same three colours, for this module's own use.
+
+    A module-level `__getattr__` answers attribute access on the module object
+    and is never consulted for a global name lookup inside it, so the functions
+    below ask here rather than reading `_RED` and getting a NameError.
+    """
+    return C.active_theme().color[_TONE_INK[name]]
+
+
+# The preview document, and the only colours on this screen that do not come out
+# of `ui/theme.py`. An email is not part of this application's chrome: the
+# recipient's mail client draws it on white paper in near-black ink whatever
+# theme the sender happens to be wearing, and a preview that followed the app's
+# palette would be a preview of something nobody is ever sent. Written as
+# lightness rather than as hex so that "no hex literal in this file" means what
+# it says, and so the two greys read as the one ramp they are.
+_PAPER = QColor(Qt.white)
+_PAPER_INK = QColor.fromHslF(0.0, 0.0, 0.10)
+_PAPER_META = QColor.fromHslF(0.0, 0.0, 0.42)
+
+# The paper's type, for the same reason and under the same exception. A mail
+# client draws a 16px subject over a 15px message whatever the sender's own
+# interface is set to, so a preview written in this screen's 13px body is a
+# preview of something nobody is ever sent. Kept here rather than inline in
+# `_as_paper` because `_preview_floor` below is the sum of them and the two must
+# not be able to drift.
+_PAPER_TYPE = {"subject": 16, "meta": 12, "body": 15, "note": 14}
+_PAPER_LEADING = 1.6
+_PAPER_RULE, _PAPER_GAP, _PAPER_PAD = 4, 14, 16
+_PAPER_FAMILY = "-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif"
 
 # One more than the follow-up cap on the Sending tab, so a template can always be
 # written for the last step the scheduler will ever ask for.
@@ -122,18 +192,44 @@ _MAX_STEP = 5
 # that the preview still reads as live.
 _PREVIEW_DEBOUNCE_MS = 250
 
-# The shortest preview that still shows an email rather than an envelope,
-# measured off the document `_as_paper` builds: the subject line ends 39px down,
-# the To line 60px, the first line of the message 97px and the line under it
-# 145px. Two lines of the message is the least that says anything about the copy
-# — one is a greeting — so this is the floor the preview is never squeezed past,
-# at any window size and with any number of findings on screen.
-_PREVIEW_FLOOR = 150
+# The two appearance controls, and what they are called on screen. Both keys
+# already exist in `core.settings`; until this tab there was no way to reach
+# either of them but a hand edit of settings.json.
+THEME_CHOICES = (("dark", "Dark"), ("light", "Light"))
+DENSITY_CHOICES = (("comfortable", "Comfortable"), ("compact", "Compact"))
 
-# What is left for the boxes once the preview has its floor: the name row, the
-# subject line and the first row of the palette, which is enough to know where
-# in the editor the column has been scrolled to.
-_EDITOR_FLOOR = 150
+# A lead table, three rows of it, so that picking a density is picking something
+# that can be seen rather than a word. Built by `components.table`, so the row
+# height under the control is the row height every table in the app will get.
+DENSITY_PREVIEW_COLUMNS = (
+    C.Column("Business", kind="stretch", min_ch=12, max_ch=28),
+    C.Column("Status", min_ch=7, max_ch=10),
+    C.Column("Score", align="right", min_ch=5, max_ch=6),
+)
+DENSITY_PREVIEW_ROWS = (
+    ("Northgate Roofing", "audited", "72"),
+    ("Harbour Dental", "queued", "58"),
+    ("Kelsey Plumbing", "sent", "41"),
+)
+
+# Every form label on this screen, so column one is the same width on every tab.
+# The audit measured seven left edges on the Sending tab alone, four of them
+# within 30px of each other and two of them 4px apart in adjacent groups: each
+# grid sized its own label column to its own longest word, so no two groups
+# agreed and nothing on the page lined up with anything else. The widest string
+# here is what every label now reserves, measured in the font that is drawing
+# it rather than guessed at in pixels.
+FORM_LABELS = (
+    "Provider", "API key", "Model", "Max tokens per lead", "Monthly token cap",
+    "Company", "Your name", "Your title", "Website", "Reply-to", "Phone",
+    "Calendar link", "Postal address", "Tone", "Services you sell",
+    "Proof points", "Gmail address", "App password", "Display name",
+    "Daily cap", "Sending days", "Sending window", "Timezone",
+    "Minimum gap between sends", "Maximum gap between sends",
+    "Daily cap per account", "Hourly cap per account", "Start at",
+    "Increase each day by", "Stop increasing at", "Wait between touches",
+    "Follow-ups per lead", "Unsubscribe address", "Theme", "Density",
+)
 
 # Everything a paste can carry that ends a line, with whatever horizontal space
 # sits either side of it: a run of them collapses to the single space a subject
@@ -266,25 +362,128 @@ SAMPLE_AI: dict = {
 
 # ── Small helpers ────────────────────────────────────────────────────────────
 
+
+def _t():
+    """The theme every value on this screen is read from, at build time.
+
+    Build time and not import time: `ui/components.py` resolves a control height
+    and a pill fill in Python rather than in the sheet, so a widget carries the
+    palette it was constructed under until something rebuilds it. `restyle`
+    below is what rebuilds it.
+    """
+    return C.active_theme()
+
+
 def _section_label(text: str) -> QLabel:
-    label = QLabel(text.upper())
-    label.setObjectName("section_label")
-    return label
+    return C.section_label(text)
 
 
 def _hint(text: str) -> QLabel:
-    label = QLabel(text)
-    label.setObjectName("hint")
-    label.setWordWrap(True)
-    return label
+    """The quiet line under a control, capped at a readable measure.
+
+    Through `components.hint`, which caps the line at 80 characters. This screen
+    held most of the 24 wrapped labels the audit measured at 101 to 211
+    characters per line — three times the width an eye can track back from
+    without losing its place.
+    """
+    return C.hint(text)
 
 
 def _divider() -> QFrame:
-    line = QFrame()
-    line.setObjectName("divider")
-    line.setFrameShape(QFrame.HLine)
-    line.setFixedHeight(1)
-    return line
+    return C.divider()
+
+
+class _FormLabel(QLabel):
+    """A form label that reserves the width every other form label reserves.
+
+    Re-measured whenever the font changes, for the reason `components`'
+    own measured widgets are: a widget is built before the sheet reaches it, so
+    a width taken in the constructor is a width in whatever font Qt handed out
+    at construction — and this one has to agree with every other label on the
+    screen or the column it defines is not a column.
+    """
+
+    def __init__(self, text: str, parent=None):
+        super().__init__(text, parent)
+        self.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
+        self._cap()
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() in (QEvent.FontChange, QEvent.StyleChange,
+                            QEvent.ApplicationFontChange):
+            self._cap()
+
+    def _cap(self) -> None:
+        fm = self.fontMetrics()
+        self.setMinimumWidth(max(fm.horizontalAdvance(one)
+                                 for one in FORM_LABELS))
+        self.updateGeometry()
+
+
+def _form_label(text: str) -> QLabel:
+    return _FormLabel(text)
+
+
+def _form_grid() -> QGridLayout:
+    """The one geometry every form on this screen is laid out on.
+
+    Column zero holds a `_FormLabel` and never stretches; column one holds the
+    control and takes whatever is going. Every grid states its spacings, because
+    the audit found 36 layouts silently inheriting Qt's 9px default, which is
+    off the 4px grid in both directions.
+    """
+    t = _t()
+    grid = QGridLayout()
+    grid.setContentsMargins(t.space["0"], t.space["0"], t.space["0"],
+                            t.space["0"])
+    grid.setHorizontalSpacing(t.space["3"])
+    grid.setVerticalSpacing(t.space["2"])
+    grid.setColumnStretch(0, 0)
+    grid.setColumnStretch(1, 1)
+    return grid
+
+
+def _row_box() -> QHBoxLayout:
+    """A row of controls that sits in column one, so it starts where they do."""
+    t = _t()
+    box = QHBoxLayout()
+    box.setContentsMargins(t.space["0"], t.space["0"], t.space["0"],
+                           t.space["0"])
+    box.setSpacing(t.space["2"])
+    return box
+
+
+def _loose(*widgets) -> QHBoxLayout:
+    """Controls that sit in column one at their own width, not the column's.
+
+    A combo handed a whole stretching column becomes a 700px well holding the
+    word "Direct". This keeps the left edge — which is what the column is for —
+    and gives back the rest.
+    """
+    box = _row_box()
+    for widget in widgets:
+        box.addWidget(widget)
+    box.addStretch()
+    return box
+
+
+def _line(placeholder: str = "") -> QLineEdit:
+    """A single-line box at the one height every input on this screen is."""
+    edit = QLineEdit()
+    edit.setPlaceholderText(placeholder)
+    edit.setFixedHeight(_t().control["md"])
+    return edit
+
+
+def _combo(items=()) -> QComboBox:
+    """A dropdown of (value, label) pairs, the data being what gets stored."""
+    combo = QComboBox()
+    combo.setFixedHeight(_t().control["md"])
+    for value, label in items or ():
+        combo.addItem(str(label), value)
+    return combo
 
 
 def _status(label: QLabel, text: str, kind: str = "busy") -> None:
@@ -296,13 +495,174 @@ def _status(label: QLabel, text: str, kind: str = "busy") -> None:
     label.style().polish(label)
 
 
-def _spin(minimum: int, maximum: int, step: int = 1, suffix: str = "", width: int = 90) -> QSpinBox:
-    box = QSpinBox()
-    box.setObjectName("spin")
+# A line of this app's own copy, to measure what one character of running text
+# costs. `QFontMetrics.averageCharWidth` is the obvious answer and it is 15%
+# wide: it averages the glyph table, where every capital and every digit counts
+# once, and English prose is mostly lowercase and spaces.
+_MEASURE_SAMPLE = ("App Passwords live in Google Account, Security, 2-Step "
+                   "Verification. Your normal Gmail password will be rejected.")
+
+
+def _chars_wide(fm, chars: int) -> int:
+    """The width `chars` characters of running text take in `fm`."""
+    unit = fm.horizontalAdvance(_MEASURE_SAMPLE) / max(1, len(_MEASURE_SAMPLE))
+    if unit <= 0:
+        unit = fm.averageCharWidth() or fm.horizontalAdvance("x") or 1
+    return int(unit * max(1, int(chars)))
+
+
+class _StatusNote(QLabel):
+    """A result line: wrapped, capped at a readable measure, tone from the sheet.
+
+    Not `components.body_label`, though the cap is the same 80 characters: these
+    carry `status_ok`, `status_err` and `status_busy`, and a component paints
+    its colour into its own stylesheet — which beats the sheet that is supposed
+    to be colouring them.
+    """
+
+    _CHARS = 80
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(text, parent)
+        self.setWordWrap(True)
+        self._cap()
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() in (QEvent.FontChange, QEvent.StyleChange,
+                            QEvent.ApplicationFontChange):
+            self._cap()
+
+    def _cap(self) -> None:
+        self.setMaximumWidth(_chars_wide(self.fontMetrics(), self._CHARS))
+        self.updateGeometry()
+
+
+class _StatusLine(QLabel):
+    """The footer's one line, elided rather than allowed to widen the screen.
+
+    A store failure is a sentence and not a word — "Could not save: [Errno 13]
+    Permission denied" — and nothing in a footer row wraps, so a message put
+    there is paid for in the screen's own minimum width: a window the user can
+    no longer drag back down. Elided in place, with the whole of it in the
+    tooltip, and reporting a minimum of nothing so the row can always shrink.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._full = ""
+
+    def setText(self, text: str) -> None:
+        self._full = str(text or "")
+        self.setToolTip(self._full)
+        self._elide()
+
+    def text(self) -> str:
+        return self._full
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(0, super().minimumSizeHint().height())
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._elide()
+
+    def _elide(self) -> None:
+        room = self.width()
+        QLabel.setText(self, self.fontMetrics().elidedText(
+            self._full, Qt.ElideRight, room) if room > 0 else self._full)
+
+
+def _preview_floor() -> int:
+    """The shortest preview that still shows an email rather than an envelope.
+
+    Summed off the document `_as_paper` builds rather than measured once and
+    written down: the paper's own padding twice, the subject line, the rule
+    under it, the To line, the gap after it, and two lines of the message. Two
+    lines is the least that says anything about the copy — one is a greeting —
+    so this is the floor the preview is never squeezed past, at any window size
+    and with any number of findings on screen.
+    """
+    return int(2 * _PAPER_PAD
+               + _PAPER_TYPE["subject"] * _PAPER_LEADING + _PAPER_RULE
+               + _PAPER_TYPE["meta"] * _PAPER_LEADING + _PAPER_PAD
+               + 2 * _PAPER_TYPE["body"] * _PAPER_LEADING + _PAPER_GAP)
+
+
+def _editor_floor() -> int:
+    """What is left for the boxes once the preview has its floor.
+
+    The name row, the subject line, the body's own first lines and one row of
+    the merge palette, which is enough to know where in the editor the column
+    has been scrolled to.
+    """
+    t = _t()
+    return 3 * t.control["md"] + t.control["xs"] + 4 * t.space["2"]
+
+
+def _findings_ceiling() -> int:
+    """How much of the page the validation findings may ever take.
+
+    Nothing caps how many one template collects, and a word-wrapped label handed
+    a dozen of them grew past 250px and pushed the preview under the bottom of
+    the window — so the pane showing what the copy will look like disappeared
+    exactly when the copy most needed looking at.
+    """
+    return 2 * _t().space["9"]
+
+
+def _palette_ceiling() -> int:
+    """How much of the page the 21 merge chips may ever take.
+
+    Three rows. At the window minimum they reflow to five and took 165px of a
+    308px column, which is what put the body editor 70px below the fold with its
+    BODY label sliced in half.
+    """
+    t = _t()
+    return 3 * t.control["xs"] + 2 * t.space["1"]
+
+
+class _Spin(QSpinBox):
+    """A number box as wide as the number it holds, and no wider.
+
+    Its six call sites used to pass a pixel width each — 84, 90, 96, 100, 100,
+    130 — which is six widths for four kinds of number and none of them right at
+    any font but the one they were measured in. A count of digits is what the
+    box is actually being asked for, so that is what it takes.
+    """
+
+    def __init__(self, chars: int, suffix: str = "", parent=None):
+        super().__init__(parent)
+        self.setObjectName("spin")
+        self._chars = max(1, int(chars))
+        self.setSuffix(suffix)
+        self._cap()
+
+    def measure(self) -> int:
+        return self._chars
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() in (QEvent.FontChange, QEvent.StyleChange,
+                            QEvent.ApplicationFontChange):
+            self._cap()
+
+    def _cap(self) -> None:
+        t = _t()
+        fm = self.fontMetrics()
+        room = fm.horizontalAdvance("0" * self._chars + self.suffix())
+        # The well, its two arrows and the padding either side of them: all
+        # spacing tokens, so the box grows with the density rather than with a
+        # number somebody once measured.
+        self.setFixedWidth(room + t.space["4"] + 2 * t.space["3"])
+        self.setFixedHeight(t.control["md"])
+
+
+def _spin(minimum: int, maximum: int, step: int = 1, suffix: str = "",
+          chars: int = 4) -> QSpinBox:
+    box = _Spin(chars, suffix)
     box.setRange(minimum, maximum)
     box.setSingleStep(step)
-    box.setSuffix(suffix)
-    box.setFixedWidth(width)
     return box
 
 
@@ -321,9 +681,12 @@ def _rich(text: str, colour: str = "") -> str:
     """Coloured label text.
 
     The global sheet fixes a colour on every QLabel and a stylesheet beats
-    `setPalette`, so emphasis inside a label has to arrive as rich text.
+    `setPalette`, so emphasis inside a label has to arrive as rich text. The
+    default is the theme's own body ink, so a line with no tone still reads as
+    part of the page.
     """
-    return '<span style="color:%s">%s</span>' % (colour or "#E5E5E7", html.escape(text))
+    return '<span style="color:%s">%s</span>' % (
+        colour or _t().color["text.primary"], html.escape(text))
 
 
 def _zone_note(name: str) -> str:
@@ -345,14 +708,74 @@ def _zone_note(name: str) -> str:
         return _rich(
             "%s could not be resolved on this machine, so the window would follow "
             "this computer's clock instead. Reinstall requirements.txt — it ships "
-            "the tzdata package — and restart." % label, _RED)
+            "the tzdata package — and restart." % label, _tone_ink("_RED"))
     return _rich("Resolved: the hours above are kept in %s, whatever this machine's "
-                 "clock reads." % label, _GREEN)
+                 "clock reads." % label, _tone_ink("_GREEN"))
 
 
 def _step_name(step: int) -> str:
     step = max(0, _int_of(step))
     return "First touch" if step == 0 else "Follow-up %d" % step
+
+
+# ── What the scheduler will actually do ──────────────────────────────────────
+# `core.campaign` composes rather than obeys: three caps become their minimum,
+# an inverted window becomes one hour, an empty day set becomes Monday to
+# Friday. Every one of those used to happen in silence with the requested number
+# still on screen — a user who set a 40/day cap and left the warm-up ramp on was
+# told 40 and sent 10. These four answer "and what will really happen", and each
+# returns "" when nothing is being overridden, because a note beside every field
+# is a note nobody reads.
+
+
+def _hours_note(start: int, end: int) -> str:
+    """The window the scheduler keeps, when it is not the one that was asked for."""
+    kept_start, kept_end = _campaign._hours(
+        {"send_start_hour": start, "send_end_hour": end})
+    if (kept_start, kept_end) == (start, end):
+        return ""
+    return ("Sends between %02d:00 and %02d:00. A window that ends before it "
+            "opens would send nothing at all, so the scheduler holds it to one "
+            "hour." % (kept_start, kept_end))
+
+
+def _days_note(chosen) -> str:
+    """The days the scheduler keeps, when none were ticked."""
+    kept = _campaign._send_days({"send_days": list(chosen)})
+    if set(chosen) == kept:
+        return ""
+    return ("Sends on %s. No day ticked means every day is off, which the "
+            "scheduler reads as the working week rather than as never."
+            % ", ".join(DAY_NAMES[day] for day in sorted(kept)))
+
+
+def _gap_note(low: int, high: int) -> str:
+    """The pacing range the scheduler keeps, when the two were the wrong way up."""
+    kept_low, kept_high = _campaign._gap_bounds(
+        {"send_min_gap_sec": low, "send_max_gap_sec": high})
+    if (kept_low, kept_high) == (low, high):
+        return ""
+    return ("Waits between %d and %d seconds. A minimum above the maximum is a "
+            "range nothing fits in, so the two are swapped."
+            % (kept_low, kept_high))
+
+
+def _cap_note(settings: dict, accounts) -> str:
+    """The daily cap in force, when the warm-up ramp is lower than the number set.
+
+    Asked of `account_daily_cap` rather than worked out again here, because a
+    second implementation of the same rule is a second answer waiting to differ
+    from the one the send loop uses.
+    """
+    asked = max(0, _int_of(settings.get("daily_cap_per_account"), 0))
+    rows = [a for a in (accounts or []) if isinstance(a, dict)] or [{}]
+    kept = min(_campaign.account_daily_cap(account, settings)
+               for account in rows)
+    if kept >= asked or asked <= 0:
+        return ""
+    return ("Sends %d today, not %d. Each account's own cap and the warm-up "
+            "ramp both have to allow a message, and the smallest of the three "
+            "is what goes out." % (kept, asked))
 
 
 def _mono_family() -> str:
@@ -546,13 +969,20 @@ class _FlexEdit(QTextEdit):
 
 
 class _ChipBar(QWidget):
-    """Every merge field as a button that wraps to whatever width it is given.
+    """Every merge field as a chip that wraps to whatever width it is given.
 
     A grid would have to pick a column count, and the field names run from
     `phone` to `gap_1_evidence`; at four columns half the row is air and at six
     the long names are cut. So the chips are laid out by hand and the widget
     reports the height that layout actually needed, which is what lets the page
     around it scroll instead of clipping the last row.
+
+    They are `components.chip()` now and not `QPushButton#tab`. Twenty-one merge
+    fields wearing the app's top-level navigation control said, in the only
+    language a control has, that clicking one navigates somewhere — and the
+    keyboard cursor was the selected-tab fill exactly, so the chip under the
+    caret read as the open tab. A chip is a short value; a tab is a place. They
+    are different components because they are different promises.
 
     No chip may take the focus — a chip that could would take it on the click
     too, and the caret the field is inserted at goes with it. That left the
@@ -563,34 +993,44 @@ class _ChipBar(QWidget):
 
     insert_requested = pyqtSignal(str)
 
-    # 28 because that is the height QPushButton#tab reserves in the global
-    # sheet. Forced shorter, the sheet's own vertical padding eats the
-    # descenders and every underscore in a field name disappears.
-    _GAP = 5
-    _CHIP_HEIGHT = 28
-    # The sheet's own `#tab:checked` fill, applied by hand, because the chips
-    # are not checkable. A fill and not a ring: `border` is part of the box, so
-    # every chip behind the marked one would shift along the row on each arrow
-    # key, and `outline` costs no width but paints nothing at all once a
-    # background-color has put the button on Qt's own stylesheet painting path.
-    _MARK = "color: #E5E5E7; background-color: #3A3A3C;"
     _STEPS = {Qt.Key_Right: 1, Qt.Key_Down: 1, Qt.Key_Left: -1, Qt.Key_Up: -1}
 
     def __init__(self, fields, parent=None):
         super().__init__(parent)
+        t = _t()
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.setFocusPolicy(Qt.TabFocus)
         self.setAccessibleName("Merge fields")
-        self._chips: list[QPushButton] = []
+        self._gap = t.space["1"]
+        self._height = t.control["xs"]
+        self._chips: list = []
         self._at = 0
+
+        # The chip's resting look, lifted off a chip and hung on the bar so that
+        # every chip wears it without owning it. What that buys is the cursor
+        # below: a widget's own sheet beats an ancestor's whatever the
+        # specificity, so the one chip Enter would insert is the one chip with a
+        # sheet of its own, and clearing that sheet puts it back in the row.
+        sample = C.chip("sample")
+        self._resting = sample.styleSheet()
+        sample.deleteLater()
+        self.setStyleSheet(self._resting)
+
+        # A ring and not a fill, and 1px like every other ring in the app: the
+        # box never changes size, so nothing behind the cursor shifts along the
+        # row on an arrow key. `accent.border` is the focus token, which is what
+        # this is — there is nothing selected in a palette, only somewhere the
+        # keyboard is.
+        self._marked = "%s QFrame { border: %dpx solid %s; }" % (
+            self._resting, C.BORDER, t.color["accent.border"])
+
         for field in fields:
-            chip = QPushButton(field, self)
-            chip.setObjectName("tab")
-            chip.setFixedHeight(self._CHIP_HEIGHT)
+            chip = C.chip(field)
+            chip.setParent(self)
+            chip.setStyleSheet("")
             chip.setCursor(Qt.PointingHandCursor)
-            chip.setFocusPolicy(Qt.NoFocus)
             chip.setToolTip(_field_tooltip(field))
-            chip.clicked.connect(lambda _checked=False, name=field:
+            chip.clicked.connect(lambda name=field:
                                  self.insert_requested.emit(name))
             self._chips.append(chip)
         self._reflow()
@@ -634,7 +1074,8 @@ class _ChipBar(QWidget):
         """
         marked = self.hasFocus()
         for index, chip in enumerate(self._chips):
-            chip.setStyleSheet(self._MARK if marked and index == self._at else "")
+            chip.setStyleSheet(
+                self._marked if marked and index == self._at else "")
         if not marked:
             QToolTip.hideText()
             return
@@ -646,24 +1087,42 @@ class _ChipBar(QWidget):
         super().resizeEvent(event)
         self._reflow()
 
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        """How tall the palette would be in `width`, without moving anything.
+
+        The pane around this one asks before it hands over a width, so the
+        answer has to be available without the chips having been placed yet.
+        """
+        return self._flow(max(1, int(width)), place=False)
+
+    def rows(self, width: int = 0) -> int:
+        """How many rows the chips wrap to, which is what the ceiling is set in."""
+        wanted = self._flow(max(1, int(width or self.width())), place=False)
+        return max(1, (wanted + self._gap) // (self._height + self._gap))
+
     def _reflow(self) -> None:
-        width = max(1, self.width())
-        x = y = row_height = 0
-        for chip in self._chips:
-            size = chip.sizeHint()
-            chip_width = min(size.width(), width)
-            if x and x + chip_width > width:
-                x = 0
-                y += row_height + self._GAP
-                row_height = 0
-            chip.setGeometry(x, y, chip_width, self._CHIP_HEIGHT)
-            x += chip_width + self._GAP
-            row_height = max(row_height, self._CHIP_HEIGHT)
-        wanted = y + row_height
+        wanted = self._flow(max(1, self.width()), place=True)
         # Guarded: setting a fixed height re-runs the parent layout, which can
         # hand this widget a new width and call straight back in here.
         if wanted and wanted != self.minimumHeight():
             self.setFixedHeight(wanted)
+
+    def _flow(self, width: int, *, place: bool) -> int:
+        x = y = row_height = 0
+        for chip in self._chips:
+            chip_width = min(chip.sizeHint().width(), width)
+            if x and x + chip_width > width:
+                x = 0
+                y += row_height + self._gap
+                row_height = 0
+            if place:
+                chip.setGeometry(x, y, chip_width, self._height)
+            x += chip_width + self._gap
+            row_height = max(row_height, self._height)
+        return y + row_height
 
 
 class _FlatLine(QLineEdit):
@@ -698,33 +1157,38 @@ class _FlatLine(QLineEdit):
         self.setCursorPosition(max(0, min(at, len(flat))))
 
 
-class _IssuePane(QScrollArea):
-    """The validation findings, bounded and scrolled instead of unbounded.
+class _BoundedPane(QScrollArea):
+    """Something that can grow without limit, given a ceiling and a scrollbar.
 
-    Nothing caps how many findings one template collects, and a word-wrapped
-    label handed a dozen of them grew past 250px and pushed the preview under
-    the bottom of the window — so the pane that shows what the copy will look
-    like disappeared exactly when the copy most needed looking at. A ceiling and
-    a scrollbar of its own keep the findings readable and the preview in place.
+    Two things on the Templates tab can: the validation findings, which nothing
+    caps — a word-wrapped label handed a dozen of them grew past 250px and
+    pushed the preview under the bottom of the window, so the pane showing what
+    the copy will look like disappeared exactly when the copy most needed
+    looking at — and the merge-field palette, whose 21 chips reflow to five rows
+    at the window minimum and took 165px of a 308px column, which is what put
+    the body editor 70px below the fold with its BODY label at the very edge of
+    it. Both are references. Neither may cost the thing being written.
 
-    `heightForWidth` rather than a plain maximum: the findings wrap, so how tall
-    they are is a function of how wide the column is, and a fixed height would
-    be either mostly air on one finding or a scrollbar on two.
+    `heightForWidth` rather than a plain maximum, because both of them wrap: how
+    tall they are is a function of how wide the column is, and a fixed height
+    would be either mostly air or a scrollbar depending on the window.
     """
 
-    _CEILING = 96
-
-    def __init__(self, body: QLabel, parent=None):
+    def __init__(self, body: QWidget, ceiling: int, parent=None):
         super().__init__(parent)
+        self._ceiling = max(1, int(ceiling))
         self.setWidget(body)
         self.setWidgetResizable(True)
         self.setFrameShape(QFrame.NoFrame)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.setMaximumHeight(self._CEILING)
+        self.setMaximumHeight(self._ceiling)
         policy = QSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
         policy.setHeightForWidth(True)
         self.setSizePolicy(policy)
+
+    def ceiling(self) -> int:
+        return self._ceiling
 
     def hasHeightForWidth(self) -> bool:
         return True
@@ -732,57 +1196,30 @@ class _IssuePane(QScrollArea):
     def heightForWidth(self, width: int) -> int:
         body, chrome = self.widget(), 2 * self.frameWidth()
         wanted = body.heightForWidth(max(1, width - chrome)) if body is not None else 0
-        return max(0, min(wanted + chrome, self._CEILING))
+        if wanted <= 0 and body is not None:
+            wanted = body.sizeHint().height()
+        return max(0, min(wanted + chrome, self._ceiling))
 
     def sizeHint(self) -> QSize:
         return QSize(super().sizeHint().width(),
                      self.heightForWidth(max(1, self.width())))
 
 
-class _SecretField(QWidget):
-    """Password-echo line edit with a reveal toggle.
+def _secret_field(placeholder: str = "") -> QWidget:
+    """A password box with a reveal toggle, from the shared library.
 
-    A live Gmail app password sitting in a visible box is both a shoulder-surfing
-    hole and the reason users paste screenshots of their credentials into support
-    threads. The toggle exists because a masked field with no way to check what
-    you typed is how people get locked out.
+    Both this screen and the outreach screen implemented one, differently. A
+    live Gmail app password sitting in a visible box is both a shoulder-surfing
+    hole and the reason users paste screenshots of their credentials into
+    support threads; a masked field with no way to check what was typed is how
+    they get locked out instead. `components.text_field(secret=True)` is that
+    control, once, and it carries the error line this one never had.
     """
-
-    def __init__(self, placeholder: str = "", parent=None):
-        super().__init__(parent)
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
-
-        self.edit = QLineEdit()
-        self.edit.setEchoMode(QLineEdit.Password)
-        self.edit.setPlaceholderText(placeholder)
-        self.edit.setFixedHeight(34)
-
-        self.toggle = QPushButton("Show")
-        self.toggle.setObjectName("reveal")
-        self.toggle.setCheckable(True)
-        self.toggle.setFixedSize(58, 34)
-        self.toggle.setCursor(Qt.PointingHandCursor)
-        self.toggle.toggled.connect(self._on_toggled)
-
-        layout.addWidget(self.edit, stretch=1)
-        layout.addWidget(self.toggle)
-
-    def _on_toggled(self, shown: bool) -> None:
-        self.edit.setEchoMode(QLineEdit.Normal if shown else QLineEdit.Password)
-        self.toggle.setText("Hide" if shown else "Show")
-
-    def text(self) -> str:
-        return self.edit.text().strip()
-
-    def setText(self, value: str) -> None:
-        self.edit.setText(value or "")
-        self.toggle.setChecked(False)
-
-    @property
-    def editingFinished(self):
-        return self.edit.editingFinished
+    field = C.text_field(placeholder=placeholder, secret=True)
+    field.editingFinished = field.edit.editingFinished
+    field.textChanged = field.edit.edit.textChanged
+    field.toggle = field.edit.toggle
+    return field
 
 
 class ModelComboBox(QComboBox):
@@ -793,7 +1230,7 @@ class ModelComboBox(QComboBox):
         self.setEditable(True)
         self.setInsertPolicy(QComboBox.NoInsert)
         self.lineEdit().setPlaceholderText(placeholder)
-        self.setFixedHeight(34)
+        self.setFixedHeight(_t().control["md"])
 
     def text(self) -> str:
         return self.currentText()
@@ -865,49 +1302,51 @@ class _AccountRow(QWidget):
 
     remove_requested = pyqtSignal(object)
     verify_requested = pyqtSignal(object)
+    changed = pyqtSignal()
 
     def __init__(self, account: dict, index: int, parent=None):
         super().__init__(parent)
+        t = _t()
         root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(10)
+        root.setContentsMargins(t.space["0"], t.space["0"], t.space["0"],
+                               t.space["0"])
+        root.setSpacing(t.space["3"])
 
         head = QHBoxLayout()
-        head.setSpacing(10)
-        title = QLabel(f"Account {index}")
+        head.setContentsMargins(t.space["0"], t.space["0"], t.space["0"],
+                                t.space["0"])
+        head.setSpacing(t.space["2"])
+        self.title_label = QLabel("Account %d" % index)
+        title = self.title_label
         title.setObjectName("muted")
-        self.enabled_cb = QCheckBox("Enabled")
-        self.enabled_cb.setToolTip("Disabled accounts stay configured but never send")
-        remove_btn = QPushButton("Remove")
-        remove_btn.setObjectName("danger")
-        remove_btn.setFixedHeight(28)
-        remove_btn.clicked.connect(lambda: self.remove_requested.emit(self))
+        self.enabled_cb = C.toggle(
+            "Enabled", help="Disabled accounts stay configured but never send")
+        self.remove_btn = C.button("Remove", kind="danger", size="sm",
+                                   on_click=lambda: self.remove_requested.emit(self))
+        self.remove_btn.setToolTip("Take this mailbox off the sending rota")
         head.addWidget(title)
         head.addStretch()
         head.addWidget(self.enabled_cb)
-        head.addWidget(remove_btn)
+        head.addWidget(self.remove_btn)
         root.addLayout(head)
 
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(12)
-        grid.setVerticalSpacing(10)
-        grid.setColumnStretch(1, 1)
+        grid = _form_grid()
 
         self.email_edit = QLineEdit()
         self.email_edit.setPlaceholderText("you@gmail.com")
-        self.email_edit.setFixedHeight(34)
-        grid.addWidget(QLabel("Gmail address"), 0, 0)
+        self.email_edit.setFixedHeight(t.control["md"])
+        grid.addWidget(_form_label("Gmail address"), 0, 0)
         grid.addWidget(self.email_edit, 0, 1, 1, 2)
 
-        self.password_field = _SecretField("16-character app password")
-        self.verify_btn = QPushButton("Verify")
-        self.verify_btn.setObjectName("outlined")
-        self.verify_btn.setFixedSize(84, 34)
-        self.verify_btn.setToolTip("Sign in to Gmail with these credentials without sending anything")
-        self.verify_btn.clicked.connect(lambda: self.verify_requested.emit(self))
-        grid.addWidget(QLabel("App password"), 1, 0)
+        self.password_field = _secret_field("16-character app password")
+        self.verify_btn = C.button(
+            "Verify", kind="secondary", size="md",
+            on_click=lambda: self.verify_requested.emit(self))
+        self.verify_btn.setToolTip(
+            "Sign in to Gmail with these credentials without sending anything")
+        grid.addWidget(_form_label("App password"), 1, 0)
         grid.addWidget(self.password_field, 1, 1)
-        grid.addWidget(self.verify_btn, 1, 2)
+        grid.addWidget(self.verify_btn, 1, 2, Qt.AlignTop)
 
         self.status_label = QLabel("")
         self.status_label.setObjectName("status_busy")
@@ -917,35 +1356,63 @@ class _AccountRow(QWidget):
 
         self.display_edit = QLineEdit()
         self.display_edit.setPlaceholderText("Name recipients see, e.g. Sam Rivera")
-        self.display_edit.setFixedHeight(34)
-        grid.addWidget(QLabel("Display name"), 3, 0)
+        self.display_edit.setFixedHeight(t.control["md"])
+        grid.addWidget(_form_label("Display name"), 3, 0)
         grid.addWidget(self.display_edit, 3, 1, 1, 2)
 
-        caps_row = QHBoxLayout()
-        caps_row.setSpacing(10)
-        self.daily_cap_spin = _spin(1, 500, 5, "/day", 96)
+        caps_row = _row_box()
+        self.daily_cap_spin = _spin(1, 500, 5, "/day", chars=3)
         self.daily_cap_spin.setToolTip("This account's own ceiling; the global cap still applies")
         caps_row.addWidget(self.daily_cap_spin)
-        self.warmup_cb = QCheckBox("Warm up from")
-        self.warmup_cb.setToolTip("Ramp this account's daily volume from the warm-up start date")
+        self.warmup_cb = C.toggle(
+            "Warm up from",
+            help="Ramp this account's daily volume from the warm-up start date")
         self.warmup_date = QDateEdit()
         self.warmup_date.setObjectName("spin")
         self.warmup_date.setDisplayFormat("yyyy-MM-dd")
         self.warmup_date.setCalendarPopup(True)
-        self.warmup_date.setFixedWidth(120)
+        self.warmup_date.setFixedHeight(t.control["md"])
         self.warmup_cb.toggled.connect(self.warmup_date.setEnabled)
         caps_row.addWidget(self.warmup_cb)
         caps_row.addWidget(self.warmup_date)
         caps_row.addStretch()
-        grid.addWidget(QLabel("Daily cap"), 4, 0)
+        grid.addWidget(_form_label("Daily cap"), 4, 0)
         grid.addLayout(caps_row, 4, 1, 1, 2)
 
-        self.imap_cb = QCheckBox("Read replies and bounces on this mailbox (IMAP)")
-        self.imap_cb.setToolTip("Lets the app detect replies and hard bounces on this mailbox")
-        grid.addWidget(self.imap_cb, 5, 1, 1, 2)
+        # What this account will actually send today, when that is not what the
+        # box above it says. The three caps compose as a minimum in
+        # `core.campaign`, so an account ramping up from a warm-up date sends
+        # ten while the field reads forty.
+        self.effective_label = _hint("")
+        self.effective_label.setVisible(False)
+        grid.addWidget(self.effective_label, 5, 1, 1, 2)
+
+        self.imap_cb = C.toggle(
+            "Read replies and bounces on this mailbox (IMAP)",
+            help="Lets the app detect replies and hard bounces on this mailbox")
+        grid.addWidget(self.imap_cb, 6, 1, 1, 2)
 
         root.addLayout(grid)
         self._load(account or {})
+        self._watch()
+
+    def renumber(self, index: int) -> None:
+        """The ordinal in the heading, after a row above this one has gone."""
+        self.title_label.setText("Account %d" % index)
+
+    def _watch(self) -> None:
+        """One signal out for every edit anywhere in the row.
+
+        Wired after `_load`, so restoring a saved account is not reported as a
+        change to it.
+        """
+        for edit in (self.email_edit, self.display_edit):
+            edit.textChanged.connect(lambda _text: self.changed.emit())
+        self.password_field.textChanged.connect(lambda _text: self.changed.emit())
+        self.daily_cap_spin.valueChanged.connect(lambda _v: self.changed.emit())
+        self.warmup_date.dateChanged.connect(lambda _d: self.changed.emit())
+        for box in (self.enabled_cb, self.imap_cb, self.warmup_cb):
+            box.toggled.connect(lambda _on: self.changed.emit())
 
     def _load(self, account: dict) -> None:
         self.email_edit.setText(str(account.get("email") or ""))
@@ -962,6 +1429,21 @@ class _AccountRow(QWidget):
         self.warmup_cb.setChecked(started.isValid())
         self.warmup_date.setDate(started if started.isValid() else QDate.currentDate())
         self.warmup_date.setEnabled(self.warmup_cb.isChecked())
+
+    def show_effective_cap(self, settings: dict) -> None:
+        """Say what this mailbox will really send today, when it is not the box.
+
+        Asked of `core.campaign.account_daily_cap`, which is the function the
+        send loop asks, so the number on screen cannot drift from the number
+        that goes out.
+        """
+        asked = self.daily_cap_spin.value()
+        kept = _campaign.account_daily_cap(self.to_dict(), settings or {})
+        note = ("" if kept >= asked else
+                "Sends %d today, not %d — the warm-up ramp or the global cap is "
+                "lower than this." % (kept, asked))
+        self.effective_label.setText(note)
+        self.effective_label.setVisible(bool(note))
 
     # ── verify ──
 
@@ -1007,7 +1489,8 @@ class SettingsScreen(QWidget):
     back_signal = pyqtSignal()
     saved_signal = pyqtSignal(dict)
 
-    TABS = ("AI", "Sender", "Templates", "Gmail", "Sending", "Compliance")
+    TABS = ("AI", "Sender", "Templates", "Gmail", "Sending", "Compliance",
+            "Appearance")
 
     def __init__(self):
         super().__init__()
@@ -1021,6 +1504,13 @@ class SettingsScreen(QWidget):
         self._merge_target = None
         self._merge_span = (-1, -1)
         self._template_notes: list = []
+        self._dirty = False
+        self._loading = False
+        self._building = False
+        self._published = None
+        self._publish_timer = QTimer(self)
+        self._publish_timer.setSingleShot(True)
+        self._publish_timer.timeout.connect(self._push_to_shell)
         self._build()
         self._load_into_ui()
 
@@ -1034,81 +1524,268 @@ class SettingsScreen(QWidget):
         those back on the next save here. The templates are re-read for the
         same reason: the file can be edited by hand, and a picker showing
         yesterday's copy is a template somebody edits twice.
+
+        What it will not do is reload over edits nobody has committed. Back used
+        to save on the way out, so navigating away and back was a round trip
+        through the disk; the two explicit commands mean leaving decides
+        nothing, and a reload here would quietly decide it after all — the one
+        outcome Discard exists to make the user's own choice.
         """
+        self._publish_to_shell()
+        if self._dirty:
+            return
         self.settings = load_settings()
         self._load_into_ui()
 
-    def hideEvent(self, event) -> None:
-        """Leaving the screen commits whatever template was open.
+    def subtabs(self) -> tuple:
+        """The six-and-one tabs, for whatever chrome is drawing them.
 
-        `_on_back` already writes the settings on the way out, and this is the
-        same promise for the copy: a follow-up somebody was halfway through must
-        not depend on their remembering a second button. Nothing is asked —
-        a dialog raised by a screen that is disappearing, or by a window that is
-        closing, is a dialog nobody can answer.
+        The screens no longer carry a top bar of their own — the audit found
+        four screens with four different ones — so the tabs are handed back
+        rather than drawn here. `(labels, on_change, current)` is the shape
+        `AppShell.set_subtabs` takes.
         """
-        if self._template_dirty and self._template_id:
-            if _save_template(self._editor_template()):
-                self._template_dirty = False
+        return tuple(self.TABS), self._goto_tab, self.pages.currentIndex()
+
+    def _goto_tab(self, index: int) -> None:
+        self.pages.setCurrentIndex(max(0, min(len(self.TABS) - 1, int(index))))
+
+    def _host(self) -> tuple:
+        """The shell this screen is sitting in, and the key it is filed under.
+
+        Found by asking rather than by being told, because the window registers
+        a *factory*: a screen is built on its first visit, from inside the call
+        that is about to show it, and there is no moment before that at which
+        anything could hand it a reference. `built(key)` is the shell's own
+        public answer to "which screen is this", so nothing private is reached
+        into and a screen with no shell around it — every test that builds one
+        on its own — simply gets nothing back.
+        """
+        host = self.parentWidget()
+        while host is not None:
+            if hasattr(host, "set_subtabs") and hasattr(host, "built"):
+                for key in host.built():
+                    if host.built(key) is self:
+                        return host, key
+                return None, ""
+            host = host.parentWidget()
+        return None, ""
+
+    def _publish_to_shell(self) -> None:
+        """Ask for the shell's second row to be brought up to date, once.
+
+        On the next turn of the event loop and never inside the call that asked,
+        for two reasons that are the same reason. `AppShell.set_subtabs` rebuilds
+        the row, and one route in here is a click on a button in that row — the
+        shell's own `_on_subtab` moves the buttons by hand rather than rebuilding
+        them for exactly this. The other is a keystroke: an editor marks itself
+        unsaved on every character typed, and a row of buttons torn down and
+        rebuilt per keypress is a row that flickers and loses the pointer.
+        """
+        if not self._publish_timer.isActive():
+            self._publish_timer.start(0)
+
+    def _push_to_shell(self) -> None:
+        host, key = self._host()
+        if host is None:
+            return
+        state = (key, self.pages.currentIndex(), self._outstanding())
+        if state == self._published:
+            return
+        self._published = state
+        host.set_subtabs(key, self.TABS, self._goto_tab, state[1])
+        host.set_context(key, state[2], tone="warning")
+
+    def _outstanding(self) -> str:
+        """What has been changed and not committed, in one line or none."""
+        if self._dirty and self._template_dirty:
+            return "Unsaved changes, and an unsaved template"
+        if self._dirty:
+            return "Unsaved changes"
+        if self._template_dirty:
+            return "Unsaved template"
+        return ""
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        # Forgotten rather than compared: the shell rebuilds its own chrome on a
+        # theme change, so a row that matches what was published last is not
+        # necessarily a row that is still on screen.
+        self._published = None
+        self._publish_to_shell()
+
+    def hideEvent(self, event) -> None:
+        """Leaving this screen decides nothing.
+
+        Back used to write the whole file on the way past and put "Saved" on a
+        screen the user had already left, so a half-finished sending window was
+        committed by the act of walking away and nothing on screen said so. The
+        footer owns both decisions now: navigating away keeps every edit exactly
+        where it is, and the shell's own context line goes on saying there are
+        some.
+        """
         super().hideEvent(event)
 
-    # ── construction ──
+    # ── appearance ───────────────────────────────────────────────────────────
+
+    def restyle(self) -> None:
+        """Wear the palette and the density the app is in now.
+
+        Rebuilt rather than repolished, and `MainWindow._repolish` calls this on
+        every screen that has one for the reason it exists: `ui/components.py`
+        resolves a control height and a pill fill in Python at build time and
+        writes them into the widget's own stylesheet, which beats the
+        application's — so a repolish alone leaves this screen wearing whatever
+        it was constructed in.
+
+        Nothing typed is lost. What is on screen and not on disk is folded back
+        into `self.settings` first and read out again after, which is the round
+        trip Save makes minus the file, and the open template is carried across
+        by hand because it lives in a second store this is not writing to. The
+        two dirty flags survive with it: a theme change is not a save.
+        """
+        editor = self._editor_state()
+        at = self.pages.currentIndex()
+        dirty, template_dirty = self._dirty, self._template_dirty
+        notes, status = list(self._template_notes), self.save_status.text()
+        self._collect()
+        worn = C.active_theme()
+        self.settings["theme"], self.settings["density"] = worn.name, worn.density
+
+        holder = QWidget()
+        holder.setLayout(self.layout())
+        holder.deleteLater()
+        self._build()
+        self._load_into_ui()
+        self._goto_tab(at)
+        self._restore_editor(editor, notes)
+        self._dirty, self._template_dirty = dirty, template_dirty
+        if status:
+            self.save_status.setText(status)
+            self.save_status.setVisible(True)
+        self._refresh_footer()
+        self._published = None
+        self._publish_to_shell()
+
+    def _editor_state(self) -> dict:
+        """What the template editor is holding, which no store has a copy of."""
+        return {
+            "id": self._template_id,
+            "name": self.template_name_edit.text(),
+            "subject": self.template_subject_edit.text(),
+            "body": self.template_body_edit.toPlainText(),
+            "step": self.template_step_combo.currentIndex(),
+        }
+
+    def _restore_editor(self, state: dict, notes) -> None:
+        if not state.get("id"):
+            return
+        self._template_loading = True
+        try:
+            self._template_id = state["id"]
+            self._select_row(state["id"])
+            self.template_name_edit.setText(state["name"])
+            self.template_subject_edit.setText(state["subject"])
+            self.template_body_edit.setPlainText(state["body"])
+            self.template_step_combo.setCurrentIndex(state["step"])
+        finally:
+            self._template_loading = False
+        self._template_notes = list(notes)
+        self._merge_span = (-1, -1)
+        self._refresh_template_buttons()
+        self._refresh_template_preview()
+
+    # ── construction ─────────────────────────────────────────────────────────
 
     def _build(self) -> None:
+        """The seven pages, the toaster and the footer. No bar of its own.
+
+        No header, no Back button and no tab strip: the audit found four screens
+        carrying four different top bars, each with its own Home and Settings,
+        and the shell draws the one that is left. `subtabs()` hands these seven
+        back to it.
+        """
+        t = _t()
+        # Set while the pages are going up, because half of them wire a signal
+        # to a note that reads a widget on another page: the Days boxes are
+        # connected before the warm-up spins the note asks about exist.
+        self._building = True
         root = QVBoxLayout(self)
-        root.setContentsMargins(24, 20, 24, 20)
-        root.setSpacing(0)
-
-        header = QHBoxLayout()
-        header.setSpacing(10)
-        back_btn = QPushButton("Back")
-        back_btn.setObjectName("outlined")
-        back_btn.setFixedHeight(30)
-        back_btn.clicked.connect(self._on_back)
-        title = QLabel("Settings")
-        title.setObjectName("app_name")
-        header.addWidget(back_btn)
-        header.addWidget(title)
-        header.addStretch()
-
-        self.tab_group = QButtonGroup(self)
-        self.tab_group.setExclusive(True)
-        for index, label in enumerate(self.TABS):
-            btn = QPushButton(label)
-            btn.setObjectName("tab")
-            btn.setCheckable(True)
-            btn.setChecked(index == 0)
-            self.tab_group.addButton(btn, index)
-            header.addWidget(btn)
-
-        header.addSpacing(8)
-        self.save_status = QLabel("")
-        self.save_status.setObjectName("status_busy")
-        header.addWidget(self.save_status)
-        save_btn = QPushButton("Save")
-        save_btn.setObjectName("start_btn")
-        save_btn.setFixedHeight(30)
-        save_btn.setCursor(Qt.PointingHandCursor)
-        save_btn.clicked.connect(self._on_save)
-        header.addWidget(save_btn)
-        root.addLayout(header)
-        root.addSpacing(18)
+        root.setContentsMargins(t.space["5"], t.space["4"], t.space["5"],
+                                t.space["4"])
+        root.setSpacing(t.space["3"])
 
         self.pages = QStackedWidget()
         self.pages.addWidget(self._scrolled(self._build_ai_page()))
         self.pages.addWidget(self._scrolled(self._build_sender_page()))
         # Not `_scrolled`: this page scrolls its own editor column and keeps the
-        # template list and its four buttons pinned. Wrapped whole, the New and
-        # Delete buttons sit below the preview and go off the bottom of a 760px
+        # picker, its four buttons and the preview pinned. Wrapped whole, New
+        # and Delete sit below the preview and go off the bottom of a 760px
         # window, so the way to add a template is to scroll past the one you are
         # writing.
         self.pages.addWidget(self._build_templates_page())
-        self.pages.addWidget(self._scrolled(self._build_gmail_page()))
+        # Nor this one: "Add account" scrolled with the accounts, so it moved
+        # further out of reach with every account added and at the window
+        # minimum it started below the fold.
+        self.pages.addWidget(self._build_gmail_page())
         self.pages.addWidget(self._scrolled(self._build_sending_page()))
         self.pages.addWidget(self._scrolled(self._build_compliance_page()))
+        self.pages.addWidget(self._scrolled(self._build_appearance_page()))
+        self.pages.currentChanged.connect(lambda _index: self._publish_to_shell())
         root.addWidget(self.pages, stretch=1)
 
-        self.tab_group.idClicked.connect(self.pages.setCurrentIndex)
+        # Above the footer rather than over the page: an undo the user has to
+        # chase across a moving surface is not an undo.
+        self.toaster = C.Toaster(self)
+        root.addWidget(self.toaster.widget)
+        root.addWidget(_divider())
+        root.addLayout(self._build_footer())
+        self._building = False
+        self._watch_dirty()
+
+    def _build_footer(self) -> QHBoxLayout:
+        """Save, Discard, Done, and the line that says whether there is anything
+        outstanding.
+
+        On screen whenever the settings are, which is the whole of the point:
+        this screen had no Cancel at all, and its one confirmation was written
+        into a header the user had already navigated away from by the time it
+        appeared.
+        """
+        t = _t()
+        row = QHBoxLayout()
+        row.setContentsMargins(t.space["0"], t.space["0"], t.space["0"],
+                               t.space["0"])
+        row.setSpacing(t.space["2"])
+
+        self.save_status = _StatusLine()
+        self.save_status.setObjectName("status_busy")
+        row.addWidget(self.save_status, stretch=1)
+
+        self.discard_btn = C.button("Discard changes", kind="secondary",
+                                    size="md", on_click=self._on_discard)
+        self.save_btn = C.button("Save changes", kind="primary", size="md",
+                                 on_click=lambda: self._on_save())
+        self.done_btn = C.button("Done", kind="secondary", size="md",
+                                 on_click=self._on_back)
+        self.done_btn.setToolTip("Go back to the screen this was opened from")
+        for button in (self.discard_btn, self.save_btn, self.done_btn):
+            row.addWidget(button)
+        return row
+
+    def _refresh_footer(self) -> None:
+        """Enable what applies, and say why on what does not."""
+        outstanding = bool(self._dirty or self._template_dirty)
+        self.save_btn.setEnabled(True)
+        self.save_btn.setToolTip(
+            "Write every field on these tabs to your settings file"
+            if outstanding else
+            "Everything on these tabs is already what the settings file holds")
+        self.discard_btn.setEnabled(outstanding)
+        self.discard_btn.setToolTip(
+            "Put every field back to what the settings file holds"
+            if outstanding else
+            "Nothing has been changed, so there is nothing to put back")
 
     def _scrolled(self, page: QWidget) -> QScrollArea:
         scroll = QScrollArea()
@@ -1117,117 +1794,125 @@ class SettingsScreen(QWidget):
         scroll.setWidget(page)
         return scroll
 
-    # ── AI ──
+    def _page(self) -> tuple:
+        """An empty page and the column its sections are added to.
+
+        The right margin is the gutter a vertical scrollbar needs: without it
+        the bar is drawn over the last few pixels of every control on the page.
+        """
+        t = _t()
+        page = QWidget()
+        column = QVBoxLayout(page)
+        column.setContentsMargins(t.space["0"], t.space["0"], t.space["3"],
+                                  t.space["0"])
+        column.setSpacing(t.space["6"])
+        return page, column
+
+    @staticmethod
+    def _section(column: QVBoxLayout, title: str) -> QVBoxLayout:
+        """One titled group, on the one spacing every other group uses."""
+        t = _t()
+        box = QVBoxLayout()
+        box.setContentsMargins(t.space["0"], t.space["0"], t.space["0"],
+                               t.space["0"])
+        box.setSpacing(t.space["2"])
+        box.addWidget(_section_label(title))
+        column.addLayout(box)
+        return box
+
+    @staticmethod
+    def _field(grid: QGridLayout, row: int, label: str, control) -> int:
+        """One labelled row of a form, on the geometry every form here shares."""
+        grid.addWidget(_form_label(label), row, 0)
+        if isinstance(control, QWidget):
+            grid.addWidget(control, row, 1)
+        else:
+            grid.addLayout(control, row, 1)
+        return row + 1
+
+    # ── AI ───────────────────────────────────────────────────────────────────
 
     def _build_ai_page(self) -> QWidget:
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(0, 0, 8, 0)
-        layout.setSpacing(0)
+        page, column = self._page()
 
-        layout.addWidget(_section_label("Provider"))
-        layout.addSpacing(10)
-        self.provider_combo = QComboBox()
-        for value, label in PROVIDERS:
-            self.provider_combo.addItem(label, value)
-        self.provider_combo.setFixedWidth(260)
-        layout.addWidget(self.provider_combo)
-        layout.addSpacing(6)
-        layout.addWidget(_hint(
+        provider = self._section(column, "Provider")
+        grid = _form_grid()
+        self.provider_combo = _combo(PROVIDERS)
+        self._field(grid, 0, "Provider", _loose(self.provider_combo))
+        provider.addLayout(grid)
+        provider.addWidget(_hint(
             "The model writes one subject line, one opener and one PS per lead. "
             "With the provider off, emails still send using the plain templates."
         ))
-        layout.addSpacing(22)
 
         self.groq_key, self.groq_model, self.groq_status = self._provider_block(
-            layout, "Groq", "gsk_…", "llama-3.3-70b-versatile", "groq")
+            column, "Groq", "gsk_…", "llama-3.3-70b-versatile", "groq")
         self.groq_key.editingFinished.connect(self._fetch_groq_models)
-        layout.addSpacing(22)
-        self.openrouter_key, self.openrouter_model, self.openrouter_status = self._provider_block(
-            layout, "OpenRouter", "sk-or-…", "meta-llama/llama-3.3-70b-instruct", "openrouter")
+        (self.openrouter_key, self.openrouter_model,
+         self.openrouter_status) = self._provider_block(
+            column, "OpenRouter", "sk-or-…",
+            "meta-llama/llama-3.3-70b-instruct", "openrouter")
         self.openrouter_key.editingFinished.connect(self._fetch_openrouter_models)
-        layout.addSpacing(22)
 
-        layout.addWidget(_section_label("Token budget"))
-        layout.addSpacing(10)
-        budget_grid = QGridLayout()
-        budget_grid.setHorizontalSpacing(14)
-        budget_grid.setVerticalSpacing(10)
-        self.tokens_per_lead_spin = _spin(60, 600, 10, "", 96)
-        self.monthly_cap_spin = _spin(0, 100_000_000, 100_000, "", 130)
-        budget_grid.addWidget(QLabel("Max tokens per lead"), 0, 0)
-        budget_grid.addWidget(self.tokens_per_lead_spin, 0, 1)
-        budget_grid.addWidget(QLabel("Monthly token cap"), 1, 0)
-        budget_grid.addWidget(self.monthly_cap_spin, 1, 1)
-        budget_grid.setColumnStretch(2, 1)
-        layout.addLayout(budget_grid)
-        layout.addSpacing(12)
+        budget = self._section(column, "Token budget")
+        grid = _form_grid()
+        self.tokens_per_lead_spin = _spin(60, 600, 10, "", 3)
+        self.monthly_cap_spin = _spin(0, 100_000_000, 100_000, "", 9)
+        row = self._field(grid, 0, "Max tokens per lead",
+                          _loose(self.tokens_per_lead_spin))
+        self._field(grid, row, "Monthly token cap", _loose(self.monthly_cap_spin))
+        budget.addLayout(grid)
 
         self.budget_bar = QProgressBar()
         self.budget_bar.setObjectName("budget_bar")
         self.budget_bar.setTextVisible(False)
-        self.budget_bar.setFixedHeight(10)
-        layout.addWidget(self.budget_bar)
-        layout.addSpacing(6)
+        budget.addWidget(self.budget_bar)
         self.budget_label = QLabel("")
         self.budget_label.setObjectName("muted")
-        layout.addWidget(self.budget_label)
-        layout.addSpacing(6)
-        layout.addWidget(_hint(
+        budget.addWidget(self.budget_label)
+        budget.addWidget(_hint(
             "Answers are cached per business, so re-running the same leads costs "
             "nothing. When the cap is spent the plain templates take over."
         ))
-        layout.addStretch()
+
+        column.addStretch()
         return page
 
-    def _provider_block(self, layout: QVBoxLayout, name: str, key_placeholder: str,
-                        model_placeholder: str, provider: str):
-        layout.addWidget(_section_label(name))
-        layout.addSpacing(10)
+    def _provider_block(self, column: QVBoxLayout, name: str,
+                        key_placeholder: str, model_placeholder: str,
+                        provider: str):
+        box = self._section(column, name)
+        grid = _form_grid()
 
-        key_field = _SecretField(key_placeholder)
-        test_btn = QPushButton("Test")
-        test_btn.setObjectName("outlined")
-        test_btn.setFixedSize(84, 34)
-        test_btn.setToolTip(f"Send one five-token request to {name} and report the round trip")
-        status = QLabel("")
+        key_field = _secret_field(key_placeholder)
+        test_btn = C.button("Test", kind="secondary", size="md")
+        test_btn.setToolTip(
+            "Send one five-token request to %s and report the round trip" % name)
+        status = _StatusNote()
         status.setObjectName("status_busy")
-        status.setWordWrap(True)
         status.hide()
-
         model_edit = ModelComboBox(model_placeholder)
 
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(12)
-        grid.setVerticalSpacing(10)
-        grid.setColumnStretch(1, 1)
-        grid.addWidget(QLabel("API key"), 0, 0)
-        grid.addWidget(key_field, 0, 1)
-        grid.addWidget(test_btn, 0, 2)
-        grid.addWidget(status, 1, 1, 1, 2)
-        grid.addWidget(QLabel("Model"), 2, 0)
-        grid.addWidget(model_edit, 2, 1, 1, 2)
-        layout.addLayout(grid)
+        key_row = _row_box()
+        key_row.addWidget(key_field, stretch=1)
+        key_row.addWidget(test_btn)
+        row = self._field(grid, 0, "API key", key_row)
+        grid.addWidget(status, row, 1)
+        self._field(grid, row + 1, "Model", model_edit)
+        box.addLayout(grid)
 
         test_btn.clicked.connect(
-            lambda: self._test_provider(provider, key_field, model_edit, test_btn, status))
+            lambda: self._test_provider(provider, key_field, model_edit,
+                                        test_btn, status))
         return key_field, model_edit, status
 
-    # ── Sender profile ──
+    # ── Sender profile ───────────────────────────────────────────────────────
 
     def _build_sender_page(self) -> QWidget:
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(0, 0, 8, 0)
-        layout.setSpacing(0)
+        page, column = self._page()
 
-        layout.addWidget(_section_label("Identity"))
-        layout.addSpacing(10)
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(12)
-        grid.setVerticalSpacing(10)
-        grid.setColumnStretch(1, 1)
-
+        identity = self._section(column, "Identity")
+        grid = _form_grid()
         self.profile_edits: dict[str, QLineEdit] = {}
         rows = (
             ("company", "Company", "Auto Army"),
@@ -1239,71 +1924,63 @@ class SettingsScreen(QWidget):
             ("calendar_link", "Calendar link", "The one link every first-touch email carries"),
         )
         for row, (key, label, placeholder) in enumerate(rows):
-            edit = QLineEdit()
-            edit.setPlaceholderText(placeholder)
-            edit.setFixedHeight(34)
+            edit = _line(placeholder)
             self.profile_edits[key] = edit
-            grid.addWidget(QLabel(label), row, 0)
-            grid.addWidget(edit, row, 1)
-        layout.addLayout(grid)
-        layout.addSpacing(16)
+            self._field(grid, row, label, edit)
+        identity.addLayout(grid)
 
-        layout.addWidget(_section_label("Postal address"))
-        layout.addSpacing(10)
+        postal = self._section(column, "Postal address")
+        grid = _form_grid()
         self.postal_edit = QTextEdit()
-        self.postal_edit.setPlaceholderText("Street, city, region, postal code, country")
+        self.postal_edit.setPlaceholderText(
+            "Street, city, region, postal code, country")
         self.postal_edit.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.postal_edit.document().contentsChanged.connect(self._fit_postal_box)
         self._fit_postal_box()
-        layout.addWidget(self.postal_edit)
-        layout.addSpacing(6)
-        layout.addWidget(_hint(
+        self._field(grid, 0, "Postal address", self.postal_edit)
+        postal.addLayout(grid)
+        postal.addWidget(_hint(
             "Legally required in the footer of every commercial email. Campaigns "
             "check for it before sending unless you switch that check off under "
             "Compliance."
         ))
-        layout.addSpacing(22)
 
-        layout.addWidget(_section_label("Tone"))
-        layout.addSpacing(10)
-        self.tone_combo = QComboBox()
-        for value, label in TONES:
-            self.tone_combo.addItem(label, value)
-        self.tone_combo.setFixedWidth(200)
-        layout.addWidget(self.tone_combo)
-        layout.addSpacing(22)
+        tone = self._section(column, "Tone")
+        grid = _form_grid()
+        self.tone_combo = _combo(TONES)
+        self._field(grid, 0, "Tone", _loose(self.tone_combo))
+        tone.addLayout(grid)
 
-        services_head = QHBoxLayout()
-        services_head.addWidget(_section_label("Services you sell"))
-        services_head.addStretch()
+        services = self._section(column, "Services you sell")
+        head = _row_box()
+        head.addStretch()
         for text, checked in (("All", True), ("None", False)):
-            btn = QPushButton(text)
-            btn.setObjectName("outlined")
-            btn.setFixedHeight(26)
-            btn.clicked.connect(lambda _, state=checked: self._set_all_services(state))
-            services_head.addWidget(btn)
-        layout.addLayout(services_head)
-        layout.addSpacing(10)
+            head.addWidget(C.button(
+                text, kind="secondary", size="sm",
+                on_click=lambda state=checked: self._set_all_services(state)))
+        services.addLayout(head)
+        grid = _form_grid()
         self.services_list = QListWidget()
         self.services_list.setObjectName("service_list")
-        self.services_list.setMinimumHeight(220)
-        layout.addWidget(self.services_list)
-        layout.addSpacing(6)
-        layout.addWidget(_hint(
+        self.services_list.setMinimumHeight(6 * _t().control["row"])
+        self._field(grid, 0, "Services you sell", self.services_list)
+        services.addLayout(grid)
+        services.addWidget(_hint(
             "Only the ticked services are ever offered in an email, and always in "
             "this exact wording."
         ))
-        layout.addSpacing(22)
 
-        layout.addWidget(_section_label("Proof points"))
-        layout.addSpacing(10)
+        proof = self._section(column, "Proof points")
+        grid = _form_grid()
         self.proof_edit = QTextEdit()
-        self.proof_edit.setFixedHeight(90)
+        self.proof_edit.setFixedHeight(3 * _t().control["row"])
         self.proof_edit.setPlaceholderText(
-            "One per line, e.g. cut a roofing client's quote turnaround from 2 days to 20 minutes"
-        )
-        layout.addWidget(self.proof_edit)
-        layout.addStretch()
+            "One per line, e.g. cut a roofing client's quote turnaround from 2 "
+            "days to 20 minutes")
+        self._field(grid, 0, "Proof points", self.proof_edit)
+        proof.addLayout(grid)
+
+        column.addStretch()
         return page
 
     def _fit_postal_box(self) -> None:
@@ -1341,13 +2018,15 @@ class SettingsScreen(QWidget):
         floor, ceiling = 4 * line + margins, 10 * line + margins
         edit.setFixedHeight(min(max(wanted, floor), ceiling) + chrome)
 
-    # ── Templates ──
+    # ── Templates ────────────────────────────────────────────────────────────
 
     def _build_templates_page(self) -> QWidget:
+        t = _t()
         page = QWidget()
         columns = QHBoxLayout(page)
-        columns.setContentsMargins(0, 0, 0, 0)
-        columns.setSpacing(16)
+        columns.setContentsMargins(t.space["0"], t.space["0"], t.space["0"],
+                                   t.space["0"])
+        columns.setSpacing(t.space["4"])
         columns.addWidget(self._build_template_list_column())
 
         editor = QWidget()
@@ -1364,7 +2043,7 @@ class SettingsScreen(QWidget):
         scroll.setFocusPolicy(Qt.NoFocus)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        scroll.setMinimumHeight(_EDITOR_FLOOR)
+        scroll.setMinimumHeight(_editor_floor())
 
         # The split is draggable because which half matters is the user's call,
         # not this screen's: reading the copy back wants a tall preview and
@@ -1374,10 +2053,14 @@ class SettingsScreen(QWidget):
         split = QSplitter(Qt.Vertical)
         split.setObjectName("template_split")
         split.setChildrenCollapsible(False)
-        split.setHandleWidth(10)
+        split.setHandleWidth(t.space["2"])
+        # The one widget on this screen that styles itself, and the reason is
+        # that `QSplitter::handle` in the application sheet cannot say "only
+        # this splitter": a rule there would put a rule over every handle in the
+        # app, and the outreach screen's splitters are not this one.
         split.setStyleSheet(
             "QSplitter#template_split::handle { background: transparent; "
-            "border-top: 1px solid #3A3A3C; }")
+            "border-top: %dpx solid %s; }" % (C.BORDER, t.color["border.subtle"]))
         split.addWidget(scroll)
         split.addWidget(self._build_template_preview_panel())
         split.setStretchFactor(0, 2)
@@ -1386,14 +2069,16 @@ class SettingsScreen(QWidget):
         # for more than either window size has, so the preview opens on its
         # floor — the whole message is a drag away and the copy being written
         # keeps the rest.
-        split.setSizes([4 * _EDITOR_FLOOR, _PREVIEW_FLOOR])
+        split.setSizes([4 * _editor_floor(), _preview_floor()])
         columns.addWidget(split, stretch=1)
         return page
 
     def _build_template_list_column(self) -> QWidget:
+        t = _t()
         column = QVBoxLayout()
-        column.setContentsMargins(0, 0, 0, 0)
-        column.setSpacing(10)
+        column.setContentsMargins(t.space["0"], t.space["0"], t.space["0"],
+                                  t.space["0"])
+        column.setSpacing(t.space["2"])
         column.addWidget(_section_label("Your templates"))
 
         self.template_list = QListWidget()
@@ -1404,30 +2089,30 @@ class SettingsScreen(QWidget):
         # nothing to say whether Delete or Reset is the button for it.
         self.template_list.setTextElideMode(Qt.ElideMiddle)
         self.template_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.template_list.setMinimumHeight(200)
+        self.template_list.setMinimumHeight(6 * t.control["row"])
         self.template_list.currentItemChanged.connect(self._on_template_row_changed)
         column.addWidget(self.template_list, stretch=1)
 
         buttons = QGridLayout()
-        buttons.setHorizontalSpacing(8)
-        buttons.setVerticalSpacing(8)
+        buttons.setContentsMargins(t.space["0"], t.space["0"], t.space["0"],
+                                   t.space["0"])
+        buttons.setHorizontalSpacing(t.space["2"])
+        buttons.setVerticalSpacing(t.space["2"])
         specs = (
-            ("template_new_btn", "New", "outlined", 0, 0, self._on_template_new,
+            ("template_new_btn", "New", "secondary", 0, 0, self._on_template_new,
              "Start a new template from a working first touch"),
-            ("template_copy_btn", "Duplicate", "outlined", 0, 1, self._on_template_duplicate,
+            ("template_copy_btn", "Duplicate", "secondary", 0, 1,
+             self._on_template_duplicate,
              "Copy what is in the editor into a template of your own"),
-            ("template_delete_btn", "Delete", "danger", 1, 0, self._on_template_delete,
-             "Remove this template for good"),
-            ("template_reset_btn", "Reset", "outlined", 1, 1, self._on_template_reset,
+            ("template_delete_btn", "Delete", "danger", 1, 0,
+             self._on_template_delete, "Remove this template for good"),
+            ("template_reset_btn", "Reset", "secondary", 1, 1,
+             self._on_template_reset,
              "Put this built-in template back to the wording it shipped with"),
         )
-        for attr, label, style, row, col, handler, tip in specs:
-            button = QPushButton(label)
-            button.setObjectName(style)
-            button.setFixedHeight(30)
-            button.setCursor(Qt.PointingHandCursor)
+        for attr, label, kind, row, col, handler, tip in specs:
+            button = C.button(label, kind=kind, size="sm", on_click=handler)
             button.setToolTip(tip)
-            button.clicked.connect(handler)
             setattr(self, attr, button)
             buttons.addWidget(button, row, col)
         column.addLayout(buttons)
@@ -1438,44 +2123,42 @@ class SettingsScreen(QWidget):
 
         holder = QWidget()
         holder.setLayout(column)
-        holder.setFixedWidth(252)
+        # Fixed, but not to a number: the column is as wide as the picker and
+        # the two buttons under it ask for, in whatever font and density is
+        # loaded. The 252px it used to be was one font's answer.
+        holder.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
         return holder
 
     def _build_template_editor_column(self) -> QVBoxLayout:
+        t = _t()
         column = QVBoxLayout()
-        column.setContentsMargins(0, 0, 8, 0)
-        column.setSpacing(6)
+        column.setContentsMargins(t.space["0"], t.space["0"], t.space["3"],
+                                  t.space["0"])
+        column.setSpacing(t.space["2"])
 
-        head = QHBoxLayout()
-        head.setSpacing(8)
-        self.template_name_edit = QLineEdit()
-        self.template_name_edit.setPlaceholderText("What you will call this in the picker")
-        self.template_name_edit.setFixedHeight(34)
+        head = _row_box()
+        self.template_name_edit = _line("What you will call this in the picker")
         self.template_name_edit.textChanged.connect(self._mark_template_dirty)
-        self.template_name_edit.returnPressed.connect(lambda: self._save_open_template())
-        self.template_step_combo = QComboBox()
-        for step in range(_MAX_STEP + 1):
-            self.template_step_combo.addItem(_step_name(step), step)
-        self.template_step_combo.setFixedWidth(140)
+        self.template_name_edit.returnPressed.connect(
+            lambda: self._save_open_template())
+        self.template_step_combo = _combo(
+            [(step, _step_name(step)) for step in range(_MAX_STEP + 1)])
         self.template_step_combo.setToolTip(
             "Which touch this template writes: the first email, or the follow-up "
             "that goes out when nobody has replied to the one before it")
         self.template_step_combo.currentIndexChanged.connect(
             lambda _index: self._mark_template_dirty())
-        self.template_save_btn = QPushButton("Save template")
-        self.template_save_btn.setObjectName("start_btn")
-        self.template_save_btn.setFixedHeight(34)
-        self.template_save_btn.setCursor(Qt.PointingHandCursor)
-        self.template_save_btn.clicked.connect(lambda: self._save_open_template())
-        head.addWidget(QLabel("Name"))
+        self.template_save_btn = C.button(
+            "Save template", kind="primary", size="md",
+            on_click=lambda: self._save_open_template())
+        head.addWidget(_section_label("Name"))
         head.addWidget(self.template_name_edit, stretch=1)
-        head.addWidget(QLabel("Step"))
+        head.addWidget(_section_label("Step"))
         head.addWidget(self.template_step_combo)
         head.addWidget(self.template_save_btn)
         column.addLayout(head)
 
-        subject_row = QHBoxLayout()
-        subject_row.setSpacing(8)
+        subject_row = _row_box()
         subject_row.addWidget(_section_label("Subject"))
         subject_row.addStretch()
         self.template_subject_count = QLabel("")
@@ -1485,16 +2168,28 @@ class SettingsScreen(QWidget):
         column.addLayout(subject_row)
 
         self.template_subject_edit = _FlatLine()
-        self.template_subject_edit.setPlaceholderText("Lower case, no shouting, under 55 characters")
-        self.template_subject_edit.setFixedHeight(34)
+        self.template_subject_edit.setPlaceholderText(
+            "Lower case, no shouting, under 55 characters")
+        self.template_subject_edit.setFixedHeight(t.control["md"])
         self.template_subject_edit.textChanged.connect(self._mark_template_dirty)
-        self.template_subject_edit.returnPressed.connect(lambda: self._save_open_template())
+        self.template_subject_edit.returnPressed.connect(
+            lambda: self._save_open_template())
         self._watch_caret(self.template_subject_edit)
         column.addWidget(self.template_subject_edit)
 
+        # Bounded, because the 21 chips reflow to five rows at the window
+        # minimum and took 165px of a 308px column — which is what put the body
+        # editor 70px below the fold with its BODY label sliced in half. The
+        # palette is a reference; the copy is the work.
         self.template_chips = _ChipBar(MERGE_FIELDS)
         self.template_chips.insert_requested.connect(self._insert_merge_field)
-        column.addWidget(self.template_chips)
+        self.template_chips_pane = _BoundedPane(self.template_chips,
+                                                _palette_ceiling())
+        # The bar takes the focus, not the pane around it: a scroll area that
+        # took it would sit between the subject line and the chips in the tab
+        # order and empty the selection a field is about to replace.
+        self.template_chips_pane.setFocusPolicy(Qt.NoFocus)
+        column.addWidget(self.template_chips_pane)
         column.addWidget(_hint(
             "Click a field to drop it in at the cursor. Hover one for what it "
             "resolves to."
@@ -1503,9 +2198,13 @@ class SettingsScreen(QWidget):
         column.addWidget(_section_label("Body"))
         self.template_body_edit = _FlexEdit()
         self.template_body_edit.setAcceptRichText(False)
-        self.template_body_edit.setMinimumHeight(84)
+        self.template_body_edit.setMinimumHeight(3 * t.control["md"])
+        # A family and a size and nothing else: a widget's own sheet beats an
+        # ancestor's only for what it declares, so the well, the border and the
+        # focus ring still come from `ui/theme.py`.
         self.template_body_edit.setStyleSheet(
-            "font-family: '%s'; font-size: 12px;" % _mono_family())
+            "QTextEdit { font-family: '%s'; font-size: %dpx; }"
+            % (_mono_family(), t.font["mono"][0]))
         self.template_body_edit.setPlaceholderText(
             "Plain text. Blank lines are paragraphs; the footer is added for you.")
         self.template_body_edit.textChanged.connect(self._mark_template_dirty)
@@ -1517,7 +2216,8 @@ class SettingsScreen(QWidget):
         self.template_issues.setTextFormat(Qt.RichText)
         self.template_issues.setWordWrap(True)
         self.template_issues.setAlignment(Qt.AlignLeft | Qt.AlignTop)
-        self.template_issues_pane = _IssuePane(self.template_issues)
+        self.template_issues_pane = _BoundedPane(self.template_issues,
+                                                 _findings_ceiling())
         self.template_issues_pane.hide()
         column.addWidget(self.template_issues_pane)
 
@@ -1539,13 +2239,15 @@ class SettingsScreen(QWidget):
         says what will actually be sent.
 
         So it stops scrolling. The boxes scroll behind it, the preview stays put
-        at every window size, and `_PREVIEW_FLOOR` is the least of the message
+        at every window size, and `_preview_floor` is the least of the message
         it may ever be squeezed to.
         """
+        t = _t()
         panel = QWidget()
         column = QVBoxLayout(panel)
-        column.setContentsMargins(0, 0, 8, 0)
-        column.setSpacing(6)
+        column.setContentsMargins(t.space["0"], t.space["0"], t.space["3"],
+                                  t.space["0"])
+        column.setSpacing(t.space["2"])
         column.addWidget(_section_label("Preview"))
 
         self.template_preview = _FlexEdit()
@@ -1561,7 +2263,7 @@ class SettingsScreen(QWidget):
         self.template_preview.ensurePolished()
         margins = self.template_preview.contentsMargins()
         self.template_preview.setMinimumHeight(
-            _PREVIEW_FLOOR + margins.top() + margins.bottom())
+            _preview_floor() + margins.top() + margins.bottom())
         column.addWidget(self.template_preview, stretch=1)
         column.addWidget(_hint(
             "Rendered for a sample lead through the same code that sends, footer "
@@ -1569,7 +2271,7 @@ class SettingsScreen(QWidget):
         ))
         return panel
 
-    # ── Templates: the list ──
+    # ── Templates: the list ──────────────────────────────────────────────────
 
     def _reload_templates(self, select_id: str = "") -> None:
         self._templates = _all_templates()
@@ -1658,6 +2360,7 @@ class SettingsScreen(QWidget):
         if self._template_notes:
             self._mark_template_dirty()
         self._refresh_template_buttons()
+        self._refresh_footer()
         self._refresh_template_preview()
 
     def _refresh_template_buttons(self) -> None:
@@ -1759,9 +2462,10 @@ class SettingsScreen(QWidget):
         if answer == QMessageBox.Save and not self._save_open_template(quiet=True):
             return False
         self._template_dirty = False
+        self._refresh_footer()
         return True
 
-    # ── Templates: editing ──
+    # ── Templates: editing ───────────────────────────────────────────────────
 
     def _editor_template(self):
         return _templates.Template(
@@ -1773,11 +2477,19 @@ class SettingsScreen(QWidget):
         )
 
     def _mark_template_dirty(self) -> None:
+        """Say the open template has changes, every time and not only the first.
+
+        Every time, because the footer this writes into is shared with the
+        settings either side of it: a template edited after a sending window was
+        touched would otherwise leave "Unsaved changes" standing over an editor
+        whose own state had moved on.
+        """
         if self._template_loading:
             return
-        if not self._template_dirty:
-            self._template_dirty = True
-            _status(self.save_status, "Unsaved", "busy")
+        self._template_dirty = True
+        _status(self.save_status, "Unsaved", "busy")
+        self._refresh_footer()
+        self._publish_to_shell()
         self._preview_timer.start(_PREVIEW_DEBOUNCE_MS)
 
     def _watch_caret(self, editor) -> None:
@@ -1907,16 +2619,18 @@ class SettingsScreen(QWidget):
         self._template_dirty = False
         self._reload_templates(template_id)
         _status(self.save_status, message, "ok")
+        self._refresh_footer()
+        self._publish_to_shell()
         if announce:
             self.saved_signal.emit(self.settings)
 
     def _store_failed(self, verb: str) -> None:
         """Say a template write did not happen, loudly enough to be believed.
 
-        The header has room for two words and this needs more than two: a store
+        The footer has room for one line and this needs more than one: a store
         that will not accept a write is a read-only profile directory or a full
         disk, and a user who reads "Saved" and closes the window loses the
-        evening. The short form stays in the header for the record.
+        evening. The short form stays in the footer for the record.
         """
         _status(self.save_status, "Not saved", "err")
         QMessageBox.warning(
@@ -1997,7 +2711,7 @@ class SettingsScreen(QWidget):
             return
         self._stored(self._template_id, "Template reset")
 
-    # ── Templates: preview ──
+    # ── Templates: preview ───────────────────────────────────────────────────
 
     def _preview_settings(self) -> dict:
         live = dict(self.settings)
@@ -2028,7 +2742,7 @@ class SettingsScreen(QWidget):
         self.template_subject_count.setText(_rich(
             "%d / %d once merged%s" % (merged, limit,
                                        " — cut before sending" if over else ""),
-            _RED if over else _GREEN))
+            _tone_ink("_RED") if over else _tone_ink("_GREEN")))
 
         if not body_text.strip():
             self._show_paper(
@@ -2048,7 +2762,8 @@ class SettingsScreen(QWidget):
             message = str(issue.get("message") or "").strip()
             if not message:
                 continue
-            colour = _RED if level.startswith("err") else _AMBER
+            colour = _tone_ink("_RED") if level.startswith("err") \
+                else _tone_ink("_AMBER")
             lines.append(_rich("%s: %s" % (field, message) if field else message, colour))
         self.template_issues.setText("<br>".join(lines))
         self.template_issues_pane.setVisible(bool(lines))
@@ -2057,31 +2772,37 @@ class SettingsScreen(QWidget):
     def _as_paper(self, subject: str, body_text: str) -> str:
         """The message laid out as the recipient's mail client would show it.
 
-        Every colour and size is inline: this widget's QSS is written for a dark
-        app, and a preview that does not look like an email is not a preview.
+        Every colour and size is inline and every one of them comes from the
+        `_PAPER` constants rather than from `ui/theme.py`: this widget's QSS is
+        written for an application, and a preview that does not look like an
+        email is not a preview.
         """
         blocks = []
         for para in re.split(r"\n\s*\n", str(body_text or "").strip()):
             rows = [html.escape(line.strip()) for line in para.splitlines() if line.strip()]
             if rows:
-                blocks.append('<p style="margin:0 0 14px 0;">%s</p>' % "<br>".join(rows))
+                blocks.append('<p style="margin:0 0 %dpx 0;">%s</p>'
+                              % (_PAPER_GAP, "<br>".join(rows)))
         return (
-            '<div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,'
-            'sans-serif;color:#1A1A1A;">'
-            '<p style="margin:0 0 4px 0;font-size:16px;font-weight:600;">%s</p>'
-            '<p style="margin:0 0 16px 0;font-size:12px;color:#6A6A6A;">To %s &lt;%s&gt;</p>'
-            '<div style="font-size:15px;line-height:1.6;">%s</div></div>'
-            % (html.escape(subject or "(no subject)"),
+            '<div style="font-family:%s;color:%s;">'
+            '<p style="margin:0 0 %dpx 0;font-size:%dpx;font-weight:600;">%s</p>'
+            '<p style="margin:0 0 %dpx 0;font-size:%dpx;color:%s;">To %s &lt;%s&gt;</p>'
+            '<div style="font-size:%dpx;line-height:%s;">%s</div></div>'
+            % (_PAPER_FAMILY, _PAPER_INK.name(),
+               _PAPER_RULE, _PAPER_TYPE["subject"],
+               html.escape(subject or "(no subject)"),
+               _PAPER_PAD, _PAPER_TYPE["meta"], _PAPER_META.name(),
                html.escape(str(SAMPLE_LEAD.get("name") or "")),
                html.escape(str(SAMPLE_LEAD.get("email") or "")),
-               "".join(blocks))
+               _PAPER_TYPE["body"], _PAPER_LEADING, "".join(blocks))
         )
 
     def _show_paper(self, message: str) -> None:
         self.template_preview.setHtml(
-            '<div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,'
-            'sans-serif;font-size:14px;line-height:1.6;color:#6A6A6A;">%s</div>'
-            % html.escape(message))
+            '<div style="font-family:%s;font-size:%dpx;line-height:%s;color:%s;">'
+            '%s</div>'
+            % (_PAPER_FAMILY, _PAPER_TYPE["note"], _PAPER_LEADING,
+               _PAPER_META.name(), html.escape(message)))
         self._paint_paper()
 
     def _paint_paper(self) -> None:
@@ -2093,250 +2814,293 @@ class SettingsScreen(QWidget):
         """
         frame = self.template_preview.document().rootFrame()
         fmt = frame.frameFormat()
-        fmt.setBackground(QColor("#FFFFFF"))
-        fmt.setMargin(16)
+        fmt.setBackground(_PAPER)
+        fmt.setMargin(_PAPER_PAD)
         frame.setFrameFormat(fmt)
 
-    # ── Gmail accounts ──
+    # ── Gmail accounts ───────────────────────────────────────────────────────
 
     def _build_gmail_page(self) -> QWidget:
+        """The accounts, with the way to add one pinned above them.
+
+        "Add account" used to sit under the last account inside the same scroll,
+        so it moved further away with every account added and at 880x620 it
+        started below the fold: the control for getting out of an empty state
+        was reachable only by scrolling past what was missing.
+        """
+        t = _t()
         page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(0, 0, 8, 0)
-        layout.setSpacing(0)
+        column = QVBoxLayout(page)
+        column.setContentsMargins(t.space["0"], t.space["0"], t.space["0"],
+                                  t.space["0"])
+        column.setSpacing(t.space["2"])
 
-        layout.addWidget(_section_label("Sending accounts"))
-        layout.addSpacing(10)
-        layout.addWidget(_hint(APP_PASSWORD_HINT))
-        layout.addSpacing(16)
+        head = _row_box()
+        head.addWidget(_section_label("Sending accounts"))
+        head.addStretch()
+        self.add_account_btn = C.button("Add account", kind="secondary",
+                                        size="sm", on_click=self._on_add_account)
+        self.add_account_btn.setToolTip("Put another Gmail mailbox on the rota")
+        head.addWidget(self.add_account_btn)
+        column.addLayout(head)
+        column.addWidget(_hint(APP_PASSWORD_HINT))
 
+        body = QWidget()
+        wrap = QVBoxLayout(body)
+        wrap.setContentsMargins(t.space["0"], t.space["0"], t.space["3"],
+                                t.space["0"])
+        wrap.setSpacing(t.space["4"])
         self.accounts_box = QVBoxLayout()
-        self.accounts_box.setSpacing(16)
-        layout.addLayout(self.accounts_box)
-        layout.addSpacing(14)
+        self.accounts_box.setContentsMargins(t.space["0"], t.space["0"],
+                                             t.space["0"], t.space["0"])
+        self.accounts_box.setSpacing(t.space["4"])
+        wrap.addLayout(self.accounts_box)
 
-        self.no_accounts_label = QLabel("No sending accounts yet — add one to send anything.")
-        self.no_accounts_label.setObjectName("muted")
-        self.no_accounts_label.setWordWrap(True)
-        layout.addWidget(self.no_accounts_label)
-        layout.addSpacing(10)
+        self.no_accounts_label = C.body_label(
+            "No sending accounts yet — add one to send anything.")
+        wrap.addWidget(self.no_accounts_label)
+        wrap.addStretch()
+        column.addWidget(self._scrolled(body), stretch=1)
 
-        add_row = QHBoxLayout()
-        add_btn = QPushButton("Add account")
-        add_btn.setObjectName("outlined")
-        add_btn.setFixedHeight(32)
-        add_btn.clicked.connect(lambda: self._add_account_row({}))
-        add_row.addWidget(add_btn)
-        add_row.addStretch()
-        layout.addLayout(add_row)
-        layout.addSpacing(6)
-        layout.addWidget(_hint(
+        column.addWidget(_hint(
             "Several accounts spread the volume and keep any one mailbox under "
             "Gmail's limits. Verify each one before the first campaign."
         ))
-        layout.addStretch()
         return page
 
-    # ── Sending schedule ──
+    # ── Sending schedule ─────────────────────────────────────────────────────
 
     def _build_sending_page(self) -> QWidget:
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(0, 0, 8, 0)
-        layout.setSpacing(0)
+        page, column = self._page()
 
-        layout.addWidget(_section_label("Days"))
-        layout.addSpacing(10)
-        days_row = QHBoxLayout()
-        days_row.setSpacing(14)
+        days = self._section(column, "Days")
+        grid = _form_grid()
+        days_row = _row_box()
         self.day_boxes: list[QCheckBox] = []
         for name in DAY_NAMES:
             box = QCheckBox(name)
+            box.setCursor(Qt.PointingHandCursor)
+            box.toggled.connect(lambda _on: self._refresh_schedule_notes())
             self.day_boxes.append(box)
             days_row.addWidget(box)
         days_row.addStretch()
-        layout.addLayout(days_row)
-        layout.addSpacing(22)
+        self._field(grid, 0, "Sending days", days_row)
+        days.addLayout(grid)
+        self.days_note = _hint("")
+        self.days_note.setVisible(False)
+        days.addWidget(self.days_note)
 
-        layout.addWidget(_section_label("Window"))
-        layout.addSpacing(10)
-        window_row = QHBoxLayout()
-        window_row.setSpacing(10)
-        self.start_hour_spin = _spin(0, 23, 1, ":00", 84)
-        self.end_hour_spin = _spin(1, 24, 1, ":00", 84)
+        window = self._section(column, "Window")
+        grid = _form_grid()
+        self.start_hour_spin = _spin(0, 23, 1, ":00", 2)
+        self.end_hour_spin = _spin(1, 24, 1, ":00", 2)
         self.timezone_combo = QComboBox()
         self.timezone_combo.setEditable(True)
+        self.timezone_combo.setFixedHeight(_t().control["md"])
         self.timezone_combo.addItems(list(COMMON_ZONES))
-        self.timezone_combo.setFixedWidth(200)
-        window_row.addWidget(QLabel("From"))
-        window_row.addWidget(self.start_hour_spin)
-        window_row.addWidget(QLabel("to"))
-        window_row.addWidget(self.end_hour_spin)
-        window_row.addSpacing(12)
-        window_row.addWidget(QLabel("Timezone"))
-        window_row.addWidget(self.timezone_combo)
-        window_row.addStretch()
-        layout.addLayout(window_row)
-        layout.addSpacing(6)
-        layout.addWidget(_hint(
+        hours_row = _row_box()
+        hours_row.addWidget(self.start_hour_spin)
+        hours_row.addWidget(QLabel("to"))
+        hours_row.addWidget(self.end_hour_spin)
+        hours_row.addStretch()
+        row = self._field(grid, 0, "Sending window", hours_row)
+        self._field(grid, row, "Timezone", _loose(self.timezone_combo))
+        window.addLayout(grid)
+        for spin in (self.start_hour_spin, self.end_hour_spin):
+            spin.valueChanged.connect(lambda _value: self._refresh_schedule_notes())
+        self.window_note = _hint("")
+        self.window_note.setVisible(False)
+        window.addWidget(self.window_note)
+        window.addWidget(_hint(
             "Local time unless you name an IANA zone. Naming one sends at those "
             "hours in the customer's day rather than in yours."
         ))
         self.timezone_note = _hint("")
         self.timezone_note.setVisible(False)
-        layout.addWidget(self.timezone_note)
+        window.addWidget(self.timezone_note)
         self.timezone_combo.currentTextChanged.connect(self._refresh_timezone_note)
-        layout.addSpacing(22)
 
-        layout.addWidget(_section_label("Pacing"))
-        layout.addSpacing(10)
-        pace_grid = QGridLayout()
-        pace_grid.setHorizontalSpacing(12)
-        pace_grid.setVerticalSpacing(10)
-        self.min_gap_spin = _spin(5, 7200, 15, " s", 100)
-        self.max_gap_spin = _spin(5, 7200, 15, " s", 100)
-        self.daily_cap_spin = _spin(1, 500, 5, "", 100)
-        self.hourly_cap_spin = _spin(1, 200, 1, "", 100)
-        for row, (label, widget) in enumerate((
-            ("Minimum gap between sends", self.min_gap_spin),
-            ("Maximum gap between sends", self.max_gap_spin),
-            ("Daily cap per account", self.daily_cap_spin),
-            ("Hourly cap per account", self.hourly_cap_spin),
-        )):
-            pace_grid.addWidget(QLabel(label), row, 0)
-            pace_grid.addWidget(widget, row, 1)
-        pace_grid.setColumnStretch(2, 1)
-        layout.addLayout(pace_grid)
-        layout.addSpacing(6)
-        layout.addWidget(_hint(
+        pacing = self._section(column, "Pacing")
+        grid = _form_grid()
+        self.min_gap_spin = _spin(5, 7200, 15, " s", 4)
+        self.max_gap_spin = _spin(5, 7200, 15, " s", 4)
+        self.daily_cap_spin = _spin(1, 500, 5, "", 3)
+        self.hourly_cap_spin = _spin(1, 200, 1, "", 3)
+        row = 0
+        for label, widget in (
+                ("Minimum gap between sends", self.min_gap_spin),
+                ("Maximum gap between sends", self.max_gap_spin),
+                ("Daily cap per account", self.daily_cap_spin),
+                ("Hourly cap per account", self.hourly_cap_spin)):
+            row = self._field(grid, row, label, _loose(widget))
+            widget.valueChanged.connect(
+                lambda _value: self._refresh_schedule_notes())
+        pacing.addLayout(grid)
+        self.gap_note = _hint("")
+        self.gap_note.setVisible(False)
+        pacing.addWidget(self.gap_note)
+        self.cap_note = _hint("")
+        self.cap_note.setVisible(False)
+        pacing.addWidget(self.cap_note)
+        pacing.addWidget(_hint(
             "Each gap is picked at random inside the range. A fixed interval is "
             "the clearest automation fingerprint a filter can look for."
         ))
-        layout.addSpacing(22)
 
-        layout.addWidget(_section_label("Warm-up"))
-        layout.addSpacing(10)
-        self.warmup_cb = QCheckBox("Ramp new accounts up gradually")
-        layout.addWidget(self.warmup_cb)
-        layout.addSpacing(10)
-        warm_grid = QGridLayout()
-        warm_grid.setHorizontalSpacing(12)
-        warm_grid.setVerticalSpacing(10)
-        self.warmup_start_spin = _spin(1, 200, 1, "/day", 100)
-        self.warmup_step_spin = _spin(1, 100, 1, "/day", 100)
-        self.warmup_max_spin = _spin(1, 500, 5, "/day", 100)
-        for row, (label, widget) in enumerate((
-            ("Start at", self.warmup_start_spin),
-            ("Increase each day by", self.warmup_step_spin),
-            ("Stop increasing at", self.warmup_max_spin),
-        )):
-            warm_grid.addWidget(QLabel(label), row, 0)
-            warm_grid.addWidget(widget, row, 1)
-        warm_grid.setColumnStretch(2, 1)
-        layout.addLayout(warm_grid)
-        layout.addSpacing(6)
-        layout.addWidget(_hint(
+        warm = self._section(column, "Warm-up")
+        self.warmup_cb = C.toggle(
+            "Ramp new accounts up gradually",
+            help="The ramp starts from each account's own warm-up date")
+        self.warmup_cb.toggled.connect(lambda _on: self._refresh_schedule_notes())
+        warm.addWidget(self.warmup_cb)
+        grid = _form_grid()
+        self.warmup_start_spin = _spin(1, 200, 1, "/day", 3)
+        self.warmup_step_spin = _spin(1, 100, 1, "/day", 3)
+        self.warmup_max_spin = _spin(1, 500, 5, "/day", 3)
+        row = 0
+        for label, widget in (("Start at", self.warmup_start_spin),
+                              ("Increase each day by", self.warmup_step_spin),
+                              ("Stop increasing at", self.warmup_max_spin)):
+            row = self._field(grid, row, label, _loose(widget))
+            widget.valueChanged.connect(
+                lambda _value: self._refresh_schedule_notes())
+        warm.addLayout(grid)
+        warm.addWidget(_hint(
             "A brand-new Gmail account that sends 40 cold emails on day one gets "
-            "throttled or suspended. The ramp starts from each account's warm-up date."
+            "throttled or suspended. The ramp starts from each account's warm-up "
+            "date."
         ))
-        layout.addSpacing(22)
 
-        layout.addWidget(_section_label("Follow-ups"))
-        layout.addSpacing(10)
-        self.followup_cb = QCheckBox("Send follow-ups when nobody replies")
-        layout.addWidget(self.followup_cb)
-        layout.addSpacing(10)
-        follow_grid = QGridLayout()
-        follow_grid.setHorizontalSpacing(12)
-        follow_grid.setVerticalSpacing(10)
-        self.followup_gap_spin = _spin(1, 60, 1, " days", 100)
-        self.followup_steps_spin = _spin(0, 5, 1, "", 100)
-        follow_grid.addWidget(QLabel("Wait between touches"), 0, 0)
-        follow_grid.addWidget(self.followup_gap_spin, 0, 1)
-        follow_grid.addWidget(QLabel("Follow-ups per lead"), 1, 0)
-        follow_grid.addWidget(self.followup_steps_spin, 1, 1)
-        follow_grid.setColumnStretch(2, 1)
-        layout.addLayout(follow_grid)
-        layout.addSpacing(6)
-        layout.addWidget(_hint(
-            "The wait is a floor, not an exact gap: a follow-up is placed no sooner "
-            "than this, then queued behind whatever the day's caps and sending "
-            "window allow, so on a long list it usually lands later than the number "
-            "above. A reply, a bounce or an unsubscribe cancels every remaining "
-            "follow-up for that lead."
+        follow = self._section(column, "Follow-ups")
+        self.followup_cb = C.toggle(
+            "Send follow-ups when nobody replies",
+            help="A reply, a bounce or an unsubscribe cancels the rest")
+        follow.addWidget(self.followup_cb)
+        grid = _form_grid()
+        self.followup_gap_spin = _spin(1, 60, 1, " days", 2)
+        self.followup_steps_spin = _spin(0, 5, 1, "", 2)
+        row = self._field(grid, 0, "Wait between touches",
+                          _loose(self.followup_gap_spin))
+        self._field(grid, row, "Follow-ups per lead",
+                    _loose(self.followup_steps_spin))
+        follow.addLayout(grid)
+        follow.addWidget(_hint(
+            "The wait is a floor, not an exact gap: a follow-up is placed no "
+            "sooner than this, then queued behind whatever the day's caps and "
+            "sending window allow, so on a long list it usually lands later than "
+            "the number above."
         ))
-        layout.addStretch()
+
+        column.addStretch()
         return page
 
-    # ── Compliance ──
+    def _refresh_schedule_notes(self) -> None:
+        """Say what the scheduler will really do, wherever that is not what was asked.
+
+        `core.campaign` composes rather than obeys — three caps become their
+        minimum, an inverted window becomes one hour, an empty day set becomes
+        Monday to Friday — and every one of those used to happen in silence with
+        the requested number still on screen. Each note is empty when nothing is
+        being overridden, because a note beside every field is a note nobody
+        reads.
+        """
+        if self._building:
+            return
+        live = self._schedule_values()
+        chosen = live["send_days"]
+        for label, note in (
+                (self.days_note, _days_note(chosen)),
+                (self.window_note, _hours_note(live["send_start_hour"],
+                                               live["send_end_hour"])),
+                (self.gap_note, _gap_note(live["send_min_gap_sec"],
+                                          live["send_max_gap_sec"])),
+                (self.cap_note, _cap_note(live, [row.to_dict()
+                                                 for row in self._account_rows]))):
+            label.setText(note)
+            label.setVisible(bool(note))
+        for row in self._account_rows:
+            row.show_effective_cap(live)
+
+    def _schedule_values(self) -> dict:
+        """The sending settings as the widgets hold them, for the notes above.
+
+        Asked of the widgets and not of `self.settings`, because the whole point
+        of the notes is to answer the number that is being typed rather than the
+        one that was last saved.
+        """
+        return {
+            "send_days": [i for i, box in enumerate(self.day_boxes)
+                          if box.isChecked()],
+            "send_start_hour": self.start_hour_spin.value(),
+            "send_end_hour": self.end_hour_spin.value(),
+            "send_min_gap_sec": self.min_gap_spin.value(),
+            "send_max_gap_sec": self.max_gap_spin.value(),
+            "daily_cap_per_account": self.daily_cap_spin.value(),
+            "hourly_cap_per_account": self.hourly_cap_spin.value(),
+            "warmup_enabled": self.warmup_cb.isChecked(),
+            "warmup_start": self.warmup_start_spin.value(),
+            "warmup_step": self.warmup_step_spin.value(),
+            "warmup_max": self.warmup_max_spin.value(),
+        }
+
+    # ── Compliance ───────────────────────────────────────────────────────────
 
     def _build_compliance_page(self) -> QWidget:
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(0, 0, 8, 0)
-        layout.setSpacing(0)
+        page, column = self._page()
 
-        layout.addWidget(_section_label("Unsubscribe"))
-        layout.addSpacing(10)
-        self.unsubscribe_edit = QLineEdit()
-        self.unsubscribe_edit.setPlaceholderText("unsubscribe@yourdomain.com")
-        self.unsubscribe_edit.setFixedHeight(34)
-        layout.addWidget(self.unsubscribe_edit)
-        layout.addSpacing(6)
-        layout.addWidget(_hint(
+        unsub = self._section(column, "Unsubscribe")
+        grid = _form_grid()
+        self.unsubscribe_edit = _line("unsubscribe@yourdomain.com")
+        self._field(grid, 0, "Unsubscribe address", self.unsubscribe_edit)
+        unsub.addLayout(grid)
+        unsub.addWidget(_hint(
             "Blank uses the sending account's own address. Every email carries a "
             "List-Unsubscribe header, and an unsubscribe cancels that lead's "
             "queued follow-ups."
         ))
-        layout.addSpacing(26)
 
-        layout.addWidget(_section_label("What every email carries"))
-        layout.addSpacing(10)
-        layout.addWidget(_hint(
+        carried = self._section(column, "What every email carries")
+        carried.addWidget(_hint(
             "All three are on because they are what keeps mail out of the spam "
-            "folder. Each one can be switched off, and each one says what that costs."
+            "folder. Each one can be switched off, and each one says what that "
+            "costs."
         ))
-        layout.addSpacing(12)
         self.append_unsubscribe_cb = self._guard_toggle(
-            layout, "Append the unsubscribe line",
+            carried, "Append the unsubscribe line",
             "Off means a recipient has no way to opt out. That is what gets a "
             "sender reported and filtered, and for commercial mail it is illegal "
             "in most countries.")
         self.append_postal_cb = self._guard_toggle(
-            layout, "Append the postal address",
+            carried, "Append the postal address",
             "Off removes the physical address CAN-SPAM requires in every "
             "commercial email. Filters read a missing one as a spam signal on "
             "its own.")
         self.require_profile_cb = self._guard_toggle(
-            layout, "Require a complete sender profile before sending",
+            carried, "Require a complete sender profile before sending",
             "Off lets a campaign start with your name, your address or a verified "
             "sending account missing, at your own risk.")
-        layout.addSpacing(26)
 
-        layout.addWidget(_section_label("Dry run"))
-        layout.addSpacing(10)
-        self.dry_run_cb = QCheckBox("Dry run — build and log every email, send none")
+        rehearsal = self._section(column, "Dry run")
+        self.dry_run_cb = QCheckBox(
+            "Dry run — build and log every email, send none")
+        self.dry_run_cb.setCursor(Qt.PointingHandCursor)
         self.dry_run_cb.toggled.connect(self._on_dry_run_toggled)
-        layout.addWidget(self.dry_run_cb)
-        layout.addSpacing(12)
-        self.live_warning = QLabel(
+        rehearsal.addWidget(self.dry_run_cb)
+        self.live_warning = C.body_label(
             "LIVE SENDING IS ON. Starting a campaign will deliver real email to "
-            "real businesses from your Gmail account."
-        )
-        self.live_warning.setObjectName("warning")
-        self.live_warning.setWordWrap(True)
-        layout.addWidget(self.live_warning)
-        layout.addSpacing(6)
-        layout.addWidget(_hint(
+            "real businesses from your Gmail account.", tone="danger")
+        rehearsal.addWidget(self.live_warning)
+        rehearsal.addWidget(_hint(
             "A dry run walks the whole schedule and renders every message, but "
             "opens no SMTP connection and spends none of the day's quota. The "
             "queue goes back exactly as it was, so the campaign is still ready "
             "to send for real afterwards. Use it once before any new campaign."
         ))
-        layout.addStretch()
+
+        column.addStretch()
         return page
 
-    def _guard_toggle(self, layout: QVBoxLayout, label: str, cost: str) -> QCheckBox:
+    def _guard_toggle(self, box: QVBoxLayout, label: str, cost: str) -> QCheckBox:
         """One protection, on by default, with the price of turning it off under it.
 
         The user asked not to be blocked and that is what these are: switches,
@@ -2344,24 +3108,223 @@ class SettingsScreen(QWidget):
         its unsubscribe line is a deliverability problem that shows up weeks
         later as a dead domain.
         """
-        box = QCheckBox(label)
-        box.setChecked(True)
-        box.setToolTip(cost)
-        box.toggled.connect(lambda _on: self._schedule_template_preview())
-        layout.addWidget(box)
-        layout.addSpacing(4)
-        layout.addWidget(_hint(cost))
-        layout.addSpacing(14)
-        return box
+        toggle = C.toggle(label, help=cost)
+        toggle.setChecked(True)
+        toggle.toggled.connect(lambda _on: self._schedule_template_preview())
+        box.addWidget(toggle)
+        if toggle.help_label is not None:
+            box.addWidget(toggle.help_label)
+        return toggle
+
+    # ── Appearance ───────────────────────────────────────────────────────────
+
+    def _build_appearance_page(self) -> QWidget:
+        """The two controls that make half the design system reachable at all.
+
+        Both palettes and both densities exist in `ui/theme.py` and neither
+        could be got at: writing `theme` or `density` into settings.json by hand
+        was the only route, and `core.settings._merge` used to drop both keys on
+        the next save. They take effect while you watch, because a theme control
+        that needs a restart is not a theme control — and because the thing a
+        density is chosen by is what it does to a table row, which is on this
+        page under them.
+        """
+        page, column = self._page()
+
+        look = self._section(column, "Look")
+        grid = _form_grid()
+        self.theme_combo = _combo(THEME_CHOICES)
+        self.density_combo = _combo(DENSITY_CHOICES)
+        row = self._field(grid, 0, "Theme", _loose(self.theme_combo))
+        self._field(grid, row, "Density", _loose(self.density_combo))
+        look.addLayout(grid)
+        for combo in (self.theme_combo, self.density_combo):
+            combo.currentIndexChanged.connect(
+                lambda _index: self._on_appearance_picked())
+        look.addWidget(_hint(
+            "Both apply as you pick them. Save writes the choice to your "
+            "settings file so the app opens in it next time."
+        ))
+
+        preview = self._section(column, "What density does to a row")
+        self.density_preview_box = QVBoxLayout()
+        self.density_preview_box.setContentsMargins(
+            _t().space["0"], _t().space["0"], _t().space["0"], _t().space["0"])
+        self.density_preview_box.setSpacing(_t().space["2"])
+        self.density_preview = None
+        preview.addLayout(self.density_preview_box)
+        self.density_note = _hint("")
+        preview.addWidget(self.density_note)
+        self._rebuild_density_preview()
+
+        column.addStretch()
+        return page
+
+    def _rebuild_density_preview(self) -> None:
+        """A real table at the density that is picked, so the choice is a picture.
+
+        Built by `components.table` rather than drawn here, so what is shown is
+        the row height every lead table in the app will get and not a rectangle
+        that resembles one.
+        """
+        density = str(self.density_combo.currentData()
+                      or _theme.DEFAULT_DENSITY)
+        box = self.density_preview_box
+        while box.count():
+            item = box.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+
+        table = C.table(DENSITY_PREVIEW_COLUMNS, density=density, sortable=False)
+        for row in DENSITY_PREVIEW_ROWS:
+            table.add_row(row)
+        rows = _theme.theme(_t().name, density).control["row"]
+        table.setFixedHeight(table.horizontalHeader().sizeHint().height()
+                             + len(DENSITY_PREVIEW_ROWS) * rows
+                             + 2 * C.BORDER)
+        table.setFocusPolicy(Qt.NoFocus)
+        box.addWidget(table)
+        self.density_preview = table
+        self.density_note.setText(
+            "A row is %dpx here and a toolbar button %dpx. Comfortable is the "
+            "default; compact fits about a fifth more leads on the same screen."
+            % (rows, _theme.theme(_t().name, density).control["sm"]))
+
+    def _on_appearance_picked(self) -> None:
+        """Wear the choice now, from inside the signal that made it.
+
+        Safe, and only because `restyle` hands the old layout to a throwaway
+        widget and calls `deleteLater` on it rather than deleting it: the combo
+        whose `currentIndexChanged` is still on the stack outlives the call it
+        is in and is collected when the event loop next comes round. Deferring
+        this to a zero timer instead read as the careful choice and was the
+        fragile one — a zero timer fires when the queue is empty, so how many
+        turns of the loop it takes for a theme to arrive is a question about
+        what else the app happens to be doing.
+        """
+        if self._loading:
+            return
+        self._mark_dirty()
+        self._rebuild_density_preview()
+        self._apply_appearance()
+
+    def _apply_appearance(self) -> None:
+        wanted = {"theme": str(self.theme_combo.currentData() or ""),
+                  "density": str(self.density_combo.currentData() or "")}
+        worn = C.active_theme()
+        if (wanted["theme"], wanted["density"]) == (worn.name, worn.density):
+            return
+        self.settings.update(wanted)
+        window = self.window()
+        apply = getattr(window, "apply_appearance", None)
+        if callable(apply) and window is not self:
+            apply(self.settings)
+            return
+        # No window to ask — a screen built on its own, which is every test that
+        # constructs one. The palette still has to change, because the density
+        # preview under the control is the thing being looked at.
+        app = QApplication.instance()
+        chosen = _theme.from_settings(self.settings)
+        if app is not None:
+            _theme.apply(app, chosen)
+        C.use_theme(chosen)
+        self.restyle()
 
     def _schedule_template_preview(self) -> None:
         self._preview_timer.start(_PREVIEW_DEBOUNCE_MS)
+
+    # ── what has been changed and not committed ──────────────────────────────
+
+    def _watch_dirty(self) -> None:
+        """Notice every edit, so the footer can say whether there is anything to save.
+
+        Named one control at a time rather than swept off `findChildren`,
+        because a sweep would take the template editor with it — and those two
+        boxes write to a different file, are saved by a different button and
+        already have `_mark_template_dirty` of their own. The one place the two
+        meet is `_outstanding`, which says both.
+        """
+        for edit in list(self.profile_edits.values()) + [self.unsubscribe_edit]:
+            edit.textChanged.connect(lambda _text: self._mark_dirty())
+        for box in (self.postal_edit, self.proof_edit):
+            box.textChanged.connect(self._mark_dirty)
+        for field in (self.groq_key, self.openrouter_key):
+            field.textChanged.connect(lambda _text: self._mark_dirty())
+        for combo in (self.provider_combo, self.tone_combo, self.theme_combo,
+                      self.density_combo):
+            combo.currentIndexChanged.connect(lambda _index: self._mark_dirty())
+        for combo in (self.groq_model, self.openrouter_model,
+                      self.timezone_combo):
+            combo.editTextChanged.connect(lambda _text: self._mark_dirty())
+        for spin in (self.tokens_per_lead_spin, self.monthly_cap_spin,
+                     self.start_hour_spin, self.end_hour_spin,
+                     self.min_gap_spin, self.max_gap_spin, self.daily_cap_spin,
+                     self.hourly_cap_spin, self.warmup_start_spin,
+                     self.warmup_step_spin, self.warmup_max_spin,
+                     self.followup_gap_spin, self.followup_steps_spin):
+            spin.valueChanged.connect(lambda _value: self._mark_dirty())
+        for toggle in (list(self.day_boxes)
+                       + [self.warmup_cb, self.followup_cb, self.dry_run_cb,
+                          self.append_unsubscribe_cb, self.append_postal_cb,
+                          self.require_profile_cb]):
+            toggle.toggled.connect(lambda _on: self._mark_dirty())
+        self.services_list.itemChanged.connect(lambda _item: self._mark_dirty())
+
+    def _mark_dirty(self) -> None:
+        """One edit, anywhere on these tabs, and both places that say so."""
+        if self._loading or self._building:
+            return
+        self._dirty = True
+        _status(self.save_status, "Unsaved changes", "busy")
+        self._refresh_footer()
+        self._publish_to_shell()
+
+    def _on_discard(self) -> None:
+        """Put every field back to the file. The one thing Back used to prevent.
+
+        Asked before it happens, because what it throws away is the only copy:
+        an evening of sending-window arithmetic lives in these widgets and
+        nowhere else until Save.
+        """
+        if not (self._dirty or self._template_dirty):
+            return
+        if not C.confirm(
+                self, title="Discard changes?",
+                body="Every field on these tabs goes back to what your settings "
+                     "file holds, and any template open in the editor goes back "
+                     "to what the template store holds. Neither can be brought "
+                     "back afterwards.",
+                confirm_text="Discard", danger=True):
+            return
+        self.settings = load_settings()
+        self._dirty = False
+        self._template_dirty = False
+        self._template_notes = []
+        self._load_into_ui()
+        _status(self.save_status, "Changes discarded", "ok")
+        self._refresh_footer()
+        self._publish_to_shell()
 
     # ── load ─────────────────────────────────────────────────────────────────
 
     def _load_into_ui(self) -> None:
         settings = self.settings
+        self._loading = True
+        try:
+            self._fill_from(settings)
+        finally:
+            self._loading = False
+        # Every widget now holds what the file holds, so by definition there is
+        # nothing outstanding. Leaving the flag set here left Discard armed over
+        # a screen that matched disk, and the footer offering to undo nothing.
+        self._dirty = False
+        self._refresh_schedule_notes()
+        self._refresh_footer()
+        self._publish_to_shell()
 
+    def _fill_from(self, settings: dict) -> None:
         self._select_data(self.provider_combo, settings.get("ai_provider", "auto"))
         self.groq_key.setText(get_secret(settings, "groq_api_key"))
         self.groq_model.setText(str(settings.get("groq_model") or ""))
@@ -2425,6 +3388,12 @@ class SettingsScreen(QWidget):
         self.dry_run_cb.setChecked(bool(settings.get("dry_run", True)))
         self.dry_run_cb.blockSignals(False)
         self.live_warning.setVisible(not self.dry_run_cb.isChecked())
+
+        self._select_data(self.theme_combo,
+                          settings.get("theme") or _theme.DEFAULT_THEME)
+        self._select_data(self.density_combo,
+                          settings.get("density") or _theme.DEFAULT_DENSITY)
+        self._rebuild_density_preview()
         _status(self.save_status, "", "busy")
 
         # Unsaved copy outlives a reload of the file around it: nothing in
@@ -2523,43 +3492,92 @@ class SettingsScreen(QWidget):
     # ── accounts ──
 
     def _load_accounts(self, accounts) -> None:
+        for row in self._account_rows:
+            row.setParent(None)
+            row.deleteLater()
+        self._account_rows = []
+        self._relist_accounts()
+        for account in accounts:
+            if isinstance(account, dict):
+                self._add_account_row(account)
+
+    def _add_account_row(self, account: dict, at: int = -1) -> None:
+        row = _AccountRow(account, len(self._account_rows) + 1)
+        row.remove_requested.connect(self._remove_account_row)
+        row.verify_requested.connect(self._verify_account_row)
+        row.changed.connect(self._mark_dirty)
+        row.changed.connect(self._refresh_schedule_notes)
+        email = str(account.get("email") or "").strip()
+        if email:
+            row.set_password(get_secret(self.settings, f"smtp_accounts.{email}.app_password"))
+        if 0 <= at < len(self._account_rows):
+            self._account_rows.insert(at, row)
+        else:
+            self._account_rows.append(row)
+        self._relist_accounts()
+
+    def _relist_accounts(self) -> None:
+        """Put the rows back in the column with a rule between each pair.
+
+        Rebuilt from `_account_rows` rather than edited in place: the dividers
+        are interleaved and the titles are ordinals, so an insert or a removal
+        anywhere but the end leaves both wrong.
+        """
         while self.accounts_box.count():
             item = self.accounts_box.takeAt(0)
             widget = item.widget()
             if widget is not None:
                 widget.setParent(None)
-                widget.deleteLater()
-        self._account_rows = []
-
-        for account in accounts:
-            if isinstance(account, dict):
-                self._add_account_row(account)
+                if not isinstance(widget, _AccountRow):
+                    widget.deleteLater()
+        for index, row in enumerate(self._account_rows):
+            if index:
+                self.accounts_box.addWidget(_divider())
+            row.renumber(index + 1)
+            self.accounts_box.addWidget(row)
+            row.show()
         self._update_accounts_placeholder()
+        self._refresh_schedule_notes()
 
-    def _add_account_row(self, account: dict) -> None:
-        if self._account_rows:
-            self.accounts_box.addWidget(_divider())
-        row = _AccountRow(account, len(self._account_rows) + 1)
-        row.remove_requested.connect(self._remove_account_row)
-        row.verify_requested.connect(self._verify_account_row)
-        email = str(account.get("email") or "").strip()
-        if email:
-            row.set_password(get_secret(self.settings, f"smtp_accounts.{email}.app_password"))
-        self.accounts_box.addWidget(row)
-        self._account_rows.append(row)
-        self._update_accounts_placeholder()
+    def _on_add_account(self) -> None:
+        self._add_account_row({})
+        self._mark_dirty()
+        self._account_rows[-1].email_edit.setFocus()
 
     def _remove_account_row(self, row: _AccountRow) -> None:
+        """Taking a mailbox off the rota, asked first and undoable afterwards.
+
+        It was none of those things: one click, no confirmation, no announcement
+        and no way back — and what went with the row was the app password, which
+        the user then has to go and mint again in their Google account because
+        Google never shows an existing one twice.
+        """
         if row not in self._account_rows:
             return
+        name = row.email() or "This account"
+        if not C.confirm(
+                self, title="Remove %s?" % name,
+                body="It comes off the sending rota and its app password is "
+                     "forgotten. Google never shows an app password twice, so "
+                     "putting it back means minting a new one.",
+                confirm_text="Remove", danger=True):
+            return
+        at = self._account_rows.index(row)
+        restore = (at, row.to_dict(), row.app_password())
         self._account_rows.remove(row)
-        # Renumbering by hand is fiddly with the dividers interleaved; rebuilding
-        # from the rows that are left keeps the titles honest.
-        remaining = [r.to_dict() for r in self._account_rows]
-        passwords = [r.app_password() for r in self._account_rows]
-        self._load_accounts(remaining)
-        for new_row, password in zip(self._account_rows, passwords):
-            new_row.set_password(password)
+        row.setParent(None)
+        row.deleteLater()
+        self._relist_accounts()
+        self._mark_dirty()
+        self.toaster.show("%s is off the sending rota." % name, tone="warning",
+                          action="Undo",
+                          on_action=lambda saved=restore: self._restore_account(saved))
+
+    def _restore_account(self, saved) -> None:
+        at, account, password = saved
+        self._add_account_row(account, at=at)
+        self._account_rows[min(at, len(self._account_rows) - 1)].set_password(password)
+        self._mark_dirty()
 
     def _update_accounts_placeholder(self) -> None:
         self.no_accounts_label.setVisible(not self._account_rows)
@@ -2577,7 +3595,7 @@ class SettingsScreen(QWidget):
 
     # ── AI test ──
 
-    def _test_provider(self, provider: str, key_field: _SecretField, model_edit: QLineEdit,
+    def _test_provider(self, provider: str, key_field: QWidget, model_edit: QWidget,
                        button: QPushButton, status: QLabel) -> None:
         api_key, model = key_field.text(), model_edit.text().strip()
         if not api_key:
@@ -2600,7 +3618,8 @@ class SettingsScreen(QWidget):
     def _fetch_openrouter_models(self) -> None:
         self._fetch_models_async("openrouter", self.openrouter_key, self.openrouter_model)
 
-    def _fetch_models_async(self, provider: str, key_field: _SecretField, model_combo: ModelComboBox) -> None:
+    def _fetch_models_async(self, provider: str, key_field: QWidget,
+                            model_combo: ModelComboBox) -> None:
         api_key = key_field.text()
         if not api_key:
             return
@@ -2706,6 +3725,11 @@ class SettingsScreen(QWidget):
         settings["require_profile_complete"] = self.require_profile_cb.isChecked()
         settings["dry_run"] = self.dry_run_cb.isChecked()
 
+        settings["theme"] = str(self.theme_combo.currentData()
+                                or _theme.DEFAULT_THEME)
+        settings["density"] = str(self.density_combo.currentData()
+                                  or _theme.DEFAULT_DENSITY)
+
         self._collect_accounts()
         # Written last so a renamed account keeps its key: `set_secret` looks the
         # row up by address, and the rows only carry the new addresses now.
@@ -2728,6 +3752,7 @@ class SettingsScreen(QWidget):
                        f"smtp_accounts.{entry['email']}.app_password", row.app_password())
 
     def _on_save(self) -> bool:
+        """Write both stores, and say so where the user is still standing."""
         # First, because the template store is a separate file and a user who
         # pressed Save with a half-written follow-up open means both.
         self._save_open_template(quiet=True)
@@ -2736,12 +3761,43 @@ class SettingsScreen(QWidget):
             save_settings(self.settings)
         except OSError as exc:
             _status(self.save_status, f"Could not save: {exc}", "err")
+            self._refresh_footer()
             return False
+        self._dirty = False
         self._refresh_budget()
         _status(self.save_status, "Saved", "ok")
+        self._refresh_footer()
+        self._publish_to_shell()
         self.saved_signal.emit(self.settings)
         return True
 
     def _on_back(self) -> None:
-        self._on_save()
+        """Leave, having asked about anything that is not written down yet.
+
+        Back used to call `_on_save` on its way out, so a sending window
+        somebody was halfway through setting up was committed by the act of
+        navigating away, and the "Saved" it produced appeared on a screen they
+        were no longer looking at.
+        """
+        if (self._dirty or self._template_dirty) and not self._offer_to_leave():
+            return
         self.back_signal.emit()
+
+    def _offer_to_leave(self) -> bool:
+        """Save, discard or stay. False means the screen stays where it is."""
+        answer = QMessageBox.question(
+            self, "Unsaved changes",
+            "%s. Save before leaving?" % self._outstanding(),
+            QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+            QMessageBox.Save,
+        )
+        if answer == QMessageBox.Cancel:
+            return False
+        if answer == QMessageBox.Save:
+            return self._on_save()
+        self.settings = load_settings()
+        self._dirty = False
+        self._template_dirty = False
+        self._template_notes = []
+        self._load_into_ui()
+        return True

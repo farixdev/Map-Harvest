@@ -28,6 +28,16 @@ DEFAULT_SETTINGS = {
     "export_dir": "",
     "saved_searches": [],
 
+    # ── Appearance ──
+    # Both palettes and both densities exist in `ui/theme.py` and neither could
+    # be reached: `theme.from_settings` reads these two keys, the merge below
+    # drops every key that is not in this schema, so a settings file asking for
+    # the light theme was silently answered with the dark one. An unknown value
+    # is not validated here — `theme.theme()` falls back rather than raising, so
+    # a hand-edited file cannot stop the app from starting.
+    "theme": "dark",                  # dark | light
+    "density": "comfortable",         # comfortable | compact
+
     # ── AI ──
     "ai_provider": "auto",            # auto | groq | openrouter | off
     "groq_api_key": "",               # stored via core.secrets

@@ -716,6 +716,29 @@ def _tabs(screen) -> list:
             and button.isVisible()]
 
 
+def _own_tabs(screen) -> list:
+    """A screen's own tabs, on whichever of its pages still carries them.
+
+    A screen's *steps* belong to the shell now — Outreach hands Leads, Campaign,
+    Sending and Stats to `set_subtabs` and draws no strip of its own, and the
+    bar that draws them is measured in `tests/test_ui_chrome.py`. What is left
+    on the screen is an in-page selection: the Text/HTML switch over the email
+    preview, which is exactly the mark this test is about, and which lives on
+    the Campaign page rather than on the one the screen opens with.
+    """
+    tabs = _tabs(screen)
+    pages = getattr(screen, "pages", None)
+    if len(tabs) >= 2 or pages is None:
+        return tabs
+    for index in range(pages.count()):
+        pages.setCurrentIndex(index)
+        _sized(screen, DEFAULT_SIZE)
+        tabs = _tabs(screen)
+        if len(tabs) >= 2:
+            return tabs
+    return tabs
+
+
 def test_selection_outweighs_focus_on_every_tab_and_every_row():
     """The audit's critical finding, guarded where it actually happened.
 
@@ -744,13 +767,24 @@ def test_selection_outweighs_focus_on_every_tab_and_every_row():
     and 6.22:1 in light, against a ring of 106-157 px at 3.70:1 and 4.81:1 —
     between 11x and 26x the pixels, and louder on every one of them.
     """
+    # Every screen is asked and none is required to answer, which is the
+    # navigation contract rather than a gap in this test. A screen's *steps*
+    # belong to the shell now — Home's Scrape/Filters/Settings strip sat
+    # directly under the shell's own destinations, two rows of identical tabs
+    # with the second inside the page, and Outreach's four and Settings' seven
+    # went the same way — so what is measured here is whatever in-page tab a
+    # screen still owns, and the shell's own row is measured in
+    # `tests/test_ui_chrome.py`. The counter at the end is what stops a future
+    # migration turning this into a test that measures nothing and passes.
+    measured = 0
     for theme in THEMES:
         with _wearing(theme) as app:
-            for kind in ("input", "outreach", "settings"):
+            for kind in ("input", "results", "outreach", "settings"):
                 screen = _sized(_screen(kind), DEFAULT_SIZE)
-                tabs = _tabs(screen)
-                assert len(tabs) >= 2, \
-                    "%s has %d tabs to compare" % (kind, len(tabs))
+                tabs = _own_tabs(screen)
+                if len(tabs) < 2:
+                    continue
+                measured += 1
                 park = next(button for button in _focusable(screen)
                             if button not in tabs)
                 # Which tab the screen opened on, so the bar and the page it
@@ -816,3 +850,6 @@ def test_selection_outweighs_focus_on_every_tab_and_every_row():
                     listing.clearFocus()
                     app.processEvents()
                     _outweighs(where, ground, picked, ring)
+
+    assert measured, ("no screen carries an in-page tab any more, so the tab "
+                      "half of this measured nothing at all")

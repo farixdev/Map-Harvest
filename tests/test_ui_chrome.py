@@ -21,6 +21,12 @@ pinned hex is a test that will pass right up until the interface changes and
 then describe one nobody sees. Where an assertion is a claim about a ratio or an
 ordering it runs against both palettes.
 
+The last section measures `ui.app` rather than a screen: one bar over a stack
+of screens that are built the first time they are asked for, the routes between
+them, and a theme that changes without a restart. It builds a real MainWindow,
+so it is held to the same rule as everything else here — nothing it constructs
+may reach a real profile.
+
 `SETTINGS_DIR` is redirected into a temp directory before any screen is built,
 so constructing one can never read or write a developer's real ~/.mapharvest —
 `core.outreach_db` resolves its own path through it on every call, so the
@@ -41,18 +47,21 @@ from PyQt5.QtCore import QEvent, QPoint, QRect, QSize, Qt  # noqa: E402
 from PyQt5.QtGui import QKeyEvent  # noqa: E402
 from PyQt5.QtTest import QTest  # noqa: E402
 from PyQt5.QtWidgets import (  # noqa: E402
-    QApplication, QCheckBox, QFrame, QHBoxLayout, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QMessageBox, QProgressBar, QPushButton,
-    QScrollArea, QSplitter, QStyle, QStyleOptionButton, QStyleOptionViewItem,
-    QWidget,
+    QApplication, QCheckBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
+    QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QProgressBar,
+    QPushButton, QScrollArea, QSplitter, QStyle, QStyleOptionButton,
+    QStyleOptionViewItem, QWidget,
 )
 
 from core import outreach_db as DB  # noqa: E402
 from core import settings as ST  # noqa: E402
 from core import templates as TPL  # noqa: E402
 from core.campaign import OutreachWorker  # noqa: E402
+from ui import app as APP  # noqa: E402
+from ui import components as CO  # noqa: E402
 from ui import theme as TH  # noqa: E402
 from ui import screen_outreach as SO  # noqa: E402
+from ui import domain_list_dialog as DLG  # noqa: E402
 from ui import screen_settings as SS  # noqa: E402
 from ui.screen_input import InputScreen  # noqa: E402
 from ui.screen_results import ResultsScreen  # noqa: E402
@@ -90,6 +99,11 @@ def _app() -> QApplication:
     Through `theme.apply`, not by hand: the check indicators are painted by
     `TickStyle` and the sheet deliberately says nothing about them, so an app
     that only gets the sheet is not the app the user runs.
+
+    It deliberately does *not* touch `components.use_theme`: the Appearance tab
+    sets that itself while a density is being picked, and a helper every other
+    helper calls on its way past would put it back a line later. `_screen` owns
+    that half.
     """
     global _APP
     if _APP is None:
@@ -106,7 +120,8 @@ def _wearing(theme):
 
     `setStyleSheet` repolishes every widget alive in the process, which is the
     point: a screen built under one palette has to be measured in the one under
-    test, not in the one it was constructed in.
+    test, not in the one it was constructed in. A repolish is no longer the
+    whole of it — see `_screen`.
     """
     global _WEARING
     saved, _WEARING = _WEARING, theme
@@ -117,10 +132,25 @@ def _wearing(theme):
         _app()
 
 
+# Which palette each built screen is currently wearing, so one is restyled at
+# most once per palette it is actually measured in.
+_WORN: dict = {}
+
+
 def _screen(kind: str):
-    """One built screen per kind, over a seeded throwaway database."""
+    """One built screen per kind, over a seeded throwaway database.
+
+    Handed back wearing the palette the process is in, which takes the same
+    three steps `MainWindow.apply_appearance` takes and not just the first:
+    the sheet onto the application, the theme into `ui.components`, and
+    `restyle()` on the screen. The third is what a repolish cannot do — a
+    colour a component wrote into a widget's own stylesheet is not reachable
+    from the application sheet at all, so without it a card built in the dark
+    palette is still painting `#2A2E33` while the page around it is light.
+    """
+    app = _app()
     if kind not in _SCREENS:
-        app = _app()
+        CO.use_theme(_WEARING)
         if kind == "outreach":
             conn = DB.connect(os.path.join(_TMP, "outreach.db"))
             DB.upsert_lead(conn, {"email": "zeta@example.com", "name": "Zeta Roofing",
@@ -140,7 +170,17 @@ def _screen(kind: str):
         screen.show()
         app.processEvents()
         _SCREENS[kind] = screen
-    return _SCREENS[kind]
+        _WORN[kind] = _WEARING
+
+    screen = _SCREENS[kind]
+    if _WORN.get(kind) is not _WEARING:
+        CO.use_theme(_WEARING)
+        restyle = getattr(screen, "restyle", None)
+        if callable(restyle):
+            restyle()
+            app.processEvents()
+        _WORN[kind] = _WEARING
+    return screen
 
 
 def _sized(screen, size):
@@ -590,8 +630,21 @@ def test_an_empty_results_table_says_what_to_do_next():
     assert screen.table_stack.currentIndex() == screen.NOTHING_PAGE
     assert screen.table_stack.currentWidget() is not screen.table
     text = _visible_card_text(screen)
-    assert "Nothing collected" in text and "Home screen" in text, \
+    assert "Nothing collected" in text and "Scrape" in text, \
         "the empty table still says nothing: %r" % text
+
+    # The way out, and that it goes anywhere. The screen has no bar of its own
+    # to carry Home any more, so this button is the whole of it.
+    page = screen.table_stack.currentWidget()
+    assert page.action_button is not None and \
+        page.action_button.text() == "Change the search"
+    routed = []
+    screen.home_signal.connect(lambda: routed.append(True))
+    try:
+        page.action_button.click()
+        assert routed == [True], "the empty state's only way out routes nowhere"
+    finally:
+        screen.home_signal.disconnect()
 
 
 def test_a_run_that_has_not_produced_a_row_yet_says_so():
@@ -633,10 +686,12 @@ def test_the_browse_button_is_wide_enough_for_its_own_label():
         assert button.width() >= button.sizeHint().width(), (
             "the browse button is %dpx wide and needs %d at %dx%d, so it "
             "renders '..'" % (button.width(), button.sizeHint().width()) + size)
-        assert button.height() == THEME.control["lg"], (
-            "it must stay square-ish beside the field: %dpx against the %dpx "
-            "the search field beside it takes from control.lg"
-            % (button.height(), THEME.control["lg"]))
+        assert button.height() == THEME.control["md"] == \
+            screen.export_dir_input.height(), (
+            "it must line up with the field it sits beside: %dpx against the "
+            "field's %dpx, and control.md is %d"
+            % (button.height(), screen.export_dir_input.height(),
+               THEME.control["md"]))
 
 
 # ── U8: every colour the sheet writes text in has to clear its ground ────────
@@ -2126,3 +2181,1302 @@ def test_every_focusable_button_on_every_screen_wears_the_ring():
     assert seen >= 36, "only %d focusable buttons were reachable" % seen
     assert not struck, "%d of %d buttons:\n  %s" % (len(struck), seen,
                                                     "\n  ".join(struck))
+
+
+# ── U11: the shell every screen now sits in ──────────────────────────────────
+
+_WINDOW: list = []
+
+
+def _window():
+    """The one MainWindow for this module, over the same throwaway profile.
+
+    Built once and kept, for the reason every other host in this file is: Qt on
+    the offscreen platform does not survive a test that churns top-level windows
+    while it still points at one of them as the active window.
+    """
+    if not _WINDOW:
+        _app()
+        window = APP.MainWindow()
+        window.resize(QSize(*DEFAULT_SIZE))
+        window.show()
+        _app().processEvents()
+        _WINDOW.append(window)
+    return _WINDOW[0]
+
+
+@contextlib.contextmanager
+def _stubbed(owner, name: str, replacement):
+    """One method replaced on one instance, and put back afterwards.
+
+    `on_start` ends in `start_worker`, which opens a browser and scrapes Google
+    Maps. The route is what these tests are about, so the two calls that would
+    do real work arrive as recordings instead.
+    """
+    owner.__dict__[name] = replacement
+    try:
+        yield
+    finally:
+        owner.__dict__.pop(name, None)
+
+
+def _bar(window) -> QWidget:
+    return window.findChild(QWidget, "app_bar")
+
+
+def _sub(window) -> QWidget:
+    return window.findChild(QWidget, "sub_bar")
+
+
+def _bar_buttons(window, kind: str = "") -> list:
+    return [button for button in _bar(window).findChildren(QPushButton)
+            if not kind or button.objectName() == kind]
+
+
+def test_the_window_builds_the_screen_it_shows_and_not_the_other_three():
+    """The measurement this whole shell exists for.
+
+    `MainWindow.__init__` used to construct all four screens — the 2747-line
+    settings screen among them — before the user had asked for any: 691 widgets
+    and 531ms to show a home screen made of nine. Registering a factory and
+    calling it on the first visit builds one, and the screen modules are
+    imported inside those factories, so the 2591-line outreach screen is not
+    even parsed until someone goes there.
+    """
+    window = _window()
+    assert window.shell.current_key == APP.INPUT
+    assert window.shell.built() == (APP.INPUT,), \
+        "the window built %s before anyone asked" % (window.shell.built(),)
+    for key in (APP.RESULTS, APP.OUTREACH, APP.SETTINGS):
+        assert window.shell.built(key) is None, "%s was built eagerly" % key
+
+    window.shell.go(APP.OUTREACH)
+    _app().processEvents()
+    assert set(window.shell.built()) == {APP.INPUT, APP.OUTREACH}
+    assert window.shell.built(APP.SETTINGS) is None, \
+        "visiting Outreach built the settings screen too"
+    assert window.shell.screen(APP.OUTREACH) is window.shell.built(APP.OUTREACH), \
+        "the second visit built a second screen"
+    window.shell.go(APP.INPUT)
+
+
+def test_one_bar_at_one_height_over_every_screen():
+    """Four screens carried four top bars — 31px, 70px, 50px, 31px — so where
+    the user was and how to leave was answered differently on each. There is one
+    now, it belongs to the shell, and it is the same object on every screen.
+    """
+    window = _window()
+    bar = _bar(window)
+    assert bar is not None, "the window has no bar"
+    for key in (APP.RESULTS, APP.OUTREACH, APP.SETTINGS, APP.INPUT):
+        window.shell.go(key)
+        _sized(window, DEFAULT_SIZE)
+        assert len(window.findChildren(QWidget, "app_bar")) == 1, \
+            "%s brought a second bar with it" % key
+        assert _bar(window) is bar, "the bar was rebuilt on the way to %s" % key
+        assert bar.isVisible() and bar.height() == THEME.control["header"], (
+            "the bar is %dpx on %s and control.header is %d"
+            % (bar.height(), key, THEME.control["header"]))
+
+        checked = [button.text() for button in _bar_buttons(window, "tab")
+                   if button.isChecked()]
+        wanted = [] if key == APP.SETTINGS else [window.shell._labels[key]]
+        assert checked == wanted, \
+            "the bar says %s and the user is on %s" % (checked, key)
+
+
+def test_every_navigation_route_still_arrives_where_it_did():
+    """The eight routes the window carried before the shell, one at a time.
+
+    Both halves of the scrape hand-off are recorded rather than run, and the key
+    the shell is showing is recorded with them: `setup` has to happen before the
+    switch so the screen is never painted holding the last run's rows, and
+    `start_worker` after it so the first row arrives on a screen the user can
+    already see.
+    """
+    window = _window()
+    shell = window.shell
+    inputs = shell.screen(APP.INPUT)
+    results = shell.screen(APP.RESULTS)
+    outreach = shell.screen(APP.OUTREACH)
+    settings = shell.screen(APP.SETTINGS)
+
+    seen = []
+    with _stubbed(results, "setup",
+                  lambda *a, **k: seen.append(("setup", shell.current_key))), \
+            _stubbed(results, "start_worker",
+                     lambda: seen.append(("start", shell.current_key))), \
+            _stubbed(results, "stop_worker",
+                     lambda: seen.append(("stop", shell.current_key))):
+        shell.go(APP.INPUT)
+        inputs.start_signal.emit(["plumbers"], ["Toronto"], ["name"], False,
+                                 10, "", {})
+        assert shell.current_key == APP.RESULTS
+        assert seen == [("setup", APP.INPUT), ("start", APP.RESULTS)], \
+            "the scrape hand-off ran as %s" % seen
+
+        results.stop_signal.emit()
+        assert seen[-1] == ("stop", APP.RESULTS)
+
+    results.home_signal.emit()
+    assert shell.current_key == APP.INPUT
+
+    records = [{"name": "Zeta Roofing", "email": "zeta@example.com"}]
+    handed = []
+    with _stubbed(outreach, "load_from_results", handed.append):
+        results.outreach_signal.emit(records)
+    assert shell.current_key == APP.OUTREACH
+    assert handed == [records], "the records never reached the outreach screen"
+
+    outreach.home_signal.emit()
+    assert shell.current_key == APP.INPUT
+    inputs.outreach_signal.emit()
+    assert shell.current_key == APP.OUTREACH
+    outreach.settings_signal.emit()
+    assert shell.current_key == APP.SETTINGS
+    settings.back_signal.emit()
+    assert shell.current_key == APP.OUTREACH
+
+    shell.go(APP.INPUT)
+    inputs.settings_signal.emit()
+    assert shell.current_key == APP.SETTINGS
+    settings.back_signal.emit()
+    assert shell.current_key == APP.INPUT
+
+
+def test_back_out_of_settings_returns_to_the_screen_it_was_opened_from():
+    """Opened from a half-built campaign, Back may not answer with Home."""
+    window = _window()
+    shell = window.shell
+    for key in (APP.OUTREACH, APP.RESULTS, APP.INPUT):
+        shell.go(key)
+        window.on_settings()
+        assert shell.current_key == APP.SETTINGS
+        shell.screen(APP.SETTINGS).back_signal.emit()
+        assert shell.current_key == key, \
+            "Back from settings opened on %s landed on %s" % (
+                key, shell.current_key)
+
+    shell.go(APP.OUTREACH)
+    window.on_settings()
+    window.on_settings()
+    shell.screen(APP.SETTINGS).back_signal.emit()
+    assert shell.current_key == APP.OUTREACH, \
+        "settings opened from settings made settings the way back"
+    shell.go(APP.INPUT)
+
+
+def test_the_bar_says_whether_the_next_campaign_mails_real_people():
+    """Dry run is the one piece of global state a wrong guess about is expensive.
+
+    It lived on one tab of one screen; it is on the bar now, in the two shapes
+    the sheet keeps for it — dashed for a rehearsal, filled red for live.
+    """
+    window = _window()
+    saved = dict(window.settings)
+    try:
+        pill = [b for b in _bar_buttons(window)
+                if b.objectName() in ("rehearsal", "live")]
+        assert len(pill) == 1 and pill[0].text() == "Dry run"
+        assert pill[0].objectName() == "rehearsal"
+
+        window.on_settings_saved(dict(saved, dry_run=False))
+        _app().processEvents()
+        pill = [b for b in _bar_buttons(window)
+                if b.objectName() in ("rehearsal", "live")]
+        assert len(pill) == 1 and pill[0].text() == "LIVE", \
+            "the bar still says %r with dry run off" % pill[0].text()
+        assert pill[0].objectName() == "live"
+    finally:
+        window.on_settings_saved(saved)
+        _app()
+
+
+def test_a_screen_hands_its_sub_tabs_to_the_shell_and_they_stay_with_it():
+    """The second row: one place the user looks to know where they are."""
+    window = _window()
+    shell = window.shell
+    picked = []
+    tabs = ("Leads", "Campaign", "Sending", "Stats")
+    shell.set_subtabs(APP.OUTREACH, tabs, picked.append, current=1)
+    shell.go(APP.OUTREACH)
+    _sized(window, DEFAULT_SIZE)
+
+    row = _sub(window)
+    assert row.isVisible(), "the sub-tab row is not on screen"
+    buttons = row.findChildren(QPushButton)
+    assert [button.text() for button in buttons] == list(tabs)
+    assert [button.text() for button in buttons if button.isChecked()] == \
+        ["Campaign"], "the row does not say which tab is open"
+
+    buttons[2].click()
+    _app().processEvents()
+    assert picked == [2], "clicking a sub-tab told the screen %s" % picked
+    assert [b.text() for b in _sub(window).findChildren(QPushButton)
+            if b.isChecked()] == ["Sending"]
+
+    shell.go(APP.INPUT)
+    _sized(window, DEFAULT_SIZE)
+    assert not _sub(window).findChildren(QPushButton), \
+        "one screen's sub-tabs followed the user to another"
+    assert not _sub(window).isVisible(), \
+        "an empty second row still takes height from the page"
+
+    shell.go(APP.OUTREACH)
+    assert [b.text() for b in _sub(window).findChildren(QPushButton)] == list(tabs)
+    shell.set_subtabs(APP.OUTREACH, (), None)
+    shell.go(APP.INPUT)
+
+
+def test_the_shell_carries_one_line_of_context_per_screen():
+    window = _window()
+    shell = window.shell
+    shell.set_context(APP.INPUT, "3 saved searches", tone="info")
+    shell.go(APP.INPUT)
+    _sized(window, DEFAULT_SIZE)
+    assert [lb.text() for lb in _sub(window).findChildren(QLabel)] == \
+        ["3 saved searches"]
+
+    shell.go(APP.OUTREACH)
+    _sized(window, DEFAULT_SIZE)
+    assert not _sub(window).findChildren(QLabel), \
+        "the context line followed the user off the screen it belongs to"
+
+    shell.go(APP.INPUT)
+    shell.set_context(APP.INPUT, "")
+    _sized(window, DEFAULT_SIZE)
+    assert not _sub(window).findChildren(QLabel)
+    assert not _sub(window).isVisible()
+
+
+def test_the_theme_changes_while_the_app_is_running():
+    """A theme toggle that needs a restart is not a theme toggle.
+
+    Measured as paint rather than as state: the bar is grabbed in each palette
+    and the colour most of it comes out has to be that palette's own `surface`.
+    The preference is written to the settings file as well, because a toggle
+    that forgets is the same defect one launch later.
+    """
+    window = _window()
+    saved = dict(window.settings)
+    app = QApplication.instance()
+    try:
+        window.shell.go(APP.INPUT)
+        _sized(window, DEFAULT_SIZE)
+        painted = _histogram(_bar(window))
+        assert max(painted, key=painted.get) == THEME.color["surface"].upper()
+
+        window.toggle_theme()
+        app.processEvents()
+        light = TH.theme("light")
+        assert window.theme.name == "light"
+        assert app.styleSheet() == TH.stylesheet(light), \
+            "the sheet on the application is not the light one"
+        assert ST.load_settings()["theme"] == "light", \
+            "the choice was not written to the settings file"
+
+        window.layout().activate()
+        app.processEvents()
+        painted = _histogram(_bar(window))
+        assert max(painted, key=painted.get) == light.color["surface"].upper(), (
+            "the bar still paints %s and the light surface is %s"
+            % (max(painted, key=painted.get), light.color["surface"].upper()))
+
+        window.toggle_theme()
+        app.processEvents()
+        painted = _histogram(_bar(window))
+        assert max(painted, key=painted.get) == THEME.color["surface"].upper(), \
+            "the bar did not come back to the dark palette"
+    finally:
+        window.settings = dict(saved)
+        ST.save_settings(saved)
+        window.apply_appearance(saved)
+        _app()
+
+
+def test_the_compact_density_reaches_the_controls_without_a_restart():
+    """The other half of what the settings file could not ask for."""
+    window = _window()
+    saved = dict(window.settings)
+    try:
+        window.shell.go(APP.INPUT)
+        assert _bar_buttons(window, "tab")[0].height() == THEME.control["sm"]
+
+        window.apply_appearance(dict(saved, density="compact"))
+        _app().processEvents()
+        compact = TH.theme(THEME.name, "compact")
+        assert window.theme.density == "compact"
+        assert _bar_buttons(window, "tab")[0].height() == compact.control["sm"], (
+            "a compact bar tab is %dpx and control.sm is %d"
+            % (_bar_buttons(window, "tab")[0].height(), compact.control["sm"]))
+        assert _bar(window).height() == compact.control["header"]
+    finally:
+        window.apply_appearance(saved)
+        _app()
+        assert _bar(window).height() == THEME.control["header"]
+
+
+def test_shutting_the_window_stops_only_the_screens_that_exist():
+    """The window used to hold four screens; it now holds what it has built."""
+    window = _window()
+    window.shutdown_worker()
+    for screen in window.shell.screens():
+        assert APP._screen_threads(screen) == [], \
+            "%r is still running a thread after shutdown" % screen
+
+
+# ── U12: the first run, the table's widths, and the page's measure ───────────
+# The auditor's worst journey in the product is not visual. Email was unticked
+# by default, so the default scrape produced no email column; Start Outreach
+# then imported nothing; and leaving Results made the scraped table permanently
+# unreachable, so the way to find out about the checkbox was a full second run
+# of Chrome. Everything in this section is one of the three parts of that, or
+# one of the two geometry findings on the screens it happens on.
+
+SITE = "https://www.harbourfrontdental-%02d.example.com"
+MAIL = "reception%02d@harbourfrontdental.example.com"
+STREET = "%d King Street West, Suite 1200, Toronto, ON M5H 1A1"
+
+LEAD_FIELDS = ["name", "category", "rating", "review_count", "address",
+               "website", "phone", "email"]
+
+# 1280 is the size the audit measured the clipping at and 2560 the one it
+# measured the ballooning at; `MINIMUM_SIZE` and `DEFAULT_SIZE` are the two the
+# window itself uses.
+WIDE_SIZE, AUDIT_SIZE = (2560, 1440), (1280, 860)
+
+# What a 44-character address — the length the audit named — takes in the
+# table's own 12px, plus the cell's padding.
+EMAIL_PX = 275
+
+
+def _leads(count: int = 20) -> list:
+    return [{"name": "Harbourfront Dental Care %d" % i,
+             "category": "Roofing contractor",
+             "rating": "4.%d" % (i % 10),
+             "review_count": "%d" % (120 + i * 37),
+             "address": STREET % (10 + i),
+             "website": SITE % i,
+             "phone": "+1 416-555-01%02d" % i,
+             "email": MAIL % i} for i in range(count)]
+
+
+def _filled(screen, rows: list):
+    """The results screen holding `rows`, over the throwaway profile."""
+    screen.setup(["dentists"], ["Toronto"], LEAD_FIELDS, max_results=len(rows),
+                 export_dir=_TMP)
+    for row in rows:
+        screen.add_table_row(row)
+    return screen
+
+
+def _column(screen, field: str) -> int:
+    return screen.fields.index(field)
+
+
+def _elided(screen, field: str) -> int:
+    column = _column(screen, field)
+    return sum(1 for row in range(screen.table.rowCount())
+               if screen.table.is_elided(row, column))
+
+
+def _refilled(edit, text: str) -> None:
+    """Replace whatever is in `edit` with `text`, typed rather than assigned.
+
+    Not `_typed`, which this used to be called and which is defined in U9 above
+    for a caret contract it is the opposite of: that one adds text at the caret,
+    this one clears the box first. Two functions of one name in one module meant
+    the later definition answered both, so U9's "the keystroke after the insert
+    lands where the caret was left" was measured against a box that had just
+    been emptied — and passed on a screen that had thrown the insert away.
+    """
+    edit.setFocus(Qt.OtherFocusReason)
+    edit.clear()
+    QTest.keyClicks(edit, text)
+
+
+def test_the_default_field_set_comes_back_with_an_address_to_mail():
+    """Part one of the worst journey, and the only part that is one checkbox.
+
+    `email` was in `DEFAULT_OFF_FIELDS` because it is slow — it fetches each
+    business website — so the scrape a new user runs without changing anything
+    returned no email column at all, and the campaign built from it had nobody
+    to send to. It is still slow and it is on anyway: the address is the one
+    field the product exists to produce.
+    """
+    screen = _screen("input")
+    fields = screen.get_checked_fields()
+    assert "email" in fields, \
+        "the default scrape still collects no address: %s" % fields
+    assert "email" not in screen.DEFAULT_OFF_FIELDS
+    assert "email" in screen.SLOW_FIELDS, \
+        "the cost of the default has stopped being recorded"
+    assert screen.ENRICH_FIELDS - {"email"} <= set(screen.DEFAULT_OFF_FIELDS), \
+        "the socials came on with it, and they are the slow half"
+
+    try:
+        screen._select_fast_fields()
+        assert "email" not in screen.get_checked_fields(), \
+            "Fast only has to still mean fast"
+        screen._select_default_fields()
+        assert "email" in screen.get_checked_fields(), \
+            "there is no one-click way back to the shipping default"
+    finally:
+        screen._select_default_fields()
+
+
+def test_the_export_folder_is_filled_in_before_anyone_is_asked():
+    """The modal dialog that stood between a fresh install and its first scrape.
+
+    The rule — the folder has to exist — was enforced by a 200ms shake, so the
+    first thing this screen did to a new user was refuse to start and not say
+    why. It arrives filled in with a real path, and the path is made on the way
+    past rather than demanded first.
+    """
+    screen = _screen("input")
+    saved = screen.export_dir()
+    assert saved, "the export folder is empty on a fresh screen again"
+    assert os.path.basename(saved) == "MapHarvest", \
+        "the default export folder is %r" % saved
+
+    wanted = os.path.join(_TMP, "exports", "first-run")
+    assert not os.path.isdir(wanted)
+    try:
+        screen.export_dir_input.setText(wanted)
+        _refilled(screen.domain_input, "dentists")
+        _refilled(screen.area_input, "Toronto")
+        validated = screen.validate()
+        assert validated is not None, "a folder that can be made was refused"
+        assert os.path.isdir(wanted), "the folder was not made"
+        assert validated[3] == wanted
+    finally:
+        screen.export_dir_input.setText(saved)
+        screen.domain_input.clear()
+        screen.area_input.clear()
+
+
+def test_an_invalid_field_answers_in_words_beside_itself():
+    """Part of the same thing: the shake said nothing and moved a control 6px.
+
+    Every rule this screen keeps is now a sentence under the field it belongs
+    to, and the field takes the keyboard. The control that may not move is the
+    one that was just clicked, and Start Scraping is in the footer rather than
+    in the scrolling page, so it is where it was.
+    """
+    screen = _sized(_screen("input"), DEFAULT_SIZE)
+    saved = screen.export_dir()
+    try:
+        screen.domain_input.clear()
+        screen.area_input.clear()
+        before = screen.start_btn.mapTo(screen, QPoint(0, 0))
+
+        assert screen.validate() is None
+        _app().processEvents()
+        assert screen.domain_field.error.isVisible(), \
+            "an empty domain still refuses in silence"
+        assert len(screen.domain_field.error.text()) > 20, \
+            "the error is %r" % screen.domain_field.error.text()
+        # `focusWidget`, not `hasFocus`: the latter is also a claim about which
+        # top-level window is active, and every other host in this file takes
+        # that away on its way past.
+        assert screen.focusWidget() is screen.domain_input, \
+            "the field the message is about does not have the keyboard"
+        assert screen.domain_field.error.mapTo(screen, QPoint(0, 0)).y() > \
+            screen.domain_input.mapTo(screen, QPoint(0, 0)).y(), \
+            "the message is not under the field it is about"
+        assert screen.start_btn.mapTo(screen, QPoint(0, 0)) == before, \
+            "the button that was just clicked moved out from under the pointer"
+
+        _refilled(screen.domain_input, "dentists")
+        assert not screen.domain_field.error.isVisible(), \
+            "the error outlived the thing it was about"
+
+        assert screen.validate() is None
+        assert screen.area_field.error.isVisible(), "the next rule says nothing"
+
+        _refilled(screen.area_input, "Toronto")
+        screen.export_dir_input.setText(os.path.join(_TMP, "no*such:folder"))
+        assert screen.validate() is None
+        assert screen.export_field.error.isVisible(), \
+            "a folder that cannot be made is refused in silence"
+
+        screen.export_dir_input.setText(_TMP)
+        for box in screen.checkboxes.values():
+            box.setChecked(False)
+        assert screen.validate() is None
+        assert screen.fields_error.isVisible(), \
+            "an empty field list is refused with a 600ms colour change again"
+    finally:
+        screen._select_default_fields()
+        screen.export_dir_input.setText(saved)
+        screen.domain_input.clear()
+        screen.area_input.clear()
+        screen._clear_errors()
+
+
+def test_a_fresh_install_reaches_outreach_without_a_second_scrape():
+    """The loop, end to end, counted in the clicks it costs.
+
+    Eleven on these two screens before: two fields, three for the folder
+    dialog, Start, Start Outreach into an empty campaign, back to Home, the
+    Email checkbox, Start again, Start Outreach again — and the second Start is
+    a full re-run of Chrome. Four now, and this test is the four: the domain,
+    the area, Start Scraping, Start Outreach. Everything else the run needs is
+    already true when the screen is built.
+    """
+    screen = _screen("input")
+    results = _screen("results")
+    saved_dir = screen.export_dir()
+    exports = os.path.join(_TMP, "first-loop")
+    started, handed = [], []
+    screen.start_signal.connect(lambda *a: started.append(a))
+    results.outreach_signal.connect(handed.append)
+    try:
+        screen.export_dir_input.setText(exports)
+        _refilled(screen.domain_input, "dentists")        # click 1
+        _refilled(screen.area_input, "Toronto")           # click 2
+        screen.start_btn.click()                       # click 3
+
+        assert len(started) == 1, "Start Scraping refused the default screen"
+        domains, areas, fields, _headless, limit, export_dir, _filters = started[0]
+        assert domains == ["dentists"] and areas == ["Toronto"]
+        assert "email" in fields, "the first scrape still has no address column"
+        assert export_dir == exports and os.path.isdir(exports)
+        assert limit > 0
+
+        _filled(results, _leads(3))
+        results.outreach_btn.click()                   # click 4
+        assert len(handed) == 1 and len(handed[0]) == 3, \
+            "the hand-off carried %s" % (handed,)
+        assert all(record.get("email") for record in handed[0]), \
+            "the leads handed to Outreach still have no address to send to"
+    finally:
+        screen.start_signal.disconnect()
+        results.outreach_signal.disconnect()
+        results._set_idle_mode()
+        screen.export_dir_input.setText(saved_dir)
+        screen.domain_input.clear()
+        screen.area_input.clear()
+
+
+def test_the_scrape_is_still_reachable_after_leaving_the_results_screen():
+    """The third part, and the one that cost a re-scrape all on its own.
+
+    Home had no control that returned to Results, and coming back in went
+    through `setup`, which clears `self.results` — so the rows a run had just
+    produced were gone for good the moment the user pressed Home. The shell
+    carries Results as a destination and opens it without arguments, so the
+    table survives the round trip.
+    """
+    window = _window()
+    shell = window.shell
+    results = shell.screen(APP.RESULTS)
+    rows = _leads(4)
+    try:
+        _filled(results, rows)
+        assert results.table.rowCount() == len(rows)
+        assert "Results" in [button.text()
+                             for button in _bar_buttons(window, "tab")], \
+            "the bar carries no way back to the scrape"
+
+        shell.go(APP.INPUT)
+        shell.go(APP.RESULTS)
+        _app().processEvents()
+
+        assert shell.screen(APP.RESULTS) is results, "a second screen was built"
+        assert results.table.rowCount() == len(rows), (
+            "the round trip emptied the table: %d rows left"
+            % results.table.rowCount())
+        assert [record["email"] for record in results.results] == \
+            [record["email"] for record in rows]
+        assert results.table_stack.currentWidget() is results.table
+    finally:
+        results._set_idle_mode()
+        shell.go(APP.INPUT)
+
+
+def test_the_results_table_hands_its_width_to_the_columns_that_carry_it():
+    """The first critical geometry finding, at the three sizes it was found at.
+
+    Every column was a flat 130px with `stretchLastSection` on, so at 1280 with
+    20 leads Website, Email and Address were cut in 20 of 20 rows while Rating
+    had 115px of slack and Review Count 250px; at 880 the same table scrolled
+    400px sideways; at 2560 the last column alone took 1550px. The spec sizes a
+    short fixed value to its content and shares the rest between the columns
+    that carry meaning, so what follows is the same table three times.
+    """
+    screen = _filled(_screen("results"), _leads(20))
+    try:
+        measured = {}
+        for size in (MINIMUM_SIZE, AUDIT_SIZE, WIDE_SIZE):
+            _sized(screen, size)
+            table = screen.table
+            widths = {field: table.columnWidth(_column(screen, field))
+                      for field in LEAD_FIELDS}
+            measured[size[0]] = widths
+
+            assert not table.horizontalScrollBar().maximum(), (
+                "%d: the table scrolls %dpx sideways"
+                % (size[0], table.horizontalScrollBar().maximum()))
+            assert sum(widths.values()) <= table.viewport().width(), \
+                "%d: the columns are wider than the table" % size[0]
+
+            # Nothing that does not fit may be silent about it: 11 of the 16
+            # cut cells the audit counted had no tooltip at all.
+            tipless = [(row, column)
+                       for row in range(table.rowCount())
+                       for column in range(table.columnCount())
+                       if table.is_elided(row, column)
+                       and not table.tooltip_at(row, column)]
+            assert not tipless, (
+                "%d: %d cut cells answer a hover with nothing"
+                % (size[0], len(tipless)))
+
+            # A number is as wide as the number, whatever the window is.
+            for field in ("rating", "review_count"):
+                assert widths[field] <= widths["email"] // 2, (
+                    "%d: %s takes %dpx beside a %dpx email"
+                    % (size[0], field, widths[field], widths["email"]))
+
+        for width in (AUDIT_SIZE[0], WIDE_SIZE[0]):
+            assert measured[width]["email"] >= EMAIL_PX, (
+                "%d: the email column is %dpx and a 44-character address needs "
+                "%d" % (width, measured[width]["email"], EMAIL_PX))
+
+        _sized(screen, AUDIT_SIZE)
+        assert _elided(screen, "email") == 0, (
+            "the email is still cut in %d of 20 rows at 1280"
+            % _elided(screen, "email"))
+        assert _elided(screen, "name") == 0
+
+        _sized(screen, WIDE_SIZE)
+        for field in LEAD_FIELDS:
+            assert _elided(screen, field) == 0, (
+                "%s is cut in %d of 20 rows on a 2560px window"
+                % (field, _elided(screen, field)))
+        widest = max(measured[WIDE_SIZE[0]].values())
+        assert widest <= 2 * measured[AUDIT_SIZE[0]]["email"], \
+            "a column ballooned to %dpx on the wide window" % widest
+    finally:
+        _sized(screen, DEFAULT_SIZE)
+
+
+def test_a_scrape_that_fails_puts_the_whole_message_on_screen():
+    """It was cut to 60 characters, and the rest of it existed nowhere.
+
+    A Selenium failure names the driver, the binary and the version that did
+    not match, and all three are past the 60th character. The error state
+    carries the whole of it, selectable because the next thing anyone does with
+    one of these is paste it somewhere, and the toast that carries it as well
+    is the one tone that waits to be dismissed.
+    """
+    screen = _screen("results")
+    message = ("Message: session not created: This version of ChromeDriver "
+               "only supports Chrome version 121. Current browser version is "
+               "126.0.6478.127 with binary path C:\\Program Files\\Google\\"
+               "Chrome\\Application\\chrome.exe")
+    try:
+        screen.results = []
+        screen.table.setRowCount(0)
+        screen.on_error(message)
+        _app().processEvents()
+
+        assert screen.table_stack.currentIndex() == screen.ERROR_PAGE
+        shown = screen.error_page.body_label.text()
+        assert shown == message, (
+            "the error on screen is %d characters of %d"
+            % (len(shown), len(message)))
+        assert screen.error_page.body_label.textInteractionFlags() & \
+            Qt.TextSelectableByMouse, "the message cannot be copied"
+        assert screen.error_page.action_button is not None, \
+            "the failed run offers no way out"
+
+        toasts = screen.toaster.toasts()
+        assert toasts and toasts[-1].tone == "danger"
+        assert message in toasts[-1].text_label.text()
+        assert toasts[-1].timer is None, \
+            "the failure toast takes itself off screen while it is being read"
+    finally:
+        screen.toaster.clear()
+        screen._error = ""
+        screen._update_table_page()
+
+
+def test_the_recent_searches_box_says_what_would_fill_it():
+    """It was a 596x440 bordered box holding one grey sentence."""
+    screen = _screen("input")
+    saved = list(screen.settings.get("saved_searches") or [])
+    try:
+        screen.settings["saved_searches"] = []
+        screen._refresh_saved_list()
+        _app().processEvents()
+        assert screen.saved_stack.currentWidget() is screen.saved_empty
+        assert screen.saved_list.count() == 0, \
+            "the empty list still holds a row that cannot be clicked"
+        card = screen.saved_empty.findChild(QFrame, "card")
+        assert card is not None, "the empty state is a bare rectangle again"
+        assert "Nothing saved yet" in " ".join(
+            label.text() for label in card.findChildren(QLabel))
+
+        screen.settings["saved_searches"] = [
+            {"domains": ["dentists"], "area": "Toronto", "max_results": 20}]
+        screen._refresh_saved_list()
+        assert screen.saved_stack.currentWidget() is screen.saved_list
+        assert screen.saved_list.count() == 1
+    finally:
+        screen.settings["saved_searches"] = saved
+        screen._refresh_saved_list()
+
+
+def test_the_home_page_gains_a_column_rather_than_stretching_one():
+    """The second geometry finding: at 2560 this was empty boxes and 600px cells.
+
+    Every sentence on the page is capped in characters by the component that
+    draws it, so a column is exactly as wide as readable copy and no wider —
+    and a window with room for another column is given another column instead
+    of the same one stretched across it.
+    """
+    screen = _screen("input")
+    seen = {}
+    for size in (MINIMUM_SIZE, DEFAULT_SIZE, AUDIT_SIZE, WIDE_SIZE):
+        _sized(screen, size)
+        page = screen.page
+        seen[size[0]] = page.columns_shown()
+
+        measured = [widget for widget in screen.findChildren(QWidget)
+                    if widget.isVisible()
+                    and isinstance(widget, (QLabel, QLineEdit, QCheckBox))]
+        widest = max(measured, key=lambda widget: widget.width())
+        assert widest.width() <= page.column_width(), (
+            "%d: %s is %dpx against a %dpx measure"
+            % (size[0], widest.__class__.__name__, widest.width(),
+               page.column_width()))
+
+        overflowing = [widget for widget in measured
+                       if widget.mapTo(screen, QPoint(0, 0)).x() + widget.width()
+                       > screen.width()]
+        assert not overflowing, \
+            "%d: %d controls run off the side" % (size[0], len(overflowing))
+
+    assert seen[MINIMUM_SIZE[0]] >= 2, \
+        "the minimum window fell back to one column: %s" % seen
+    assert seen[WIDE_SIZE[0]] > seen[AUDIT_SIZE[0]] > seen[DEFAULT_SIZE[0]], \
+        "the page does not gain a column as the window grows: %s" % seen
+    _sized(screen, DEFAULT_SIZE)
+
+
+
+# ── U13: the settings screen, after it gave its chrome back ──────────────────
+# Everything below is a defect the design-system audit measured on this one
+# screen: two rows of chrome, no way to cancel, a scheduler that overrode the
+# numbers the UI reported back, controls out of reach at the window minimum,
+# seven left edges on one tab, the merge palette wearing the navigation control,
+# and an unconfirmed, unannounced, unrecoverable Remove.
+
+
+@contextlib.contextmanager
+def _agreeing(answer: bool):
+    """`components.confirm` answered without a modal nobody could close."""
+    saved = SS.C.confirm
+    asked = []
+
+    def stub(_parent, **kwargs):
+        asked.append(kwargs)
+        return answer
+
+    SS.C.confirm = stub
+    try:
+        yield asked
+    finally:
+        SS.C.confirm = saved
+
+
+def _form_labels(page) -> list:
+    return [label for label in page.findChildren(SS._FormLabel)
+            if label.isVisible()]
+
+
+def _control_edges(page) -> set:
+    """Where column one starts, taken off every form grid on the page."""
+    edges = set()
+    for grid in page.findChildren(QGridLayout):
+        for row in range(grid.rowCount()):
+            head, cell = grid.itemAtPosition(row, 0), grid.itemAtPosition(row, 1)
+            if head is None or cell is None:
+                continue
+            if isinstance(head.widget(), SS._FormLabel):
+                edges.add(grid.cellRect(row, 1).x())
+    return edges
+
+
+def test_the_settings_screen_draws_no_bar_of_its_own():
+    """The two rows of chrome, and which of them the screen was still drawing.
+
+    It carried a Back button, a title and a strip of seven tabs directly under
+    the shell's own bar — the same navigation control twice, one row apart. The
+    tabs are handed back through `subtabs()` now and everything else is gone.
+    """
+    screen = _sized(_screen("settings"), DEFAULT_SIZE)
+    labels, on_change, _current = screen.subtabs()
+    assert labels == screen.TABS and callable(on_change)
+    assert len(labels) == screen.pages.count(), \
+        "%d tabs over %d pages" % (len(labels), screen.pages.count())
+
+    assert screen.findChild(QWidget, "app_bar") is None, \
+        "the screen brought a top bar of its own"
+    strip = [button for button in screen.findChildren(QPushButton)
+             if button.objectName() == "tab"]
+    assert strip == [], \
+        "the screen still draws its own tabs: %s" % [b.text() for b in strip]
+    named = {button.text() for button in screen.findChildren(QPushButton)}
+    assert not named & {"Back", "Home", "Settings"}, \
+        "the screen still draws its own chrome: %s" % sorted(named)
+
+    on_change(screen.TABS.index("Gmail"))
+    assert screen.pages.currentIndex() == screen.TABS.index("Gmail"), \
+        "the shell cannot move the page"
+    on_change(0)
+
+
+def test_leaving_settings_writes_nothing_and_saving_says_so_where_it_shows():
+    """Back used to save the whole file on the way past.
+
+    So a half-finished sending window was committed by the act of navigating
+    away, and the one confirmation it produced was written into a header on a
+    screen the user was no longer looking at. Both decisions are commands in a
+    footer now, the footer is on screen whenever the settings are, and it says
+    which of them there is anything to do.
+    """
+    screen = _sized(_screen("settings"), DEFAULT_SIZE)
+    screen.pages.setCurrentIndex(screen.TABS.index("Sending"))
+    _sized(screen, DEFAULT_SIZE)
+    on_disk = ST.load_settings()
+    # Settled first: this screen is shared with every other test in the file and
+    # several of them type into it, and what is measured here is the step from
+    # "nothing outstanding" to "something is".
+    screen.settings = ST.load_settings()
+    screen._load_into_ui()
+    _app().processEvents()
+    was = screen.hourly_cap_spin.value()
+    try:
+        assert not screen._dirty
+        assert not screen.discard_btn.isEnabled(), \
+            "Discard offers to undo a screen nobody has touched"
+
+        screen.hourly_cap_spin.setValue(was + 3)
+        _app().processEvents()
+        assert screen._dirty, "an edited spin box is not noticed"
+        assert screen.save_status.text() == "Unsaved changes", \
+            "the footer says %r" % screen.save_status.text()
+        assert screen.discard_btn.isEnabled()
+
+        # Leaving. Nothing may reach the file, and the screen must keep the edit.
+        left = []
+        screen.back_signal.connect(lambda: left.append(True))
+        with _answering(QMessageBox.Cancel) as dialog:
+            screen._on_back()
+        assert dialog.asked == 1, "leaving with unsaved changes asked nothing"
+        assert left == [], "Cancel left the screen anyway"
+        assert ST.load_settings().get("hourly_cap_per_account") == \
+            on_disk.get("hourly_cap_per_account"), \
+            "leaving wrote the edit to the settings file"
+        assert screen.hourly_cap_spin.value() == was + 3, \
+            "the unsaved edit was thrown away by being asked about"
+
+        # Saving. The file moves and the confirmation is on this screen.
+        assert screen._on_save()
+        assert ST.load_settings().get("hourly_cap_per_account") == was + 3
+        assert screen.save_status.text() == "Saved"
+        assert screen.save_status.isVisible(), \
+            "the confirmation is on a screen nobody is looking at"
+        assert not screen._dirty and not screen.discard_btn.isEnabled()
+
+        # Discarding. The widgets go back to the file, and it asks first.
+        screen.hourly_cap_spin.setValue(was + 9)
+        _app().processEvents()
+        with _agreeing(False) as asked:
+            screen._on_discard()
+        assert len(asked) == 1, "Discard threw the edits away without asking"
+        assert screen.hourly_cap_spin.value() == was + 9, \
+            "declining the question discarded anyway"
+        with _agreeing(True):
+            screen._on_discard()
+        assert screen.hourly_cap_spin.value() == was + 3, \
+            "Discard did not put the field back to the file"
+        assert not screen._dirty
+    finally:
+        screen.hourly_cap_spin.setValue(was)
+        screen._on_save()
+        ST.save_settings(on_disk)
+        screen.settings = ST.load_settings()
+        screen._load_into_ui()
+        screen.pages.setCurrentIndex(0)
+
+
+def test_the_scheduler_s_own_limits_are_shown_beside_the_numbers_that_ask():
+    """`core.campaign` composes rather than obeys, and the UI used to hide it.
+
+    Three caps become their minimum, an inverted window becomes one hour, an
+    empty day set becomes Monday to Friday. Every one of those happened in
+    silence with the requested number still on screen — a user who set a 40/day
+    cap and left the warm-up ramp on was told 40 and sent 10. Each note is empty
+    when nothing is being overridden, because a note beside every field is a
+    note nobody reads.
+    """
+    screen = _sized(_screen("settings"), DEFAULT_SIZE)
+    screen.pages.setCurrentIndex(screen.TABS.index("Sending"))
+    _sized(screen, DEFAULT_SIZE)
+    on_disk = ST.load_settings()
+    try:
+        # A schedule the scheduler will keep exactly as it is asked to, over no
+        # accounts and with no ramp, so that "nothing is annotated" means the
+        # notes are quiet rather than that nothing was set.
+        with _agreeing(True):
+            for row in list(screen._account_rows):
+                screen._remove_account_row(row)
+        screen.toaster.clear()
+        for box in screen.day_boxes:
+            box.setChecked(True)
+        screen.warmup_cb.setChecked(False)
+        screen.start_hour_spin.setValue(9)
+        screen.end_hour_spin.setValue(17)
+        screen.min_gap_spin.setValue(60)
+        screen.max_gap_spin.setValue(240)
+        screen.daily_cap_spin.setValue(40)
+        _app().processEvents()
+        quiet = [note for note in (screen.days_note, screen.window_note,
+                                   screen.gap_note, screen.cap_note)
+                 if note.isVisible()]
+        assert quiet == [], \
+            "a setting nothing overrides is annotated anyway: %s" % (
+                [note.text() for note in quiet],)
+
+        for box in screen.day_boxes:
+            box.setChecked(False)
+        screen.end_hour_spin.setValue(9)
+        screen.min_gap_spin.setValue(300)
+        screen.max_gap_spin.setValue(120)
+        _app().processEvents()
+
+        assert screen.days_note.isVisible() and "Mon" in screen.days_note.text(), \
+            "no day ticked is read as the working week and says nothing"
+        kept = SS._campaign._hours({"send_start_hour": 9, "send_end_hour": 9})
+        assert screen.window_note.isVisible() and \
+            "%02d:00" % kept[1] in screen.window_note.text(), \
+            "an inverted window is forced to an hour in silence: %r" \
+            % screen.window_note.text()
+        assert screen.gap_note.isVisible() and "120" in screen.gap_note.text(), \
+            "an inverted pacing range is swapped in silence: %r" \
+            % screen.gap_note.text()
+
+        # And the per-account cap, which is the one the audit caught: a warm-up
+        # ramp lower than the number in the box.
+        screen.daily_cap_spin.setValue(40)
+        screen.warmup_cb.setChecked(True)
+        screen.warmup_start_spin.setValue(10)
+        screen.warmup_max_spin.setValue(40)
+        screen._add_account_row({"email": "ramp@example.com", "daily_cap": 40,
+                                 "warmup_started": "2099-01-01"})
+        _app().processEvents()
+        row = screen._account_rows[-1]
+        assert screen.cap_note.isVisible(), \
+            "the ramp is lower than the cap and the page says nothing"
+        # isVisibleTo, not isVisible: the row lives on the Gmail tab while
+        # this test stands on Sending, so the subtree is legitimately hidden.
+        # The guarantee is that the label is not hidden within its own row --
+        # that it shows when the user is actually looking at the account.
+        assert row.effective_label.isVisibleTo(row) and \
+            "not 40" in row.effective_label.text(), \
+            "the account row reports the number it was asked for: %r" \
+            % row.effective_label.text()
+    finally:
+        with _agreeing(True):
+            for row in list(screen._account_rows):
+                screen._remove_account_row(row)
+        screen.toaster.clear()
+        ST.save_settings(on_disk)
+        screen.settings = ST.load_settings()
+        screen._load_into_ui()
+        screen.pages.setCurrentIndex(0)
+
+
+def test_every_form_on_every_tab_lines_up_on_one_pair_of_edges():
+    """The audit measured seven left edges on the Sending tab alone.
+
+    Four of them within 30px of each other and two of them 4px apart in adjacent
+    groups, because each grid sized its own label column to its own longest
+    word. There is one label column for the whole screen now, reserved from the
+    widest string any tab uses and measured in the font that draws it, so a tab
+    is a page rather than a stack of unrelated forms.
+    """
+    screen = _sized(_screen("settings"), DEFAULT_SIZE)
+    opened = screen.pages.currentIndex()
+    labels, controls, seen = set(), set(), 0
+    try:
+        for index in range(screen.pages.count()):
+            screen.pages.setCurrentIndex(index)
+            _sized(screen, DEFAULT_SIZE)
+            page = screen.pages.currentWidget()
+            here = _form_labels(page)
+            seen += len(here)
+            labels |= {label.mapTo(page, QPoint(0, 0)).x() for label in here}
+            labels |= {label.width() for label in here}
+            controls |= _control_edges(page)
+    finally:
+        screen.pages.setCurrentIndex(opened)
+        _sized(screen, DEFAULT_SIZE)
+
+    assert seen >= 30, "only %d form labels were reachable" % seen
+    assert len(labels) == 2, (
+        "the label column starts or ends in more than one place: %s"
+        % sorted(labels))
+    assert len(controls) == 1, \
+        "column one starts at %s" % sorted(controls)
+
+
+def test_the_merge_palette_is_a_chip_and_not_the_navigation_control():
+    """Twenty-one merge fields were `QPushButton#tab`, the app's own top-level
+    navigation, and the keyboard cursor on them reused the selected-tab fill
+    exactly — so the chip under the caret read as the open tab.
+
+    A chip is a short value and a tab is a place. They are different components
+    because they are different promises.
+    """
+    screen = _templates_page(_screen("settings"))
+    chips = screen.template_chips._chips
+    assert len(chips) == len(TPL.MERGE_FIELDS)
+    assert not any(isinstance(chip, QPushButton) for chip in chips), \
+        "a merge field is still a button"
+    assert {chip.property("role") for chip in chips} == {"chip"}, \
+        "the palette is not built by components.chip()"
+
+    theme = TH.theme()
+    selected = theme.color["surfaceActive"].upper()
+    cursor = screen.template_chips._marked
+    assert selected not in cursor.upper(), \
+        "the chip cursor is painted in the selected-tab fill"
+    assert theme.color["accent.border"].upper() in cursor.upper(), \
+        "the chip cursor is not the app's focus ink: %r" % cursor
+
+
+def test_taking_a_mailbox_off_the_rota_asks_first_and_can_be_taken_back():
+    """Remove was one click, unconfirmed, unannounced and unrecoverable.
+
+    What went with the row was the app password, and Google never shows an app
+    password twice — so an accidental click cost a trip to a Google account page
+    to mint a new one.
+    """
+    screen = _sized(_screen("settings"), DEFAULT_SIZE)
+    screen.pages.setCurrentIndex(screen.TABS.index("Gmail"))
+    _sized(screen, DEFAULT_SIZE)
+    before = len(screen._account_rows)
+    try:
+        screen._add_account_row({"email": "first@example.com", "daily_cap": 10})
+        screen._add_account_row({"email": "second@example.com", "daily_cap": 20})
+        screen._account_rows[-2].set_password("abcd efgh ijkl mnop")
+        _app().processEvents()
+        row = screen._account_rows[-2]
+
+        with _agreeing(False) as asked:
+            screen._remove_account_row(row)
+        assert len(asked) == 1, "Remove took the mailbox without asking"
+        assert asked[0].get("danger") is True, \
+            "removing a mailbox is not asked as a destructive action"
+        assert row in screen._account_rows, "declining removed it anyway"
+
+        with _agreeing(True):
+            screen._remove_account_row(row)
+        assert row not in screen._account_rows, "the row survived Remove"
+        toasts = screen.toaster.toasts()
+        assert len(toasts) == 1, "removing a mailbox announced nothing"
+        undo = toasts[-1].findChild(QPushButton)
+        assert undo is not None and undo.text().lower() == "undo", \
+            "the announcement carries no way back"
+
+        undo.click()
+        _app().processEvents()
+        addresses = [one.email() for one in screen._account_rows]
+        assert "first@example.com" in addresses, "Undo did not put it back"
+        restored = screen._account_rows[addresses.index("first@example.com")]
+        assert restored.app_password() == "abcd efgh ijkl mnop", \
+            "Undo put the mailbox back without its app password"
+        assert [one.title_label.text() for one in screen._account_rows] == \
+            ["Account %d" % (n + 1) for n in range(len(screen._account_rows))], \
+            "the rows are numbered %s" % [one.title_label.text()
+                                          for one in screen._account_rows]
+    finally:
+        with _agreeing(True):
+            while len(screen._account_rows) > before:
+                screen._remove_account_row(screen._account_rows[-1])
+        screen.toaster.clear()
+        screen._dirty = False
+        screen.pages.setCurrentIndex(0)
+        _sized(screen, DEFAULT_SIZE)
+
+
+def test_the_way_to_add_a_mailbox_stays_where_it_is_at_the_window_minimum():
+    """It scrolled with the accounts, so it moved further away with each one.
+
+    At 880x620 with two accounts configured it started below the bottom edge:
+    the control for getting out of an empty state was reachable only by
+    scrolling past what was missing.
+    """
+    screen = _sized(_screen("settings"), MINIMUM_SIZE)
+    screen.pages.setCurrentIndex(screen.TABS.index("Gmail"))
+    _sized(screen, MINIMUM_SIZE)
+    before = len(screen._account_rows)
+    page = screen.pages.currentWidget()
+    try:
+        seen = []
+        for count in range(4):
+            _sized(screen, MINIMUM_SIZE)
+            button = screen.add_account_btn
+            top = button.mapTo(page, QPoint(0, 0)).y()
+            seen.append(top)
+            assert button.isVisible(), \
+                "Add account is not on screen with %d accounts" % count
+            assert 0 <= top and top + button.height() <= page.height(), (
+                "Add account sits at %d..%d of a %dpx page with %d accounts"
+                % (top, top + button.height(), page.height(), count))
+            assert _scroll_ancestor(button) is None, \
+                "Add account is inside the column that scrolls"
+            screen._add_account_row({"email": "a%d@example.com" % count})
+        assert len(set(seen)) == 1, \
+            "Add account moved as accounts were added: %s" % seen
+    finally:
+        with _agreeing(True):
+            while len(screen._account_rows) > before:
+                screen._remove_account_row(screen._account_rows[-1])
+        screen.toaster.clear()
+        screen._dirty = False
+        screen.pages.setCurrentIndex(0)
+        _sized(screen, DEFAULT_SIZE)
+
+
+def test_the_body_label_is_whole_and_the_editor_reachable_at_the_minimum():
+    """The BODY label was sliced in half by the bottom edge of an 880x620 window.
+
+    The merge palette reflowed to five rows and took 165px of a 308px column,
+    which put the body editor below the fold with its own label cut through.
+    Both are bounded now, and the editor is reachable by scrolling the column
+    that holds it rather than being clipped by the page.
+    """
+    screen = _templates_page(_screen("settings"), MINIMUM_SIZE)
+    palette = screen.template_chips_pane
+    assert palette.height() <= palette.ceiling(), \
+        "the merge palette is %dpx against a %dpx ceiling" % (
+            palette.height(), palette.ceiling())
+    assert palette.height() < screen.template_chips.height() \
+        or screen.template_chips.rows() <= 3, \
+        "the palette is still growing to whatever the chips need"
+
+    editor = screen.template_body_edit
+    column = _scroll_ancestor(editor)
+    assert column is not None, "the body editor is not in a scrolling column"
+    label = next(one for one in screen.pages.currentWidget().findChildren(QLabel)
+                 if one.text() == "BODY")
+    for widget in (label, editor):
+        bottom = widget.mapTo(column.widget(), QPoint(0, widget.height())).y()
+        reach = column.verticalScrollBar().maximum() + column.viewport().height()
+        assert bottom <= reach, (
+            "%r ends %dpx past the furthest the column scrolls"
+            % (widget.__class__.__name__, bottom - reach))
+    _templates_page(screen)
+
+
+def test_the_appearance_tab_changes_both_palettes_while_you_watch():
+    """Both palettes and both densities existed and neither could be reached.
+
+    Writing `theme` or `density` into settings.json by hand was the only route,
+    and `core.settings._merge` used to drop both keys on the next save. They are
+    controls now, they apply as they are picked, and the density preview under
+    them is a real table so what is being chosen can be seen.
+    """
+    screen = _sized(_screen("settings"), DEFAULT_SIZE)
+    screen.pages.setCurrentIndex(screen.TABS.index("Appearance"))
+    _sized(screen, DEFAULT_SIZE)
+    on_disk = ST.load_settings()
+    started = TH.from_settings(screen.settings)
+    try:
+        assert [screen.theme_combo.itemData(n)
+                for n in range(screen.theme_combo.count())] == ["dark", "light"]
+        assert [screen.density_combo.itemData(n)
+                for n in range(screen.density_combo.count())] == \
+            ["comfortable", "compact"]
+
+        comfortable = screen.density_preview.verticalHeader().defaultSectionSize()
+        assert comfortable == TH.theme(started.name, "comfortable").control["row"]
+
+        screen.density_combo.setCurrentIndex(1)
+        _app().processEvents()
+        _app().processEvents()
+        compact = screen.density_preview.verticalHeader().defaultSectionSize()
+        assert compact == TH.theme(started.name, "compact").control["row"], \
+            "the preview row is %dpx and compact is %dpx" % (
+                compact, TH.theme(started.name, "compact").control["row"])
+        assert compact < comfortable, "the preview does not show the difference"
+        assert SS.C.active_theme().density == "compact", \
+            "picking a density changed a preview and nothing else"
+        assert screen.template_subject_edit.height() == \
+            TH.theme(started.name, "compact").control["md"], \
+            "the controls on the other tabs did not follow the density"
+
+        screen.theme_combo.setCurrentIndex(1)
+        _app().processEvents()
+        _app().processEvents()
+        assert SS.C.active_theme().name == "light", \
+            "picking a theme did not reach the app"
+        assert screen.pages.currentIndex() == screen.TABS.index("Appearance"), \
+            "changing the theme moved the user off the tab they were on"
+        assert screen._dirty, "an appearance choice is not something to save"
+        assert ST.load_settings().get("theme") != "light", \
+            "the choice was written to the file without anyone pressing Save"
+
+        assert screen._on_save()
+        assert ST.load_settings().get("theme") == "light"
+        assert ST.load_settings().get("density") == "compact"
+    finally:
+        screen.settings["theme"] = started.name
+        screen.settings["density"] = started.density
+        ST.save_settings(on_disk)
+        screen.settings = ST.load_settings()
+        screen._load_into_ui()
+        SS.C.use_theme(started)
+        TH.apply(_app(), started)
+        screen.restyle()
+        screen.pages.setCurrentIndex(0)
+        _sized(screen, DEFAULT_SIZE)
+        _app()
+
+
+def test_the_list_dialog_can_be_resized_and_carries_a_floor():
+    """`setFixedSize(400, 320)`: two defects, not one.
+
+    A user pasting forty search terms got a 240px well and no way to see more
+    than eight of them at a time on a monitor with room for forty. A user at
+    150% Windows text scaling got the same box with type half again as large in
+    it, so Save went off the bottom edge — and a dialog whose Save cannot be
+    reached cannot be used.
+    """
+    dialog = DLG.DomainListDialog(["dentists", "roofers"])
+    try:
+        opened = dialog.size()
+        assert dialog.maximumWidth() >= WIDE_SIZE[0], \
+            "the dialog is capped at %dpx wide" % dialog.maximumWidth()
+        dialog.resize(QSize(1200, 900))
+        assert (dialog.width(), dialog.height()) == (1200, 900), \
+            "the dialog refused to grow: %s" % (dialog.size(),)
+
+        dialog.resize(QSize(1, 1))
+        floor = dialog.size()
+        assert floor.width() > 0 and floor.height() > 0
+        assert floor.height() >= dialog.save_btn.height(), \
+            "the dialog can be squeezed smaller than its own Save button"
+
+        # And the opening size is measured, so text scaling moves it.
+        font = dialog.text_edit.font()
+        assert opened.height() >= 10 * dialog.fontMetrics().lineSpacing(), \
+            "the box opens at %dpx, under ten rows of its own type" % opened.height()
+        assert font.pointSizeF() > 0 or font.pixelSize() > 0
+    finally:
+        dialog.deleteLater()

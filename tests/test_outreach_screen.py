@@ -42,6 +42,7 @@ from PyQt5.QtWidgets import (  # noqa: E402
 from core import outreach_db as DB  # noqa: E402
 from core import settings as ST  # noqa: E402
 from ui import app as APP  # noqa: E402
+from ui import components as CO  # noqa: E402
 from ui import theme as TH  # noqa: E402
 from ui import screen_outreach as SO  # noqa: E402
 
@@ -69,7 +70,15 @@ _BENCH_CARD = QSize(240, 80)
 
 
 def _app() -> QApplication:
-    """The one QApplication for this module, styled exactly as `ui.app.run`."""
+    """The one QApplication for this module, styled exactly as `ui.app.run`.
+
+    Both halves of it, and the second half is not optional any more.
+    `ui.components` resolves a colour in Python at build time and writes it into
+    the widget's own stylesheet, which beats the application's — so a process
+    that only calls `theme.apply` leaves every component-built widget wearing
+    the palette it was constructed in. `ui.app.run` calls `components.use_theme`
+    in the same breath, and so does this.
+    """
     global _APP
     if _APP is None:
         ST.SETTINGS_DIR = _TMP
@@ -77,6 +86,7 @@ def _app() -> QApplication:
         _APP = QApplication.instance() or QApplication([])
     if _APP.styleSheet() != TH.stylesheet(_WEARING):
         TH.apply(_APP, _WEARING)
+    CO.use_theme(_WEARING)
     return _APP
 
 
@@ -84,17 +94,28 @@ def _app() -> QApplication:
 def _wearing(theme):
     """The whole process in `theme`, and back to the default afterwards.
 
-    `setStyleSheet` repolishes every widget alive in the process, which is the
-    point: a screen built under one palette has to be measured in the one under
-    test, not in the one it was constructed in.
+    Three steps, exactly the three `MainWindow.apply_appearance` takes: the
+    sheet onto the application, the theme into `ui.components`, and `restyle()`
+    on the screen. The third is what this used to be missing — a repolish alone
+    cannot reach a colour a component wrote into a widget's own sheet, so the
+    screen would be measured in the palette it was built in and every ratio
+    below would be a ratio from the other theme.
     """
     global _WEARING
     saved, _WEARING = _WEARING, theme
     try:
-        yield _app()
+        _restyle(_app())
+        yield _APP
     finally:
         _WEARING = saved
-        _app()
+        _restyle(_app())
+
+
+def _restyle(app) -> None:
+    """Put the built screen into the palette the process is now wearing."""
+    if _SCREEN is not None:
+        _SCREEN.restyle()
+        app.processEvents()
 
 
 def _screen():
@@ -311,6 +332,34 @@ def test_lead_table_sorts_by_score_not_reverse_alphabetically():
     assert names != sorted(names, reverse=True) or len(set(names)) < 2
 
 
+def test_a_column_header_reverses_the_order_it_already_sorts_by():
+    """Sorting is driven by hand now, so the header has to still work.
+
+    `components.table()` is built with `sortable=False` on this screen because
+    Score and Status are painted by a delegate from data on the item rather
+    than from its text, and `QTableWidget.sortItems` reorders items underneath
+    a painted row. The records are sorted and the rows rebuilt instead, and
+    this is the header contract that swap has to keep.
+    """
+    screen = _screen()
+    table = screen.lead_table
+    try:
+        screen._on_header_clicked(SO._COL_NAME)
+        assert table.horizontalHeader().sortIndicatorSection() == SO._COL_NAME
+        assert [table.item(row, SO._COL_NAME).text()
+                for row in range(table.rowCount())] == \
+            ["Alpha Plumbing", "Mid Electric", "Zeta Roofing"]
+
+        screen._on_header_clicked(SO._COL_NAME)
+        assert table.horizontalHeader().sortIndicatorOrder() == Qt.DescendingOrder
+        assert [table.item(row, SO._COL_NAME).text()
+                for row in range(table.rowCount())] == \
+            ["Zeta Roofing", "Mid Electric", "Alpha Plumbing"]
+    finally:
+        screen._sort = (SO._COL_SCORE, Qt.DescendingOrder)
+        screen._reload_leads()
+
+
 def test_unaudited_leads_sort_below_scored_ones():
     """An em dash compares greater than a digit as text; the score must not."""
     screen = _screen()
@@ -320,13 +369,44 @@ def test_unaudited_leads_sort_below_scored_ones():
     try:
         screen._reload_leads()
         table = screen.lead_table
-        scores = [table.item(row, SO._COL_SCORE).text()
+        badges = [table.item(row, SO._COL_SCORE).text()
                   for row in range(table.rowCount())]
-        assert scores == ["88", "55", "30", "—"]
+        assert [badge.split(" ·")[0] for badge in badges] == \
+            ["88", "55", "30", "—"]
     finally:
         conn.execute("DELETE FROM leads WHERE email = ?", ("fresh@example.com",))
         conn.commit()
         screen._reload_leads()
+
+
+def test_score_and_status_never_rest_on_colour_alone():
+    """The finding: nine statuses over seven hexes, three of them identical.
+
+    `bounced`, `failed` and `suppressed` measured 1.00:1 against each other, so
+    a monochrome print, a colour-blind reader and a screenshot at 50% all read
+    three different outcomes as one — and the opportunity score was a coloured
+    number with no band word anywhere near it. Both columns carry the label
+    `components` gives them, so the cell says what it means with the colour
+    switched off, and a screen reader and the filter box read the same words.
+    """
+    screen = _screen()
+    screen._reload_leads()
+    table = screen.lead_table
+    for row in range(table.rowCount()):
+        score = table.item(row, SO._COL_SCORE).text()
+        status = table.item(row, SO._COL_STATUS).text()
+        assert "·" in score and score.split("·")[1].strip(), \
+            "the score cell is %r — a number and no band" % score
+        assert status.strip(), "the status cell says nothing"
+        assert table.tooltip_at(row, SO._COL_SCORE), \
+            "the score answers a hover with nothing"
+        assert table.tooltip_at(row, SO._COL_STATUS), \
+            "the status answers a hover with nothing"
+
+    marks = {status: CO.status_pill(status).text()
+             for status in ("bounced", "failed", "suppressed")}
+    assert len(set(marks.values())) == 3, \
+        "the three worst outcomes still read as one: %s" % marks
 
 
 # ── D19: the Campaign tab's primary actions must fit ─────────────────────────

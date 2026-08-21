@@ -1,17 +1,274 @@
+"""The screen the product opens on, and the closed loop it used to leave open.
+
+Everything here paints through `ui/theme.py` and `ui/components.py`. What it
+used to paint through was its own 31px top bar, its own three tabs, its own
+section labels and one hex literal, and what that cost was measured:
+
+  * **the first run came back with nothing to mail.** `email` was unticked by
+    default, so the default scrape produced no email column, Start Outreach
+    imported 0 leads, and the only way back to a scrape that had one was a full
+    re-run of Chrome. Email is on by default now, because the address is the
+    field the whole application exists to collect, and the sentence under the
+    grid says what it costs rather than leaving the user to find out.
+  * **the export folder was a modal dialog before the first scrape.** It is
+    filled in with a real folder now and created on the way past, so the default
+    path from a fresh install to a scrape is four clicks rather than eleven.
+  * **an invalid field shook for 200ms and said nothing.** Every rule this
+    screen enforces is now a sentence under the field it belongs to, and the
+    field it belongs to takes the keyboard.
+  * **at 2560 the page was empty boxes and 600px-wide checkbox cells.** No text
+    on this screen runs past `MEASURE_CH` characters, because every measured
+    thing on it is a component that caps itself, and the blocks reflow into one
+    to four of those columns depending on what the window can hold — so the wide
+    window gains a column rather than the same column stretched.
+
+The chrome is gone with the tabs: the shell owns the product name, the
+destinations and Settings, so this screen draws none of them. `settings_signal`
+and `outreach_signal` stay because the window still routes them, and every
+public method and signal the app calls is unchanged.
+"""
+
 import os
 
-from PyQt5.QtCore import QPoint, QPropertyAnimation, QTimer, pyqtSignal, Qt
+from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (
-    QWidget, QLabel, QLineEdit,
-    QPushButton, QCheckBox, QGridLayout,
-    QHBoxLayout, QVBoxLayout, QFrame,
-    QScrollArea, QStackedWidget, QButtonGroup,
-    QSlider, QSpinBox, QDoubleSpinBox, QComboBox,
-    QListWidget, QListWidgetItem, QFileDialog, QSizePolicy,
+    QComboBox, QDoubleSpinBox, QFileDialog, QGridLayout, QHBoxLayout, QLineEdit,
+    QListWidget, QListWidgetItem, QScrollArea, QSizePolicy, QSlider, QSpinBox,
+    QStackedWidget, QVBoxLayout, QWidget,
 )
 
-from core.settings import load_settings, save_settings, add_saved_search
+from core.settings import add_saved_search, load_settings, save_settings
+from ui import components
 from ui.domain_list_dialog import DomainListDialog, ListDialog
+
+# The measure of one column of this page, in characters, handed to the
+# components that know what a character costs. Nothing here converts it to
+# pixels: `body_label` and `hint` cap themselves and re-take the cap when the
+# font lands, so a column is exactly as wide as its own widest capped sentence
+# in whatever font and at whatever DPI the machine is running.
+MEASURE_CH = 60
+
+# Which block goes in which column, by how many columns there is room for. The
+# audit measured this page at 2560 as "mostly empty boxes and 600px-wide
+# checkbox cells", and the two ways out of that are to cap the measure and use
+# the space or to cap it and leave a gutter. This is the first: a wide window
+# gains a column, and what is left over after four is the gutter.
+SEARCH, FIELDS, FILTERS, OUTPUT, RECENT = range(5)
+
+_LAYOUTS = {
+    1: ((SEARCH, FIELDS, FILTERS, OUTPUT, RECENT),),
+    2: ((SEARCH, OUTPUT, RECENT), (FIELDS, FILTERS)),
+    3: ((SEARCH, OUTPUT), (FIELDS, RECENT), (FILTERS,)),
+    4: ((SEARCH,), (FIELDS,), (FILTERS,), (OUTPUT, RECENT)),
+}
+
+MAX_COLUMNS = max(_LAYOUTS)
+
+
+# ── Local layout helpers ─────────────────────────────────────────────────────
+# Every layout on this screen states its margins and its spacing in tokens. The
+# audit found 36 layouts silently inheriting Qt's default 9px, which is off the
+# 4px grid in both directions and is why nothing lined up with anything.
+
+
+def _rows(owner=None, *, margin="0", spacing="3", t=None):
+    box = QVBoxLayout(owner) if owner is not None else QVBoxLayout()
+    return _grid(box, t or components.active_theme(), margin, spacing)
+
+
+def _cols(owner=None, *, margin="0", spacing="3", t=None):
+    box = QHBoxLayout(owner) if owner is not None else QHBoxLayout()
+    return _grid(box, t or components.active_theme(), margin, spacing)
+
+
+def _grid(box, t, margin, spacing):
+    step = t.space[margin]
+    box.setContentsMargins(step, step, step, step)
+    box.setSpacing(t.space[spacing])
+    return box
+
+
+def _block(t, title: str) -> QWidget:
+    """One titled section of the page, on the page's own ground.
+
+    Deliberately not a `card()`. Five cards down a column is five borders drawn
+    around things that are one thing, and this is the screen the audit called
+    "mostly empty boxes" — the rule over a group of controls is the section
+    label, and the ground under it is the page.
+    """
+    widget = QWidget()
+    box = _rows(widget, margin="0", spacing="3", t=t)
+    box.addWidget(components.section_label(title))
+    widget.body = box
+    return widget
+
+
+class _Field(QWidget):
+    """A labelled input, and the two lines that say what it wants and what is wrong.
+
+    The error is the whole of task D: an invalid field used to answer with a
+    200ms shake and no words, so the one rule a user cannot guess — that the
+    export folder has to exist — read as the Start button simply not working.
+
+    The message appears under its own field and pushes what is below it down.
+    What may not move is the control that was just clicked, and it does not:
+    Start Scraping sits in the footer, outside the scrolling page these fields
+    are laid out in, so it is in the same place before and after.
+    """
+
+    def __init__(self, t, label: str, *, placeholder: str = "",
+                 help_text: str = "", trailing=None, read_only: bool = False,
+                 parent=None):
+        super().__init__(parent)
+        box = _rows(self, margin="0", spacing="1", t=t)
+
+        head = _cols(margin="0", spacing="2", t=t)
+        head.addWidget(components.section_label(label))
+        head.addStretch()
+        self.note = components.body_label("", tone="tertiary")
+        self.note.setWordWrap(False)
+        head.addWidget(self.note)
+        box.addLayout(head)
+
+        row = _cols(margin="0", spacing="2", t=t)
+        self.edit = QLineEdit()
+        self.edit.setPlaceholderText(placeholder)
+        self.edit.setFixedHeight(t.control["md"])
+        self.edit.setReadOnly(read_only)
+        row.addWidget(self.edit, stretch=1)
+        if trailing is not None:
+            row.addWidget(trailing)
+        box.addLayout(row)
+
+        self.help = components.hint(help_text, max_chars=MEASURE_CH)
+        self.help.setVisible(bool(help_text))
+        box.addWidget(self.help)
+
+        self.error = components.body_label("", tone="danger",
+                                           max_chars=MEASURE_CH)
+        self.error.hide()
+        box.addWidget(self.error)
+        self.edit.textChanged.connect(lambda _text: self.set_error(""))
+
+    def text(self) -> str:
+        return self.edit.text().strip()
+
+    def setText(self, value: str) -> None:
+        self.edit.setText(value or "")
+
+    def set_note(self, text: str) -> None:
+        self.note.setText(text or "")
+
+    def set_error(self, message: str = "") -> None:
+        self.error.setText(message or "")
+        self.error.setVisible(bool(message))
+
+
+class _Page(QWidget):
+    """The body of the screen: blocks laid into as many columns as fit.
+
+    How many fit is asked of the blocks themselves rather than of a pixel
+    constant — every sentence on this page is capped in characters by the
+    component that draws it, so the widest block's own size hint is the width of
+    one column in the font actually in use.
+    """
+
+    def __init__(self, blocks, t, parent=None):
+        super().__init__(parent)
+        self._blocks = list(blocks)
+        self._gap = t.space["7"]
+        self._placed = 0
+        self._laying_out = False
+
+        row = _cols(self, margin="0", spacing="7", t=t)
+        row.addStretch()
+        self._columns = []
+        for _ in range(MAX_COLUMNS):
+            column = QWidget()
+            _rows(column, margin="0", spacing="6", t=t)
+            column.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
+            row.addWidget(column)
+            self._columns.append(column)
+        row.addStretch()
+        self._place(1)
+
+    def columns_shown(self) -> int:
+        return self._placed
+
+    def column_width(self) -> int:
+        """What one column asks for, which is what caps the measure on this page."""
+        return max(block.sizeHint().width() for block in self._blocks)
+
+    def resizeEvent(self, event) -> None:
+        """Guarded against itself: widening a column can move the scrollbar."""
+        super().resizeEvent(event)
+        if self._laying_out:
+            return
+        self._laying_out = True
+        try:
+            width = self.column_width()
+            for column in self._columns:
+                column.setFixedWidth(width)
+            self._place(self._fits(self.width(), width))
+        finally:
+            self._laying_out = False
+
+    def _fits(self, width: int, unit: int) -> int:
+        step = unit + self._gap
+        if step <= 0:
+            return 1
+        return max(1, min(MAX_COLUMNS, (width + self._gap) // step))
+
+    def _place(self, columns: int) -> None:
+        if columns == self._placed:
+            return
+        self._placed = columns
+        for index, column in enumerate(self._columns):
+            box = column.layout()
+            while box.count():
+                item = box.takeAt(0)
+                widget = item.widget()
+                if widget is not None:
+                    widget.setParent(None)
+            column.setVisible(index < columns)
+        for index, keys in enumerate(_LAYOUTS[columns]):
+            box = self._columns[index].layout()
+            for key in keys:
+                block = self._blocks[key]
+                box.addWidget(block)
+                block.show()
+            box.addStretch()
+
+
+def _default_export_dir() -> str:
+    """Where the CSVs go when the user has not said, so the first run needs no dialog.
+
+    Filled in rather than created: nothing on this screen touches the disk until
+    the scrape starts, and `_ensure_export_dir` is what makes the folder on the
+    way past.
+    """
+    home = os.path.expanduser("~")
+    documents = os.path.join(home, "Documents")
+    base = documents if os.path.isdir(documents) else home
+    return os.path.join(base, "MapHarvest")
+
+
+def _ensure_export_dir(path: str) -> str:
+    """Nothing if `path` is now a folder, or the sentence saying why it is not.
+
+    Made here rather than demanded of the user, because the folder that does
+    not exist yet is the one this screen just proposed.
+    """
+    if not path:
+        return ("Choose the folder the CSV should be written to, or leave the "
+                "one already here.")
+    if os.path.isdir(path):
+        return ""
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError as error:
+        return "That folder could not be created: %s" % (error.strerror or error)
+    return ""
 
 
 class InputScreen(QWidget):
@@ -39,138 +296,76 @@ class InputScreen(QWidget):
     DETAIL_FIELDS = {"hours", "review_1", "review_2", "review_3"}
     # Fields that require fetching each business website.
     ENRICH_FIELDS = {"email", "facebook", "instagram", "linkedin", "twitter", "youtube"}
-    # Off by default because they're the slow paths.
-    DEFAULT_OFF_FIELDS = DETAIL_FIELDS | ENRICH_FIELDS
+    # The slow paths, and what the "Fast only" pick drops.
+    SLOW_FIELDS = DETAIL_FIELDS | ENRICH_FIELDS
+    # What a fresh install starts with. `email` is slow and is on anyway: it is
+    # the one field Outreach cannot work without, and a default that leaves it
+    # off is a default whose first scrape has to be run twice.
+    DEFAULT_OFF_FIELDS = SLOW_FIELDS - {"email"}
 
     def __init__(self):
         super().__init__()
         self._extra_domains: list = []
         self._extra_areas: list = []
-        self._anim = None
         self.settings = load_settings()
         self._build()
         self._apply_settings_to_ui()
 
+    # ── Construction ─────────────────────────────────────────────────────────
+
     def _build(self):
-        root = QVBoxLayout(self)
-        root.setContentsMargins(24, 20, 24, 20)
-        root.setSpacing(0)
+        t = components.active_theme()
+        root = _rows(self, margin="5", spacing="4", t=t)
 
-        header = QHBoxLayout()
-        header.setSpacing(12)
-        app_name = QLabel("MapHarvest")
-        app_name.setObjectName("app_name")
-        header.addWidget(app_name)
-        header.addStretch()
+        blocks = [self._build_search(t), self._build_fields(t),
+                  self._build_filters(t), self._build_output(t),
+                  self._build_recent(t)]
+        self.page = _Page(blocks, t)
 
-        self.tab_group = QButtonGroup(self)
-        self.tab_group.setExclusive(True)
-        tab_row = QHBoxLayout()
-        tab_row.setSpacing(4)
-        tabs = [("Scrape", 0), ("Filters", 1), ("Settings", 2)]
-        self._tab_btns = {}
-        for label, idx in tabs:
-            btn = QPushButton(label)
-            btn.setObjectName("tab")
-            btn.setCheckable(True)
-            btn.setChecked(idx == 0)
-            self.tab_group.addButton(btn, idx)
-            tab_row.addWidget(btn)
-            self._tab_btns[idx] = btn
-        self.scrape_tab_btn = self._tab_btns[0]
-        header.addLayout(tab_row)
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setFrameShape(QScrollArea.NoFrame)
+        # The sheet rings a focused scroll area, and this one holds the whole
+        # page: left as a tab stop it takes the keyboard before the first field
+        # does and answers with a ring drawn round every control on the screen.
+        area.setFocusPolicy(Qt.NoFocus)
+        area.setWidget(self.page)
+        root.addWidget(area, stretch=1)
 
-        header.addSpacing(12)
-        outreach_btn = QPushButton("Outreach")
-        outreach_btn.setObjectName("outlined")
-        outreach_btn.setFixedHeight(30)
-        outreach_btn.setCursor(Qt.PointingHandCursor)
-        outreach_btn.clicked.connect(self.outreach_signal.emit)
-        header.addWidget(outreach_btn)
+        root.addWidget(components.divider())
+        root.addLayout(self._build_footer(t))
 
-        root.addLayout(header)
-        root.addSpacing(20)
+    def _build_search(self, t) -> QWidget:
+        block = _block(t, "Search")
 
-        self.pages = QStackedWidget()
-        self.pages.addWidget(self._build_scrape_page())
-        self.pages.addWidget(self._build_filters_page())
-        self.pages.addWidget(self._build_settings_page())
-        root.addWidget(self.pages, stretch=1)
+        self.domain_list_btn = components.button(
+            "List", kind="secondary", size="md", on_click=self._open_domain_list)
+        self.domain_list_btn.setToolTip("Add more business types to this run")
+        self.domain_field = _Field(
+            t, "Domain", placeholder="e.g. car dealers",
+            help_text="The kind of business to look for, as you would type it "
+                      "into Google Maps.",
+            trailing=self.domain_list_btn)
+        self.domain_input = self.domain_field.edit
+        block.body.addWidget(self.domain_field)
 
-        self.tab_group.idClicked.connect(self.pages.setCurrentIndex)
+        self.area_list_btn = components.button(
+            "List", kind="secondary", size="md", on_click=self._open_area_list)
+        self.area_list_btn.setToolTip("Add more cities or areas to this run")
+        self.area_field = _Field(
+            t, "Area", placeholder="e.g. Lahore",
+            help_text="Every domain is searched in every area, one run each.",
+            trailing=self.area_list_btn)
+        self.area_input = self.area_field.edit
+        block.body.addWidget(self.area_field)
 
-    # ── Scrape tab ───────────────────────────────────────────────────────────
-    def _build_scrape_page(self) -> QWidget:
-        page = QWidget()
-        root = QVBoxLayout(page)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
-
-        columns = QHBoxLayout()
-        columns.setSpacing(40)
-
-        left = QVBoxLayout()
-        left.setSpacing(0)
-
-        # Domain + list
-        domain_header = QHBoxLayout()
-        domain_header.addWidget(self._section_label("Domain"))
-        domain_header.addStretch()
-        self.domain_count_label = QLabel("")
-        self.domain_count_label.setObjectName("muted")
-        domain_header.addWidget(self.domain_count_label)
-        left.addLayout(domain_header)
-        left.addSpacing(8)
-
-        domain_row = QHBoxLayout()
-        domain_row.setSpacing(10)
-        self.domain_input = QLineEdit()
-        self.domain_input.setPlaceholderText("e.g. car dealers")
-        self.domain_input.setFixedHeight(40)
-        self.list_btn = QPushButton("List")
-        self.list_btn.setObjectName("outlined")
-        self.list_btn.setFixedSize(72, 40)
-        self.list_btn.setToolTip("Add multiple domains to scrape")
-        self.list_btn.clicked.connect(self._open_domain_list)
-        domain_row.addWidget(self.domain_input, stretch=1)
-        domain_row.addWidget(self.list_btn)
-        left.addLayout(domain_row)
-        left.addSpacing(20)
-
-        # Area + list (multi-city)
-        area_header = QHBoxLayout()
-        area_header.addWidget(self._section_label("Area"))
-        area_header.addStretch()
-        self.area_count_label = QLabel("")
-        self.area_count_label.setObjectName("muted")
-        area_header.addWidget(self.area_count_label)
-        left.addLayout(area_header)
-        left.addSpacing(8)
-
-        area_row = QHBoxLayout()
-        area_row.setSpacing(10)
-        self.area_input = QLineEdit()
-        self.area_input.setPlaceholderText("e.g. Lahore")
-        self.area_input.setFixedHeight(40)
-        self.area_list_btn = QPushButton("List")
-        self.area_list_btn.setObjectName("outlined")
-        self.area_list_btn.setFixedSize(72, 40)
-        self.area_list_btn.setToolTip("Add multiple cities/areas to scrape")
-        self.area_list_btn.clicked.connect(self._open_area_list)
-        area_row.addWidget(self.area_input, stretch=1)
-        area_row.addWidget(self.area_list_btn)
-        left.addLayout(area_row)
-        left.addSpacing(20)
-
-        # Max results
-        limit_header = QHBoxLayout()
-        limit_header.addWidget(self._section_label("Max Results"))
-        limit_header.addStretch()
-        self.max_results_label = QLabel("50")
-        self.max_results_label.setObjectName("muted")
-        limit_header.addWidget(self.max_results_label)
-        left.addLayout(limit_header)
-        left.addSpacing(10)
+        limit = _cols(margin="0", spacing="2", t=t)
+        limit.addWidget(components.section_label("Max results"))
+        limit.addStretch()
+        self.max_results_label = components.body_label("50", tone="secondary")
+        self.max_results_label.setWordWrap(False)
+        limit.addWidget(self.max_results_label)
+        block.body.addLayout(limit)
 
         self.max_results_slider = QSlider(Qt.Horizontal)
         self.max_results_slider.setObjectName("limit_slider")
@@ -180,345 +375,327 @@ class InputScreen(QWidget):
         self.max_results_slider.setTickPosition(QSlider.TicksBelow)
         self.max_results_slider.setTickInterval(25)
         self.max_results_slider.valueChanged.connect(self._on_max_slider_changed)
-        left.addWidget(self.max_results_slider)
-        left.addSpacing(20)
+        block.body.addWidget(self.max_results_slider)
+        block.body.addWidget(components.hint(
+            "How many businesses to keep per domain and area.",
+            max_chars=MEASURE_CH))
+        return block
 
-        # Export folder
-        left.addWidget(self._section_label("Export Folder"))
-        left.addSpacing(8)
-        export_row = QHBoxLayout()
-        export_row.setSpacing(10)
-        self.export_browse_btn = QPushButton("…")
-        self.export_browse_btn.setObjectName("outlined")
-        # Height fixed, width only floored. The sheet's 16px horizontal padding
-        # puts the ellipsis' own sizeHint at 45px, so a hard 40 clipped it back
-        # to a bare '..' on the first screen a new user sees — and any font or
-        # translation that needs more would clip it again.
-        self.export_browse_btn.setFixedHeight(40)
-        self.export_browse_btn.setMinimumWidth(40)
-        self.export_browse_btn.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
-        self.export_browse_btn.setToolTip("Choose folder for automatic CSV exports")
-        self.export_browse_btn.clicked.connect(self._browse_export_dir)
-        self.export_dir_input = QLineEdit()
-        self.export_dir_input.setReadOnly(True)
-        self.export_dir_input.setPlaceholderText("Select a folder on your computer")
-        self.export_dir_input.setFixedHeight(40)
-        export_row.addWidget(self.export_browse_btn)
-        export_row.addWidget(self.export_dir_input, stretch=1)
-        left.addLayout(export_row)
-        left.addSpacing(20)
+    def _build_fields(self, t) -> QWidget:
+        block = _block(t, "Data to scrape")
 
-        # Recent searches
-        left.addWidget(self._section_label("Recent Searches"))
-        left.addSpacing(8)
-        self.saved_list = QListWidget()
-        self.saved_list.setObjectName("saved_list")
-        self.saved_list.setMinimumHeight(100)
-        self.saved_list.itemClicked.connect(self._load_saved_search)
-        left.addWidget(self.saved_list, stretch=1)
-
-        # Right column: fields
-        right = QVBoxLayout()
-        right.setSpacing(0)
-
-        self.fields_section_label = self._section_label("Data to Scrape")
-        right.addWidget(self.fields_section_label)
-        right.addSpacing(12)
+        picks = _cols(margin="0", spacing="2", t=t)
+        for text, tip, slot in (
+            ("All", "Every field, including the slow ones",
+             self._select_all_fields),
+            ("Default", "Everything fast, plus the email address",
+             self._select_default_fields),
+            ("Fast only", "Nothing that opens a listing or a website",
+             self._select_fast_fields),
+            ("None", "Clear every field", self._select_no_fields),
+        ):
+            pick = components.button(text, kind="ghost", size="sm",
+                                     on_click=slot)
+            pick.setToolTip(tip)
+            picks.addWidget(pick)
+        picks.addStretch()
+        block.body.addLayout(picks)
 
         self.checkboxes = {}
-        fields_grid = QGridLayout()
-        fields_grid.setHorizontalSpacing(24)
-        fields_grid.setVerticalSpacing(9)
-        fields_grid.setColumnStretch(0, 1)
-        fields_grid.setColumnStretch(1, 1)
-        for i, (key, name) in enumerate(zip(self.FIELD_KEYS, self.FIELD_NAMES)):
-            cb = QCheckBox(name)
-            cb.setChecked(key not in self.DEFAULT_OFF_FIELDS)
-            if key in self.DETAIL_FIELDS:
-                cb.setToolTip("Opens each listing's page — slower")
-            elif key in self.ENRICH_FIELDS:
-                cb.setToolTip("Fetches the business website — slower")
-            self.checkboxes[key] = cb
-            fields_grid.addWidget(cb, i // 2, i % 2)
-
-        fields_holder = QWidget()
-        fields_holder.setLayout(fields_grid)
-        fields_scroll = QScrollArea()
-        fields_scroll.setWidgetResizable(True)
-        fields_scroll.setFrameShape(QFrame.NoFrame)
-        fields_scroll.setWidget(fields_holder)
-        right.addWidget(fields_scroll, stretch=1)
-
-        right.addSpacing(8)
-        # Quick select buttons
-        quick_row = QHBoxLayout()
-        quick_row.setSpacing(8)
-        for text, slot in (("All", self._select_all_fields),
-                           ("Fast only", self._select_fast_fields),
-                           ("None", self._select_no_fields)):
-            b = QPushButton(text)
-            b.setObjectName("outlined")
-            b.setFixedHeight(28)
-            b.clicked.connect(slot)
-            quick_row.addWidget(b)
-        quick_row.addStretch()
-        right.addLayout(quick_row)
-
-        right.addSpacing(6)
-        fields_hint = QLabel(
-            "Hours/Reviews open each listing; Email & socials fetch each "
-            "website. Both are slower and off by default."
-        )
-        fields_hint.setObjectName("hint")
-        fields_hint.setWordWrap(True)
-        right.addWidget(fields_hint)
-
-        right.addSpacing(8)
-        self.start_btn = QPushButton("Start Scraping")
-        self.start_btn.setObjectName("start_btn")
-        self.start_btn.setFixedHeight(44)
-        self.start_btn.setCursor(Qt.PointingHandCursor)
-        self.start_btn.clicked.connect(self._on_start)
-        right.addWidget(self.start_btn)
-
-        columns.addLayout(left, stretch=1)
-        columns.addLayout(right, stretch=1)
-        root.addLayout(columns, stretch=1)
-
-        self._update_domain_count_label()
-        self._update_area_count_label()
-        return page
-
-    # ── Filters tab ──────────────────────────────────────────────────────────
-    def _build_filters_page(self) -> QWidget:
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(0, 0, 4, 0)
-        layout.setSpacing(0)
-
-        intro = QLabel(
-            "Only collect businesses that match these rules. Leave everything "
-            "blank/zero to keep every result."
-        )
-        intro.setObjectName("hint")
-        intro.setWordWrap(True)
-        layout.addWidget(intro)
-        layout.addSpacing(16)
-
-        layout.addWidget(self._section_label("Rating & Reviews"))
-        layout.addSpacing(10)
-
         grid = QGridLayout()
-        grid.setHorizontalSpacing(16)
-        grid.setVerticalSpacing(12)
+        grid.setContentsMargins(t.space["0"], t.space["0"], t.space["0"],
+                                t.space["0"])
+        grid.setHorizontalSpacing(t.space["4"])
+        grid.setVerticalSpacing(t.space["2"])
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        for index, (key, name) in enumerate(zip(self.FIELD_KEYS,
+                                                self.FIELD_NAMES)):
+            if key == "email":
+                tip = ("Fetches the business website — slower, and the one "
+                       "field Outreach cannot send without")
+            elif key in self.DETAIL_FIELDS:
+                tip = "Opens each listing's page — slower"
+            elif key in self.ENRICH_FIELDS:
+                tip = "Fetches the business website — slower"
+            else:
+                tip = ""
+            box = components.toggle(name, help=tip)
+            box.setChecked(key not in self.DEFAULT_OFF_FIELDS)
+            self.checkboxes[key] = box
+            grid.addWidget(box, index // 2, index % 2)
+        holder = QWidget()
+        holder.setLayout(grid)
+        block.body.addWidget(holder)
 
-        grid.addWidget(QLabel("Minimum rating"), 0, 0)
-        self.min_rating_spin = QDoubleSpinBox()
-        self.min_rating_spin.setObjectName("spin")
+        block.body.addWidget(components.hint(
+            "Email is on because Outreach needs an address to send to; it and "
+            "the socials fetch each website, and Hours and Reviews open each "
+            "listing. Both are slower.", max_chars=MEASURE_CH))
+        self.fields_error = components.body_label("", tone="danger",
+                                                  max_chars=MEASURE_CH)
+        self.fields_error.hide()
+        block.body.addWidget(self.fields_error)
+        return block
+
+    def _build_filters(self, t) -> QWidget:
+        block = _block(t, "Only keep businesses that match")
+        block.body.addWidget(components.hint(
+            "Leave everything blank or zero to keep every result.",
+            max_chars=MEASURE_CH))
+
+        grid = self._form(t)
+        self.min_rating_spin = self._spin(QDoubleSpinBox(), t)
         self.min_rating_spin.setRange(0.0, 5.0)
         self.min_rating_spin.setSingleStep(0.5)
         self.min_rating_spin.setDecimals(1)
         self.min_rating_spin.setSpecialValueText("Any")
-        self.min_rating_spin.setFixedWidth(90)
-        grid.addWidget(self.min_rating_spin, 0, 1)
-
-        grid.addWidget(QLabel("Minimum reviews"), 1, 0)
-        self.min_reviews_spin = QSpinBox()
-        self.min_reviews_spin.setObjectName("spin")
+        self.min_reviews_spin = self._spin(QSpinBox(), t)
         self.min_reviews_spin.setRange(0, 1000000)
         self.min_reviews_spin.setSingleStep(10)
         self.min_reviews_spin.setSpecialValueText("Any")
-        self.min_reviews_spin.setFixedWidth(90)
-        grid.addWidget(self.min_reviews_spin, 1, 1)
-
-        grid.addWidget(QLabel("Maximum reviews"), 2, 0)
-        self.max_reviews_spin = QSpinBox()
-        self.max_reviews_spin.setObjectName("spin")
+        self.max_reviews_spin = self._spin(QSpinBox(), t)
         self.max_reviews_spin.setRange(0, 1000000)
         self.max_reviews_spin.setSingleStep(10)
         self.max_reviews_spin.setSpecialValueText("No cap")
-        self.max_reviews_spin.setFixedWidth(90)
-        grid.addWidget(self.max_reviews_spin, 2, 1)
-        grid.setColumnStretch(2, 1)
-        layout.addLayout(grid)
-        rev_hint = QLabel("Review filters open each listing to read the exact count (slower).")
-        rev_hint.setObjectName("hint")
-        rev_hint.setWordWrap(True)
-        layout.addSpacing(6)
-        layout.addWidget(rev_hint)
-        layout.addSpacing(20)
-
-        layout.addWidget(self._section_label("Contact & Web presence"))
-        layout.addSpacing(10)
-
-        grid2 = QGridLayout()
-        grid2.setHorizontalSpacing(16)
-        grid2.setVerticalSpacing(12)
-        grid2.addWidget(QLabel("Website"), 0, 0)
         self.website_combo = QComboBox()
+        self.website_combo.setFixedHeight(t.control["md"])
         self.website_combo.addItems(["Any", "Has a website", "No website"])
-        self.website_combo.setFixedWidth(160)
-        grid2.addWidget(self.website_combo, 0, 1)
-        grid2.setColumnStretch(2, 1)
-        layout.addLayout(grid2)
-        layout.addSpacing(10)
-
-        self.require_phone_cb = QCheckBox("Must have a phone number")
-        layout.addWidget(self.require_phone_cb)
-        layout.addSpacing(6)
-        self.require_email_cb = QCheckBox("Must have a discoverable email (fetches website)")
-        layout.addWidget(self.require_email_cb)
-        layout.addSpacing(20)
-
-        layout.addWidget(self._section_label("Name & Category text"))
-        layout.addSpacing(10)
-        text_grid = QGridLayout()
-        text_grid.setHorizontalSpacing(16)
-        text_grid.setVerticalSpacing(10)
-        self.name_include_input = QLineEdit()
-        self.name_include_input.setPlaceholderText("comma-separated, any match")
-        self.name_exclude_input = QLineEdit()
-        self.name_exclude_input.setPlaceholderText("comma-separated, exclude if any match")
-        self.cat_include_input = QLineEdit()
-        self.cat_include_input.setPlaceholderText("e.g. roofing, contractor")
-        self.cat_exclude_input = QLineEdit()
-        self.cat_exclude_input.setPlaceholderText("e.g. supplier")
-        for r, (lbl, w) in enumerate((
-            ("Name must include", self.name_include_input),
-            ("Name must exclude", self.name_exclude_input),
-            ("Category must include", self.cat_include_input),
-            ("Category must exclude", self.cat_exclude_input),
+        for row, (label, widget) in enumerate((
+            ("Minimum rating", self.min_rating_spin),
+            ("Minimum reviews", self.min_reviews_spin),
+            ("Maximum reviews", self.max_reviews_spin),
+            ("Website", self.website_combo),
         )):
-            w.setFixedHeight(36)
-            text_grid.addWidget(QLabel(lbl), r, 0)
-            text_grid.addWidget(w, r, 1)
-        text_grid.setColumnStretch(1, 1)
-        layout.addLayout(text_grid)
-        layout.addSpacing(16)
+            grid.addWidget(self._form_label(label), row, 0)
+            grid.addWidget(widget, row, 1)
+        block.body.addLayout(grid)
+        block.body.addWidget(components.hint(
+            "A review filter opens each listing to read the exact count, which "
+            "is slower.", max_chars=MEASURE_CH))
 
-        reset_row = QHBoxLayout()
-        reset_row.addStretch()
-        reset_btn = QPushButton("Reset filters")
-        reset_btn.setObjectName("outlined")
-        reset_btn.setFixedHeight(32)
-        reset_btn.clicked.connect(self._reset_filters)
-        reset_row.addWidget(reset_btn)
-        layout.addLayout(reset_row)
-        layout.addStretch()
+        self.require_phone_cb = components.toggle(
+            "Must have a phone number",
+            help="Drops a listing Google Maps shows no number for")
+        block.body.addWidget(self.require_phone_cb)
+        self.require_email_cb = components.toggle(
+            "Must have a discoverable email",
+            help="Fetches the business website to find one, then drops the "
+                 "listing if there is none")
+        block.body.addWidget(self.require_email_cb)
 
-        scroll.setWidget(page)
-        return scroll
+        text_grid = self._form(t, fills=True)
+        self.name_include_input = self._filter_edit(t, "any of these words")
+        self.name_exclude_input = self._filter_edit(t, "none of these words")
+        self.cat_include_input = self._filter_edit(t, "e.g. roofing, contractor")
+        self.cat_exclude_input = self._filter_edit(t, "e.g. supplier")
+        for row, (label, widget) in enumerate((
+            ("Name includes", self.name_include_input),
+            ("Name excludes", self.name_exclude_input),
+            ("Category includes", self.cat_include_input),
+            ("Category excludes", self.cat_exclude_input),
+        )):
+            text_grid.addWidget(self._form_label(label), row, 0)
+            text_grid.addWidget(widget, row, 1)
+        block.body.addLayout(text_grid)
 
-    # ── Settings tab ─────────────────────────────────────────────────────────
-    def _build_settings_page(self) -> QWidget:
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
+        reset = _cols(margin="0", spacing="2", t=t)
+        reset.addStretch()
+        reset.addWidget(components.button("Reset filters", kind="ghost",
+                                          size="sm",
+                                          on_click=self._reset_filters))
+        block.body.addLayout(reset)
+        return block
 
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(0, 0, 4, 0)
-        layout.setSpacing(0)
+    def _build_output(self, t) -> QWidget:
+        block = _block(t, "Output and run")
 
-        layout.addWidget(self._section_label("Browser"))
-        layout.addSpacing(10)
-        self.headless_cb = QCheckBox("Run headless")
-        self.headless_cb.setChecked(False)
-        self.headless_cb.setToolTip("Hide the Chrome window while scraping")
+        self.export_browse_btn = components.button(
+            "…", kind="secondary", size="md", on_click=self._browse_export_dir)
+        self.export_browse_btn.setToolTip("Choose the folder for CSV exports")
+        self.export_field = _Field(
+            t, "Export folder", placeholder="Choose a folder on your computer",
+            help_text="Each finished search is written here as a CSV. The "
+                      "folder is made on the first run if it is not there yet.",
+            trailing=self.export_browse_btn, read_only=True)
+        self.export_dir_input = self.export_field.edit
+        block.body.addWidget(self.export_field)
+
+        headless_help = ("Hides the Chrome window while scraping. Off, it "
+                         "opens visibly so you can watch it work.")
+        self.headless_cb = components.toggle("Run headless", help=headless_help)
         self.headless_cb.toggled.connect(self._persist_settings)
-        layout.addWidget(self.headless_cb)
-        hint = QLabel("When off, Chrome opens visibly so you can watch progress.")
-        hint.setObjectName("hint")
-        hint.setWordWrap(True)
-        layout.addSpacing(6)
-        layout.addWidget(hint)
-        layout.addSpacing(22)
+        block.body.addWidget(self.headless_cb)
+        block.body.addWidget(components.hint(headless_help,
+                                             max_chars=MEASURE_CH))
 
-        layout.addWidget(self._section_label("Result Limit"))
-        layout.addSpacing(10)
-        cap_row = QHBoxLayout()
-        cap_row.addWidget(QLabel("Slider maximum"))
-        cap_row.addStretch()
-        self.limit_cap_spin = QSpinBox()
-        self.limit_cap_spin.setObjectName("spin")
+        cap = self._form(t)
+        self.limit_cap_spin = self._spin(QSpinBox(), t)
         self.limit_cap_spin.setRange(25, 1000)
         self.limit_cap_spin.setSingleStep(25)
         self.limit_cap_spin.setValue(100)
-        self.limit_cap_spin.setFixedWidth(80)
         self.limit_cap_spin.valueChanged.connect(self._on_limit_cap_changed)
-        cap_row.addWidget(self.limit_cap_spin)
-        layout.addLayout(cap_row)
-        cap_hint = QLabel("Raise this to allow the scrape slider to go above 100.")
-        cap_hint.setObjectName("hint")
-        cap_hint.setWordWrap(True)
-        layout.addSpacing(6)
-        layout.addWidget(cap_hint)
-        layout.addSpacing(26)
+        cap.addWidget(self._form_label("Slider maximum"), 0, 0)
+        cap.addWidget(self.limit_cap_spin, 0, 1)
+        block.body.addLayout(cap)
+        block.body.addWidget(components.hint(
+            "Raise this to let the Max results slider go above 100.",
+            max_chars=MEASURE_CH))
 
-        # Outreach has far more settings than fit beside a checkbox and a spin
-        # box, so it gets its own screen. What stays here is a read-only summary
-        # of the handful of values that decide whether a campaign can send at
-        # all — enough to notice "no sending accounts" without leaving this tab.
-        layout.addWidget(self._section_label("Outreach"))
-        layout.addSpacing(10)
-        self.outreach_summary = QLabel("")
-        self.outreach_summary.setObjectName("muted")
-        self.outreach_summary.setWordWrap(True)
-        layout.addWidget(self.outreach_summary)
-        layout.addSpacing(12)
-        settings_row = QHBoxLayout()
-        open_settings_btn = QPushButton("Open full settings")
-        open_settings_btn.setObjectName("outlined")
-        open_settings_btn.setFixedHeight(32)
-        open_settings_btn.clicked.connect(self.settings_signal.emit)
-        settings_row.addWidget(open_settings_btn)
-        settings_row.addStretch()
-        layout.addLayout(settings_row)
-        layout.addSpacing(6)
-        outreach_hint = QLabel(
-            "Sender profile, AI provider, Gmail accounts, sending window and "
-            "compliance live there."
-        )
-        outreach_hint.setObjectName("hint")
-        outreach_hint.setWordWrap(True)
-        layout.addWidget(outreach_hint)
-        layout.addStretch()
+        block.body.addWidget(components.section_label("Outreach"))
+        self.outreach_summary = components.body_label("", tone="secondary",
+                                                      max_chars=MEASURE_CH)
+        block.body.addWidget(self.outreach_summary)
+        block.body.addWidget(components.hint(
+            "Sender profile, AI provider, Gmail accounts, the sending window "
+            "and compliance are all under Settings.", max_chars=MEASURE_CH))
+        return block
 
-        scroll.setWidget(page)
-        return scroll
+    def _build_recent(self, t) -> QWidget:
+        block = _block(t, "Recent searches")
+        self.saved_stack = QStackedWidget()
+        # A list expands by default, so on a tall window this block took every
+        # spare pixel of its column and left the empty state's card floating
+        # halfway down 700px of nothing.
+        self.saved_stack.setSizePolicy(QSizePolicy.Preferred,
+                                       QSizePolicy.Preferred)
 
-    def _update_outreach_summary(self):
-        accounts = [a for a in (self.settings.get("smtp_accounts") or [])
-                    if isinstance(a, dict) and a.get("enabled", True) and a.get("email")]
-        provider = str(self.settings.get("ai_provider") or "auto")
-        start = self.settings.get("send_start_hour", 9)
-        end = self.settings.get("send_end_hour", 17)
-        mode = "Dry run — nothing is sent" if self.settings.get("dry_run", True) else "LIVE — real emails send"
-        self.outreach_summary.setText(
-            f"{len(accounts)} sending account{'s' if len(accounts) != 1 else ''} · "
-            f"AI {provider} · window {start}:00–{end}:00 · {mode}"
-        )
+        self.saved_list = QListWidget()
+        self.saved_list.setObjectName("saved_list")
+        self.saved_list.itemClicked.connect(self._load_saved_search)
+        self.saved_stack.addWidget(self.saved_list)
 
-    def _section_label(self, text: str) -> QLabel:
-        lbl = QLabel(text.upper())
-        lbl.setObjectName("section_label")
-        return lbl
+        # Short on purpose: `empty_state` caps its own sentence at the 80
+        # characters every paragraph in the app is capped at, and this page is
+        # laid out in narrower columns than that, so the sentence that decides
+        # how wide a column is has to be one this one fits inside.
+        self.saved_empty = components.empty_state(
+            title="Nothing saved yet",
+            body="Each search you run is kept here for next time.")
+        self.saved_stack.addWidget(self.saved_empty)
+        block.body.addWidget(self.saved_stack)
+        return block
+
+    def _build_footer(self, t):
+        row = _cols(margin="0", spacing="3", t=t)
+        self.footer_note = components.body_label("", tone="tertiary",
+                                                 max_chars=MEASURE_CH)
+        self.footer_note.setWordWrap(False)
+        row.addWidget(self.footer_note)
+        row.addStretch()
+        self.start_btn = components.button("Start Scraping", kind="primary",
+                                           size="lg", on_click=self._on_start)
+        row.addWidget(self.start_btn)
+        return row
+
+    # ── Form pieces ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _form(t, *, fills: bool = False) -> QGridLayout:
+        """A label column and a control column, and where the slack goes.
+
+        A number and a three-item dropdown have a width of their own and gain
+        nothing from more, so the slack goes to a third column and they keep it
+        — this is the same defect as the 600px checkbox cell one control down.
+        A field holding a list of words does use what it is given, so that grid
+        hands the slack to the control instead.
+        """
+        grid = QGridLayout()
+        grid.setContentsMargins(t.space["0"], t.space["0"], t.space["0"],
+                                t.space["0"])
+        grid.setHorizontalSpacing(t.space["3"])
+        grid.setVerticalSpacing(t.space["2"])
+        grid.setColumnStretch(1 if fills else 2, 1)
+        return grid
+
+    @staticmethod
+    def _form_label(text: str):
+        label = components.body_label(text, tone="secondary")
+        label.setWordWrap(False)
+        return label
+
+    @staticmethod
+    def _spin(spin, t):
+        spin.setObjectName("spin")
+        spin.setFixedHeight(t.control["md"])
+        spin.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        return spin
+
+    @staticmethod
+    def _filter_edit(t, placeholder: str) -> QLineEdit:
+        edit = QLineEdit()
+        edit.setPlaceholderText(placeholder)
+        edit.setFixedHeight(t.control["md"])
+        return edit
+
+    # ── The theme, live ──────────────────────────────────────────────────────
+
+    def restyle(self):
+        """Wear the palette the app is in now.
+
+        Every component resolves its colours in Python at build time and writes
+        them into its own stylesheet, which beats the application sheet — so a
+        repolish alone leaves this screen in the palette it was constructed in.
+        What the user has typed is carried across; nothing else here is state.
+        """
+        state = self._state()
+        holder = QWidget()
+        holder.setLayout(self.layout())
+        holder.deleteLater()
+        self._build()
+        self._apply_settings_to_ui()
+        self._restore(state)
+
+    def _state(self) -> dict:
+        return {
+            "domain": self.domain_input.text(),
+            "area": self.area_input.text(),
+            "extra_domains": list(self._extra_domains),
+            "extra_areas": list(self._extra_areas),
+            "max_results": self.max_results_slider.value(),
+            "export_dir": self.export_dir_input.text(),
+            "fields": self.get_checked_fields(),
+            "filters": self.get_filters(),
+            "headless": self.headless_cb.isChecked(),
+        }
+
+    def _restore(self, state: dict) -> None:
+        self.domain_input.setText(state["domain"])
+        self.area_input.setText(state["area"])
+        self._extra_domains = list(state["extra_domains"])
+        self._extra_areas = list(state["extra_areas"])
+        self._update_domain_count_label()
+        self._update_area_count_label()
+        self.max_results_slider.setValue(
+            min(state["max_results"], self.max_results_slider.maximum()))
+        self.export_dir_input.setText(state["export_dir"])
+        for key, box in self.checkboxes.items():
+            box.setChecked(key in state["fields"])
+        self.headless_cb.blockSignals(True)
+        self.headless_cb.setChecked(state["headless"])
+        self.headless_cb.blockSignals(False)
+        self._apply_filters(state["filters"])
 
     # ── Field quick-select ───────────────────────────────────────────────────
+
     def _select_all_fields(self):
-        for cb in self.checkboxes.values():
-            cb.setChecked(True)
+        for box in self.checkboxes.values():
+            box.setChecked(True)
+        self._clear_errors()
+
+    def _select_default_fields(self):
+        for key, box in self.checkboxes.items():
+            box.setChecked(key not in self.DEFAULT_OFF_FIELDS)
+        self._clear_errors()
 
     def _select_fast_fields(self):
-        for key, cb in self.checkboxes.items():
-            cb.setChecked(key not in self.DEFAULT_OFF_FIELDS)
+        for key, box in self.checkboxes.items():
+            box.setChecked(key not in self.SLOW_FIELDS)
+        self._clear_errors()
 
     def _select_no_fields(self):
-        for cb in self.checkboxes.values():
-            cb.setChecked(False)
+        for box in self.checkboxes.values():
+            box.setChecked(False)
 
     def _reset_filters(self):
         self.min_rating_spin.setValue(0.0)
@@ -527,11 +704,26 @@ class InputScreen(QWidget):
         self.website_combo.setCurrentIndex(0)
         self.require_phone_cb.setChecked(False)
         self.require_email_cb.setChecked(False)
-        for w in (self.name_include_input, self.name_exclude_input,
-                  self.cat_include_input, self.cat_exclude_input):
-            w.clear()
+        for edit in (self.name_include_input, self.name_exclude_input,
+                     self.cat_include_input, self.cat_exclude_input):
+            edit.clear()
+
+    def _apply_filters(self, filters: dict) -> None:
+        self.min_rating_spin.setValue(filters.get("min_rating", 0.0))
+        self.min_reviews_spin.setValue(filters.get("min_reviews", 0))
+        self.max_reviews_spin.setValue(filters.get("max_reviews", 0))
+        index = 1 if filters.get("require_website") else 0
+        self.website_combo.setCurrentIndex(
+            2 if filters.get("require_no_website") else index)
+        self.require_phone_cb.setChecked(bool(filters.get("require_phone")))
+        self.require_email_cb.setChecked(bool(filters.get("require_email")))
+        self.name_include_input.setText(filters.get("name_include", ""))
+        self.name_exclude_input.setText(filters.get("name_exclude", ""))
+        self.cat_include_input.setText(filters.get("category_include", ""))
+        self.cat_exclude_input.setText(filters.get("category_exclude", ""))
 
     # ── Settings glue ────────────────────────────────────────────────────────
+
     def apply_settings(self, settings: dict):
         """Adopt a settings dict written elsewhere (the full settings screen).
 
@@ -558,10 +750,23 @@ class InputScreen(QWidget):
         self.headless_cb.blockSignals(True)
         self.headless_cb.setChecked(bool(self.settings.get("headless", False)))
         self.headless_cb.blockSignals(False)
-        export_dir = self.settings.get("export_dir") or ""
-        self.export_dir_input.setText(export_dir)
+        self.export_dir_input.setText(
+            self.settings.get("export_dir") or _default_export_dir())
         self._refresh_saved_list()
         self._update_outreach_summary()
+
+    def _update_outreach_summary(self):
+        accounts = [a for a in (self.settings.get("smtp_accounts") or [])
+                    if isinstance(a, dict) and a.get("enabled", True) and a.get("email")]
+        provider = str(self.settings.get("ai_provider") or "auto")
+        start = self.settings.get("send_start_hour", 9)
+        end = self.settings.get("send_end_hour", 17)
+        mode = ("Dry run — nothing is sent" if self.settings.get("dry_run", True)
+                else "LIVE — real emails send")
+        self.outreach_summary.setText(
+            "%d sending account%s · AI %s · window %s:00–%s:00 · %s"
+            % (len(accounts), "" if len(accounts) == 1 else "s", provider,
+               start, end, mode))
 
     def _update_slider_cap(self, cap: int):
         value = self.max_results_slider.value()
@@ -590,17 +795,20 @@ class InputScreen(QWidget):
         path = QFileDialog.getExistingDirectory(self, "Select export folder", start)
         if path:
             self.export_dir_input.setText(path)
+            self.export_field.set_error("")
             self.settings["export_dir"] = path
             save_settings(self.settings)
 
     def export_dir(self) -> str:
         return self.export_dir_input.text().strip()
 
+    # ── Recent searches ──────────────────────────────────────────────────────
+
     def _format_saved_search(self, entry: dict) -> str:
         domains = ", ".join(entry.get("domains") or [])
         area = entry.get("area", "")
         limit = entry.get("max_results", 50)
-        return f"{domains} · {area} · max {limit}"
+        return "%s · %s · max %s" % (domains, area, limit)
 
     def _refresh_saved_list(self):
         self.saved_list.clear()
@@ -608,10 +816,8 @@ class InputScreen(QWidget):
             item = QListWidgetItem(self._format_saved_search(entry))
             item.setData(Qt.UserRole, entry)
             self.saved_list.addItem(item)
-        if self.saved_list.count() == 0:
-            item = QListWidgetItem("No recent searches yet")
-            item.setFlags(Qt.NoItemFlags)
-            self.saved_list.addItem(item)
+        self.saved_stack.setCurrentWidget(
+            self.saved_list if self.saved_list.count() else self.saved_empty)
 
     def _load_saved_search(self, item: QListWidgetItem):
         entry = item.data(Qt.UserRole)
@@ -630,6 +836,7 @@ class InputScreen(QWidget):
         self.max_results_slider.setValue(min(limit, cap))
 
     # ── Domain / area lists ──────────────────────────────────────────────────
+
     def _open_domain_list(self):
         dialog = DomainListDialog(self._extra_domains, self)
         if dialog.exec_() == DomainListDialog.Accepted:
@@ -649,42 +856,36 @@ class InputScreen(QWidget):
 
     def _update_domain_count_label(self):
         count = len(self._extra_domains)
-        if count:
-            self.domain_count_label.setText(f"+{count} in list")
-            self.list_btn.setText(f"List ({count})")
-        else:
-            self.domain_count_label.setText("")
-            self.list_btn.setText("List")
+        self.domain_field.set_note("+%d in list" % count if count else "")
+        self.domain_list_btn.setText("List (%d)" % count if count else "List")
 
     def _update_area_count_label(self):
         count = len(self._extra_areas)
-        if count:
-            self.area_count_label.setText(f"+{count} in list")
-            self.area_list_btn.setText(f"List ({count})")
-        else:
-            self.area_count_label.setText("")
-            self.area_list_btn.setText("List")
+        self.area_field.set_note("+%d in list" % count if count else "")
+        self.area_list_btn.setText("List (%d)" % count if count else "List")
 
     def _get_domains(self) -> list:
         seen, domains = set(), []
         for raw in [self.domain_input.text().strip(), *self._extra_domains]:
-            d = raw.strip()
-            if d and d.lower() not in seen:
-                seen.add(d.lower())
-                domains.append(d)
+            value = raw.strip()
+            if value and value.lower() not in seen:
+                seen.add(value.lower())
+                domains.append(value)
         return domains
 
     def _get_areas(self) -> list:
         seen, areas = set(), []
         for raw in [self.area_input.text().strip(), *self._extra_areas]:
-            a = raw.strip()
-            if a and a.lower() not in seen:
-                seen.add(a.lower())
-                areas.append(a)
+            value = raw.strip()
+            if value and value.lower() not in seen:
+                seen.add(value.lower())
+                areas.append(value)
         return areas
 
+    # ── What the screen answers with ─────────────────────────────────────────
+
     def get_checked_fields(self) -> list:
-        return [key for key, cb in self.checkboxes.items() if cb.isChecked()]
+        return [key for key, box in self.checkboxes.items() if box.isChecked()]
 
     def get_filters(self) -> dict:
         return {
@@ -707,51 +908,58 @@ class InputScreen(QWidget):
     def max_results(self) -> int:
         return self.max_results_slider.value()
 
+    # ── Validation ───────────────────────────────────────────────────────────
+
     def validate(self):
+        """The four rules this screen enforces, each said where it applies.
+
+        The shake this replaces moved a control for 200ms and named neither the
+        rule nor the field, which is why the export-folder rule — the only one
+        of the four a user cannot guess — read as the button simply not working.
+        """
+        self._clear_errors()
         domains = self._get_domains()
         areas = self._get_areas()
         fields = self.get_checked_fields()
         export_dir = self.export_dir()
 
         if not domains:
-            self._goto_scrape_tab()
-            self.shake(self.domain_input)
-            return None
+            return self._refuse(
+                self.domain_field,
+                "Name the kind of business to look for — 'car dealers', "
+                "'roofing contractors'.")
         if not areas:
-            self._goto_scrape_tab()
-            self.shake(self.area_input)
-            return None
-        if not export_dir or not os.path.isdir(export_dir):
-            self._goto_scrape_tab()
-            self.shake(self.export_dir_input)
-            return None
+            return self._refuse(
+                self.area_field,
+                "Name a city or area to search in — 'Lahore', 'Toronto'.")
+
+        problem = _ensure_export_dir(export_dir)
+        if problem:
+            return self._refuse(self.export_field, problem)
+
         if not fields:
-            self._goto_scrape_tab()
-            self._flash_fields_label()
+            self.fields_error.setText(
+                "Tick at least one thing to collect. Default is a good start.")
+            self.fields_error.show()
+            self.footer_note.setText("Nothing is ticked, so there is nothing "
+                                     "to collect.")
             return None
 
         return domains, areas, fields, export_dir
 
-    def _goto_scrape_tab(self):
-        self.pages.setCurrentIndex(0)
-        self.scrape_tab_btn.setChecked(True)
+    def _refuse(self, field, message: str):
+        field.set_error(message)
+        field.edit.setFocus(Qt.OtherFocusReason)
+        self.footer_note.setText("Fix the field marked below the box.")
+        return None
 
-    def shake(self, widget):
-        anim = QPropertyAnimation(widget, b"pos")
-        anim.setDuration(200)
-        pos = widget.pos()
-        anim.setKeyValueAt(0, pos)
-        anim.setKeyValueAt(0.2, pos + QPoint(-6, 0))
-        anim.setKeyValueAt(0.4, pos + QPoint(6, 0))
-        anim.setKeyValueAt(0.6, pos + QPoint(-4, 0))
-        anim.setKeyValueAt(0.8, pos + QPoint(4, 0))
-        anim.setKeyValueAt(1.0, pos)
-        anim.start()
-        self._anim = anim
+    def _clear_errors(self):
+        for field in (self.domain_field, self.area_field, self.export_field):
+            field.set_error("")
+        self.fields_error.hide()
+        self.footer_note.setText("")
 
-    def _flash_fields_label(self):
-        self.fields_section_label.setStyleSheet("color: #FF6B6B; font-size: 11px; font-weight: 500;")
-        QTimer.singleShot(600, lambda: self.fields_section_label.setStyleSheet(""))
+    # ── Start ────────────────────────────────────────────────────────────────
 
     def _on_start(self):
         validated = self.validate()
