@@ -2673,6 +2673,22 @@ class OutreachScreen(QWidget):
             if self._paused:
                 return ("Paused after %d of %d" % (sent, total),
                         "The queue keeps its times. Press Resume to carry on.")
+            # A running worker is not the same as a moving queue. Outside the
+            # window the loop naps and the log says so exactly once, so the
+            # screen read "Sending" while nothing left for hours -- the same
+            # reassuring-at-the-worst-moment failure this function exists to
+            # close, one branch further in.
+            now = time.time()
+            if not _campaign.in_send_window(now, self.settings):
+                return ("Holding — %d of %d done" % (sent, total),
+                        "Outside your sending window. The queue restarts at %s; "
+                        "widen the window in Settings if that is too late."
+                        % _clock(_campaign.next_window_open(now, self.settings)))
+            free, _spent = self._spent_accounts()
+            if not free:
+                return ("Holding — %d of %d done" % (sent, total),
+                        "Every account has hit today's cap. Sending resumes "
+                        "tomorrow, or raise the cap in Settings.")
             return "Sending — %d of %d done" % (sent, total), ""
         if queued <= 0:
             return ("Nothing left in this campaign's queue",
