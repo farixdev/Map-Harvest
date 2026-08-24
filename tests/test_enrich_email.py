@@ -789,6 +789,87 @@ def test_a_block_boundary_is_not_an_intra_word_split():
     print("block boundaries survive the join guard: OK")
 
 
+def test_a_spelled_address_survives_the_markup_wrapped_around_it():
+    """`bookings <b>[at]</b> acme <b>[dot]</b> com` renders as one line.
+
+    Bolding the separator is one of the commonest ways a small site hides its
+    address, and the tags sit *between* the tokens rather than inside a word, so
+    `_mark_joins` correctly leaves them alone and the spelled pattern never
+    closed. The address was simply missed — on a page whose only contact route
+    it was.
+
+    The structural rule that governs the spelled form is untouched and still
+    does the work: a spelled `at` has to be answered by a spelled `dot`, so
+    `Follow us [at] acme.ca` stays refused with the markup in place exactly as
+    it is without it.
+    """
+    for html, expected in (
+            ('<p>bookings <b>[at]</b> sierravistadetail <b>[dot]</b> com</p>',
+             "bookings@sierravistadetail.com"),
+            ('<p>info <span>(at)</span> acme <span>(dot)</span> ca</p>',
+             "info@acme.ca"),
+            ('<p>info <em>[at]</em> acme <em>[dot]</em> co <em>[dot]</em> uk</p>',
+             "info@acme.co.uk")):
+        assert E._scan_page(html, "x") == {expected: "deobfuscated"}, html
+    for refused in ('<p>Follow us <b>[at]</b> acme.ca</p>',
+                    '<p>Call Dot <b>(at)</b> acme.pizza</p>'):
+        assert E._scan_page(refused, "x") == {}, refused
+    print("a spelled address survives the markup wrapped around it: OK")
+
+
+def test_stripping_tags_for_the_spelled_scan_still_invents_nothing():
+    """The stripper is wired in for one pass, and the order is the whole guard.
+
+    `_mark_joins` runs first, so every split a reader cannot see is already a
+    `_JOIN` that both patterns refuse on the leading side; only then are the
+    remaining tags replaced, and by a space rather than by nothing. Both halves
+    are load-bearing and both are measured: strip before marking and
+    `in<b></b>fo@acme.ca` is handed back as `fo@acme.ca`, the truncation that
+    cleans and looks real and goes nowhere. Substitute the empty string instead
+    of a space and `Contact</h2><p>info@acme.ca` becomes `contactinfo@acme.ca`,
+    and the poison span becomes `inforemove@acme.com`.
+    """
+    poison = '<p>info<span style="display:none">REMOVE</span>@acme.com</p>'
+    assert E._scan_page(poison, "x") == {}, E._scan_page(poison, "x")
+    for html in ('<p>in<b></b>fo@acme.ca</p>',
+                 '<p>i<span class="hidden">nospam</span>nfo@acme.ca</p>',
+                 '<td>jane</td><td>@</td><td>acme.ca</td>',
+                 '<p>Contact</p><p>@acme.ca</p>'):
+        assert E._scan_page(html, "x") == {}, html
+    # A boundary between two blocks is still just a boundary, and the address
+    # after it is still read whole.
+    for html in ('<h2>Contact</h2><p>info@acme.ca</p>',
+                 '<td>Email</td><td>info@acme.ca</td>'):
+        assert E._scan_page(html, "x") == {"info@acme.ca": "text"}, html
+    print("stripping tags for the spelled scan invents nothing: OK")
+
+
+def test_the_front_desk_is_the_front_desk_in_any_language():
+    """`hei@` and `contacto@` are `hello@` and `contact@`, and scored below them.
+
+    The list already carried `hallo` and `kontakt`, so it had always reached
+    past English — just not far enough, which left the general inbox losing to
+    whichever department happened to be printed on the contact page.
+    """
+    pages = {"https://nordfjell.no/": '<a href="mailto:hei@nordfjell.no">hei</a>',
+             "https://nordfjell.no/pages/contact":
+                 '<a href="mailto:wholesale@nordfjell.no">wholesale</a>'}
+    ranked = E._rank_emails({u: E._scan_page(h, u) for u, h in pages.items()},
+                            "nordfjell.no")
+    assert ranked[0]["email"] == "hei@nordfjell.no", ranked
+
+    # And a mailbox that reads CVs is still the wrong human, whatever it is
+    # called: `bewerbung@` has to lose to the general inbox the way `careers@`
+    # already does.
+    for careers, general in (("bewerbung@x.de", "info@x.de"),
+                             ("recrutement@x.fr", "contact@x.fr")):
+        domain = careers.partition("@")[2]
+        ranked = E._rank_emails({"https://x.test/": {careers: "mailto", general: "mailto"}},
+                                domain)
+        assert ranked[0]["email"] == general, ranked
+    print("the front desk is the front desk in any language: OK")
+
+
 def test_a_mailto_local_part_is_never_rewritten():
     """`mailto:x27andy@acme.ca` is the page stating its address outright.
 
@@ -1095,6 +1176,9 @@ if __name__ == "__main__":
     test_mov_gtld_is_a_mailbox_not_an_asset()
     test_addresses_split_across_tags_are_missed_not_invented()
     test_a_block_boundary_is_not_an_intra_word_split()
+    test_a_spelled_address_survives_the_markup_wrapped_around_it()
+    test_stripping_tags_for_the_spelled_scan_still_invents_nothing()
+    test_the_front_desk_is_the_front_desk_in_any_language()
     test_clean_email_edges()
     test_srcset_assets_are_not_addresses()
     test_charset_handling()

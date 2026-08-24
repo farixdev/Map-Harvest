@@ -44,6 +44,7 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from core import outreach_db
 from core.settings import load_settings, save_settings
 from ui import components
 from ui import theme as theme_module
@@ -76,13 +77,25 @@ def _screen_threads(screen) -> list:
     window has no business knowing what they are called. A hard-coded list would
     go quietly out of date, and a thread missed here is a send loop that outlives
     the window.
+
+    Two searches, because there are two ways a screen holds a worker and each
+    finds only its own. The scrape, the send loop, the audit pass and the plan
+    are plain attributes with no Qt parent, so they exist for `vars` and are
+    invisible to `findChildren`. The settings screen's probes are the other way
+    round: `_FetchModelsProbe` is constructed with `parent=self` and stored in
+    no attribute at all, so `vars` never saw it — it was never stopped, and
+    closing the window destroyed a QThread that was still running its HTTP
+    call, which Qt answers by aborting the process.
     """
-    running = []
-    for value in vars(screen).values():
+    running, seen = [], set()
+    for value in list(vars(screen).values()) + screen.findChildren(QThread):
         candidates = value if isinstance(value, (list, tuple)) else (value,)
-        running.extend(
-            v for v in candidates if isinstance(v, QThread) and v.isRunning()
-        )
+        for worker in candidates:
+            if not isinstance(worker, QThread) or id(worker) in seen:
+                continue
+            seen.add(id(worker))
+            if worker.isRunning():
+                running.append(worker)
     return running
 
 
@@ -135,7 +148,9 @@ class AppShell(QWidget):
         self._nav: dict = {}
         self._sub_row = None
         self._sub_tabs: list = []
+        self._sub_labels: tuple = ()
         self._context_label = None
+        self._context_state = None
         self.current_key = ""
 
         self._root = QVBoxLayout(self)
@@ -304,49 +319,94 @@ class AppShell(QWidget):
         row.setContentsMargins(t.space["5"], t.space["1"], t.space["5"],
                                t.space["1"])
         row.setSpacing(t.space["1"])
+        # The stretch outlives the widgets either side of it, so the row reads
+        # [tabs…][stretch][context] whichever half is being replaced.
+        row.addStretch()
         self._sub_row = row
+        self._sub_tabs = []
+        self._sub_labels = ()
         self._context_label = None
+        self._context_state = None
         return sub
 
     def _sync(self) -> None:
-        """Make the bar agree with where the user is."""
+        """Make the bar agree with where the user is, replacing only what moved.
+
+        This used to empty the whole second row and build it again on every
+        call, and every call includes each `set_context` — which a running
+        campaign makes once per message, because the line counts them. So the
+        four sub-tab buttons were deleted and recreated under the user's pointer
+        every time a message went out, at 2.2ms a time even when nothing about
+        them had changed.
+
+        Both screens with a second row had grown a workaround for it rather than
+        the shell being fixed: the outreach screen keeps its own copy of the
+        context line to avoid publishing an unchanged one, and the settings
+        screen defers publishing to the next turn of the event loop so the
+        rebuild cannot land inside the click or the keystroke that caused it.
+        The row is the shell's, so knowing whether it needs rebuilding is the
+        shell's job.
+        """
         for key, tab in self._nav.items():
             tab.setChecked(key == self.current_key)
 
-        while self._sub_row.count():
-            item = self._sub_row.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.setParent(None)
-                widget.deleteLater()
-
-        labels, on_change, current = self._subtabs.get(
+        labels, _on_change, current = self._subtabs.get(
             self.current_key, ((), None, 0))
+        labels = tuple(labels)
+        if labels != self._sub_labels:
+            self._replace_subtabs(labels)
+        for index, tab in enumerate(self._sub_tabs):
+            tab.setChecked(index == current)
+
+        text, tone = self._context.get(self.current_key, ("", "info"))
+        if (text, tone) != self._context_state:
+            self._replace_context(text, tone)
+        self._sub.setVisible(bool(labels) or bool(text))
+
+    def _replace_subtabs(self, labels: tuple) -> None:
+        for tab in self._sub_tabs:
+            self._discard(tab)
         self._sub_tabs = []
         for index, label in enumerate(labels):
             tab = components.button(label, kind="tab", size="sm")
             tab.setCheckable(True)
-            tab.setChecked(index == current)
             tab.clicked.connect(
                 lambda _checked=False, at=index: self._on_subtab(at))
-            self._sub_row.addWidget(tab)
+            self._sub_row.insertWidget(index, tab)
             self._sub_tabs.append(tab)
+        self._sub_labels = labels
 
-        self._sub_row.addStretch()
-        text, tone = self._context.get(self.current_key, ("", "info"))
+    def _replace_context(self, text: str, tone: str) -> None:
+        """Built rather than relabelled: `body_label` bakes its tone in.
+
+        Removed outright when there is nothing to say, so an empty context
+        leaves no label behind for a stray `findChildren` — or a screen reader —
+        to find in the row.
+        """
+        if self._context_label is not None:
+            self._discard(self._context_label)
+            self._context_label = None
         if text:
             line = components.body_label(text, tone=tone)
             line.setWordWrap(False)
             line.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
             self._sub_row.addWidget(line)
             self._context_label = line
-        self._sub.setVisible(bool(labels) or bool(text))
+        self._context_state = (text, tone)
+
+    def _discard(self, widget: QWidget) -> None:
+        self._sub_row.removeWidget(widget)
+        widget.setParent(None)
+        widget.deleteLater()
 
     def _on_subtab(self, index: int) -> None:
         """The row moved by hand rather than rebuilt: this runs inside a click.
 
-        `_sync` deletes every button in the row, and one of them is the button
-        whose signal is on the stack.
+        `_sync` leaves a row whose labels have not changed alone now, so the
+        button whose signal is on the stack survives the answer either way. It
+        still moves the check here rather than waiting to be told, because a tab
+        has to look pressed the instant it is pressed and `on_change` is free to
+        take its time.
         """
         labels, on_change, _current = self._subtabs.get(
             self.current_key, ((), None, 0))
@@ -573,8 +633,29 @@ class MainWindow(QMainWindow):
             for worker in _screen_threads(screen):
                 _stop_thread(worker)
 
+    @staticmethod
+    def shutdown_store() -> None:
+        """Close the outreach database, after the threads that write to it.
+
+        Nothing closed it before: `close_all` existed for the test suite, which
+        needs it because Windows will not delete a temp directory holding an
+        open database, and the app itself simply exited with the handle open.
+        What that costs is the checkpoint. SQLite folds the write-ahead log back
+        into the database when the last connection closes, so a process that
+        never closes leaves the log behind and the next start replays it. Opening
+        and closing this window over a seeded store left 3.5MB of
+        `outreach.db-wal` against a 4KB `outreach.db`; closing it puts 2MB into
+        the database and empties the log.
+
+        Separate from `shutdown_worker` and called after it on purpose: the send
+        loop and the audit pass write through this connection, so it may not be
+        closed until they have been stopped and joined.
+        """
+        outreach_db.close_all()
+
     def closeEvent(self, event):
         self.shutdown_worker()
+        self.shutdown_store()
         event.accept()
 
 
@@ -608,6 +689,7 @@ def run():
     # SIGINT explicitly and tick a timer so Python gets a chance to process it.
     def _on_sigint(*_):
         window.shutdown_worker()
+        window.shutdown_store()
         app.quit()
 
     signal.signal(signal.SIGINT, _on_sigint)
@@ -615,6 +697,7 @@ def run():
     idle.start(200)
     idle.timeout.connect(lambda: None)
     app.aboutToQuit.connect(window.shutdown_worker)
+    app.aboutToQuit.connect(window.shutdown_store)
 
     window.show()
     sys.exit(app.exec_())

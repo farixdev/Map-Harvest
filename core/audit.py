@@ -31,6 +31,7 @@ import concurrent.futures
 import datetime
 import gzip
 import html as _html
+import math
 import re
 import time
 import urllib.error
@@ -333,8 +334,34 @@ _ATTR_RE = re.compile(r"""(?is)([a-z0-9_:\-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\
 _FORM_RE = re.compile(r"(?is)<form\b.*?</form\s*>")
 _FORM_OPEN_RE = re.compile(r"(?i)<form\b")
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
-_PHONE_RE = re.compile(r"(?:\(\d{3}\)|\b\d{3})[\s.\-]\d{3}[\s.\-]\d{4}\b|\+\d{1,3}[\s.\-]?\d{2,4}[\s.\-]?\d{3,4}[\s.\-]?\d{2,4}")
-_MONEY_RE = re.compile(r"[$£€]\s?\d{1,3}(?:[,.\s]\d{3})*(?:\.\d{2})?\b")
+# Four shapes, because `has_phone` is a claim and not a nicety: the email says
+# "no number to tap" out loud, and a footer reading `04 78 55 44 33` makes that
+# sentence false. North America groups 3-3-4 and the rest of the world does not,
+# so a NANP-only pattern reported "no phone" for most of Europe. Erring towards
+# seeing a number is the safe direction here — a missed one puts a wrong claim
+# in a live email, a spurious one only holds a gap back.
+_PHONE_RES = (
+    re.compile(r"(?:\(\d{3}\)|\b\d{3})[\s.\-]\d{3}[\s.\-]\d{4}\b"),
+    re.compile(r"\+\d{1,3}[\s.\-]?\d{2,4}[\s.\-]?\d{3,4}[\s.\-]?\d{2,4}"),
+    # A national trunk prefix: the leading zero Europe dials before its own area
+    # codes, and nothing else on a business page opens with one and runs on.
+    re.compile(r"\b0\d(?:[\s.\-]?\d){7,12}\b"),
+    # Grouped in twos and threes — `920 55 10 40`. Later groups are held to two
+    # or three digits so a run of years (`2026 2025 2024`) cannot qualify.
+    re.compile(r"\b\d{2,4}(?:[\s.\-]\d{2,3}){2,4}\b"),
+)
+_DIGIT_RE = re.compile(r"\d")
+# Nine digits is the shortest national number in use and fifteen is the E.164
+# ceiling. The bound is what keeps an ISO date (eight) out of the loose arms.
+_PHONE_DIGITS = (9, 15)
+
+# The symbol leads in English and trails across most of Europe, and the decimal
+# separator swaps with it: `89,00 €` is a price and the prefix-only pattern read
+# a page of them as having none, which put "not a rate, a range or a starting
+# figure on any page" in front of a business whose home page is a price list.
+_MONEY_RE = re.compile(
+    r"[$£€¥]\s?\d{1,3}(?:[,.\s]\d{3})*(?:[.,]\d{2})?\b"
+    r"|\b\d{1,3}(?:[.,\s]\d{3})*(?:[.,]\d{2})?\s?[$£€¥]")
 _COPYRIGHT_RE = re.compile(r"(?:©|&copy;|copyright)[^0-9]{0,20}(?:(\d{4})\s*[-–—]\s*)?(\d{4})", re.I)
 _ASSET_RE = re.compile(
     r"\.(?:png|jpe?g|gif|webp|svg|ico|css|js|json|xml|zip|rar|mp4|mp3|avi|mov|"
@@ -405,10 +432,35 @@ _QUOTE_PHRASES = (
     "get a free quote", "book an estimate",
 )
 
+# The other languages carry their own spellings, and a page that only says
+# "Stellenangebote" was read as a business that is not hiring. Phrases, not bare
+# nouns, for the same reason the English list uses them: "recrutement" is what a
+# recruitment agency calls its whole business, "nous recrutons" is a vacancy.
 _CAREER_HREFS = ("/careers", "/career", "/jobs", "/join-us", "/join-our-team",
-                 "/work-with-us", "/employment", "/vacancies", "/hiring")
+                 "/work-with-us", "/employment", "/vacancies", "/hiring",
+                 "/karriere", "/stellenangebote", "/stellen", "/offene-stellen",
+                 "/recrutement", "/nous-rejoindre", "/offres-d-emploi",
+                 "/empleo", "/trabaja-con-nosotros", "/unete-al-equipo")
 _CAREER_WORDS = ("careers", "we're hiring", "we are hiring", "join our team",
-                 "current openings", "job openings", "now hiring", "apply now")
+                 "current openings", "job openings", "now hiring", "apply now",
+                 "stellenangebote", "offene stellen", "wir stellen ein",
+                 "wir suchen verstärkung", "bewerbungen an",
+                 "nous recrutons", "offres d'emploi", "postes à pourvoir",
+                 "rejoignez notre équipe", "ofertas de empleo",
+                 "estamos contratando", "trabaja con nosotros")
+
+# A small business almost never links each service or gives it a heading. It
+# writes "Services" once and lists them underneath, which is the one place the
+# site says outright what it sells — and the only pass that reads it. Headings
+# are matched by fragment so "Unsere Leistungen" and "Nos compétences" land here
+# too; the list is scoped to the heading, so a footer or a nav cannot leak in.
+_SERVICE_HEADINGS = ("service", "servic", "what we do", "our work", "treatment",
+                     "solution", "capabilit", "specialt", "specialit",
+                     "leistungen", "angebot", "unsere arbeit",
+                     "compétences", "competences", "prestations", "nos produits",
+                     "productos", "nuestros servicios", "que hacemos")
+_LIST_RE = re.compile(r"(?is)<(?:ul|ol)\b[^>]*>(.*?)</(?:ul|ol)\s*>")
+_LI_RE = re.compile(r"(?is)<li\b[^>]*>(.*?)</li\s*>")
 
 _BLOG_HREF_RE = re.compile(r"/(?:blog|news|articles|insights|updates|posts|stories)(?:/|$|\?)", re.I)
 _BLOG_WORDS = frozenset({"blog", "news", "articles", "insights", "stories"})
@@ -422,15 +474,33 @@ _DOC_LEAD_RE = re.compile(
     r"(?i)^(?:download|get|view|open|print|complete|fill\s+(?:in|out))\b\s*(?:the|our|your|a)?\s*")
 _DOC_NAME_RE = re.compile(r"[a-z][a-z' ]+[a-z]")
 
+# Only the other languages' *verbs* for booking, never their nouns for an
+# appointment. `/termin-buchen` is a calendar; `/cita` and `/reservas` are as
+# often a page with a phone number on it, and reading one as a booking engine
+# silently deletes the finding those sites exist to produce. The English list
+# already carries that ambiguity in `/appointment` and `/reserve`; there is
+# nothing to gain by importing it into three more languages.
 _BOOKING_LINK_RE = re.compile(
     r"/(?:book|booking|book-online|book-now|schedule|scheduling|appointment|appointments|"
-    r"reserve|reservations|make-an-appointment|request-appointment)(?:/|$|\?)", re.I)
+    r"reserve|reservations|make-an-appointment|request-appointment|"
+    r"termin-buchen|terminbuchung|terminvereinbarung|termin-vereinbaren|"
+    r"online-buchen|reserver-en-ligne|reservation-en-ligne|"
+    r"cita-online|pedir-cita-online|reservar-online)(?:/|$|\?)", re.I)
 _BOOKING_TEXT = ("book now", "book online", "book an appointment", "schedule an appointment",
                  "schedule online", "make an appointment", "request an appointment",
-                 "reserve a table", "book a table", "book a service")
+                 "reserve a table", "book a table", "book a service",
+                 "termin buchen", "termin online buchen", "online termin buchen",
+                 "terminvereinbarung", "réserver en ligne", "reserver en ligne",
+                 "pedir cita online", "cita online", "reservar online")
 
-_CALL_CTA = ("call now", "call us now", "call today", "call us today", "give us a call",
-             "speak to", "24/7", "call anytime")
+def _phone_present(text: str) -> bool:
+    """True when `text` prints something a reader would dial."""
+    for pattern in _PHONE_RES:
+        for match in pattern.finditer(text):
+            low, high = _PHONE_DIGITS
+            if low <= len(_DIGIT_RE.findall(match.group(0))) <= high:
+                return True
+    return False
 
 
 def _clean_text(fragment: str) -> str:
@@ -662,7 +732,10 @@ def _signals(pages, tech: dict, base_url: str, load_ms: int) -> tuple[dict, dict
     """Every boolean the gap table reads, plus the evidence bits it quotes."""
     today = datetime.date.today()
     html_all = "\n".join(p.html for p in pages)
-    low = html_all.lower()
+    # `_Page` already holds each page lowercased, and joining those is the same
+    # string as lowering the join. Calling `.lower()` here again re-walked every
+    # byte of every page a second time for nothing.
+    low = "\n".join(p.low for p in pages)
     text = " ".join(p.text for p in pages)
     text_low = text.lower()
     facts: dict = {}
@@ -683,15 +756,16 @@ def _signals(pages, tech: dict, base_url: str, load_ms: int) -> tuple[dict, dict
 
     booking_link = any(_BOOKING_LINK_RE.search(href) or any(t in label for t in _BOOKING_TEXT)
                        for href, label in hrefs)
-    has_booking = bool(tech["booking"]) or booking_link or any(t in text_low for t in _BOOKING_TEXT)
+    # A vendor script or a link to a booking page is a booking system. The same
+    # words in running prose are not: "Request an appointment" is the heading
+    # over the contact form on every site that has no booking at all, and
+    # reading it as proof of one deleted the finding those sites exist to
+    # produce. Prose survives only as an anchor label, where it is a control.
+    has_booking = bool(tech["booking"]) or booking_link
     if tech["booking"]:
         facts["booking_vendor"] = tech["booking"]
 
-    has_phone = "tel:" in low or bool(_PHONE_RE.search(text))
-    # A tappable number is a real second route in, so it disqualifies
-    # "the form is the only way to reach them" on its own.
-    call_cta = (any(href.startswith("tel:") for href, _ in hrefs)
-                or (has_phone and any(c in text_low for c in _CALL_CTA)))
+    has_phone = "tel:" in low or _phone_present(text)
     has_email = "mailto:" in low or "data-cfemail" in low or bool(_EMAIL_RE.search(text))
 
     newsletter = any(w in text_low for w in ("newsletter", "mailing list", "subscribe to our"))
@@ -707,9 +781,15 @@ def _signals(pages, tech: dict, base_url: str, load_ms: int) -> tuple[dict, dict
     has_blog = any(_BLOG_HREF_RE.search(href) or (set(re.findall(r"[a-z]+", label)) & _BLOG_WORDS)
                    for href, label in hrefs)
     has_blog = has_blog or any(_BLOG_HREF_RE.search(p.path) for p in pages)
-    latest = _latest_content_date(pages, today)
+    # Only asked once there is a blog to date. `blog_year` reaches the model's
+    # brief as "blog 2019", and a `datePublished` in the home page's JSON-LD is
+    # not a blog — a machine shop with no news section anywhere was being
+    # described to the model as having one, four years stale. Not looking is
+    # also the cheap answer: this is three regexes over every page's full
+    # markup, and most sites have no blog at all.
+    latest = _latest_content_date(pages, today) if has_blog else None
     blog_year = latest.year if latest else 0
-    blog_stale = bool(has_blog and latest and (today - latest).days > STALE_BLOG_DAYS)
+    blog_stale = bool(latest and (today - latest).days > STALE_BLOG_DAYS)
     if latest:
         facts["latest_date"] = latest.strftime("%B %Y")
 
@@ -782,12 +862,31 @@ def _signals(pages, tech: dict, base_url: str, load_ms: int) -> tuple[dict, dict
         "avg_page_kb": avg_kb,
         "slow": load_ms > 3000,
     }
-    facts["call_cta"] = call_cta
     facts["appointment_shaped"] = any(w in text_low for w in _APPOINTMENT_WORDS)
     return signals, facts
 
 
 # ── Services offered ──
+
+
+def _listed_services(page) -> list[str]:
+    """Items of the list a services heading introduces, in the site's own words."""
+    out: list[str] = []
+    for heading in _HEAD_RE.finditer(page.html):
+        if heading.group(1) == "1":
+            continue
+        if not any(w in _clean_text(heading.group(2)).lower() for w in _SERVICE_HEADINGS):
+            continue
+        # Only as far as the next heading: past it the list belongs to a
+        # different section and the words stop being what the heading promised.
+        tail = page.html[heading.end():heading.end() + 4000]
+        nxt = _HEAD_RE.search(tail)
+        if nxt:
+            tail = tail[:nxt.start()]
+        listing = _LIST_RE.search(tail)
+        if listing:
+            out.extend(_clean_text(item) for item in _LI_RE.findall(listing.group(1)))
+    return out
 
 
 def _services(pages, title: str, brand: str) -> list[str]:
@@ -809,7 +908,10 @@ def _services(pages, title: str, brand: str) -> list[str]:
         seen.add(key)
         out.append(label)
 
-    # A /services/ URL is the site telling you outright.
+    # A list under a services heading is the site telling you outright.
+    for page in pages:
+        for label in _listed_services(page):
+            _add(label)
     for page in pages:
         for href, label in page.links:
             if re.search(r"/(?:services|service|treatments|solutions|what-we-do)/[a-z0-9\-]{3,}",
@@ -918,8 +1020,12 @@ def _gaps(tech: dict, signals: dict, facts: dict) -> list[dict]:
         fired.append(_gap("no_crm_signals",
                           "nothing is hooked up to file a name and a number after the "
                           "form is sent"))
+    # `has_phone`, not a call-to-action: the sentence claims there is no number
+    # on the site, and a footer that prints one without saying "call now" makes
+    # it false. Gating on the marketing phrase asked whether the business is
+    # *promoting* the phone, which is a different question and the wrong one.
     if (signals["has_contact_form"] and not signals["has_live_chat"]
-            and not signals["has_online_booking"] and not facts.get("call_cta")):
+            and not signals["has_online_booking"] and not signals["has_phone"]):
         fired.append(_gap("contact_form_only",
                           "the form is the only way in: no chat, no booking, no number to tap"))
     if not signals["has_contact_form"] and not signals["has_newsletter"] and tech["forms"] == 0:
@@ -984,22 +1090,29 @@ def _gaps(tech: dict, signals: dict, facts: dict) -> list[dict]:
     return fired
 
 
-# Each gap past the headline is worth a little less than the one before it.
-# Straight addition put every site with a contact form over the cap — three
-# severity-3 gaps and a couple of severity-2s already total 117 — so the score
-# column the operator sorts leads by read 100 the whole way down, and a joiner
-# with one stale page outranked nobody. The taper is also the honest reading:
-# the email names one gap and leans on a second, so a fourteenth gap is not
-# fourteen times the opportunity, it is the same pitch with more behind it.
-_GAP_DECAY = 0.7
+# Straight addition put every site with a contact form over the cap, so the
+# column the operator sorts leads by read 100 the whole way down and ordered
+# nothing. A per-gap taper fixed the pinning and cost the ordering instead:
+# under it the seventh gap is worth two points and the tenth is worth one, so
+# the findings that mean recurring manual work — several locations, a careers
+# pipeline, paperwork handed out as PDFs, a shop — are all severity 2, all land
+# late, and together move the number by less than a rounding error. Measured
+# over a thirty-site corpus the tapered score ranked those leads *worse* than
+# counting the gaps and ignoring severity altogether.
+#
+# So the taper is gone and the cap is enforced by the shape of the curve rather
+# than by clipping: the score rises with the total severity fired and flattens
+# as it climbs, which is monotone in "how much is there to fix here" and can
+# never reach 100 however long the list gets. `_GAP_SCALE` sets only how quickly
+# the curve flattens — the ordering is identical for every value of it — so it
+# is chosen to spread real sites across a readable range and nothing else.
+_GAP_CEILING = 83.0
+_GAP_SCALE = 12.0
 
 
 def _score(gaps, reachable: bool, has_email: bool) -> int:
-    total = 0.0
-    weight = 9.0
-    for gap in gaps:
-        total += int(gap["severity"]) * weight
-        weight *= _GAP_DECAY
+    severity = sum(int(gap["severity"]) for gap in gaps)
+    total = _GAP_CEILING * (1.0 - math.exp(-severity / _GAP_SCALE))
     if reachable:
         total += 10
     if has_email:

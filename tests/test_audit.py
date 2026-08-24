@@ -808,6 +808,223 @@ def test_every_gap_reads_in_every_template():
     print("every gap reads in every template: OK")
 
 
+# ── Accuracy of what the audit claims ──
+
+# Each fixture below is one sentence the audit used to get wrong in front of the
+# person who owns the site. They are grouped here because the failure is always
+# the same shape: a detector that only speaks North American English, reading a
+# page that does not, and reporting the absence of something the page shows.
+
+_FOOTER_PHONES = {
+    "france": "04 78 55 44 33",
+    "germany": "0941 5550120",
+    "spain": "920 55 10 40",
+    "uk": "0161 555 0166",
+    "new zealand": "06 555 0122",
+    "north america": "(905) 555-1234",
+    "international": "+353 91 555 021",
+}
+
+# Runs of digits that share a shape with a phone number and are not one. A
+# spurious `has_phone` only holds a gap back, but these are what the loose
+# patterns would swallow if they were not bounded, and a page of dated posts
+# would then report a phone the site does not have.
+_NOT_PHONES = ("2026-04-02", "2026 2025 2024", "1.850,00", "05001", "L8L 2W7",
+               "Suite 12", "1961", "10-class pack", "$59.00", "12,50")
+
+
+def test_a_printed_phone_number_is_seen_in_every_market():
+    """`contact_form_only` says "no chat, no booking, no number to tap" out loud.
+
+    The claim is about a number being on the page, so the only question that
+    matters is whether one is printed — and the pattern behind it read 3-3-4 and
+    nothing else, so a French, German, Spanish, British or New Zealand footer
+    came back as a site with no phone. That put a checkably false sentence at the
+    top of a cold email, and it put "no phone" in the model's brief besides.
+    """
+    for market, number in _FOOTER_PHONES.items():
+        assert A._phone_present("Call us on " + number), (market, number)
+    for text in _NOT_PHONES:
+        assert not A._phone_present("published " + text + " here"), text
+
+    page = ("<html><head><meta name='viewport' content='width=device-width'></head>"
+            "<body><h2>Kontakt</h2>"
+            "<form method='post'><input type='email' name='email'>"
+            "<textarea name='nachricht'></textarea></form>"
+            "<footer>Telefon 0941 5550120</footer></body></html>")
+    result = A.audit_from_html({"https://beispiel.de/": page}, "https://beispiel.de/")
+    assert result["signals"]["has_phone"] is True, result["signals"]
+    assert "contact_form_only" not in _codes(result), _codes(result)
+    print("a printed phone number is seen in every market: OK")
+
+
+def test_a_call_to_action_is_not_what_makes_a_number_real():
+    """The gate used to be the marketing phrase, not the number.
+
+    A footer that prints a number without saying "call now" is still a number to
+    tap, and asking whether the business *promotes* the phone answered a
+    different question than the one the sentence makes a claim about.
+    """
+    quiet = ("<html><body><form><textarea name='message'></textarea></form>"
+             "<footer>216-555-0940</footer></body></html>")
+    loud = quiet.replace("216-555-0940", "Call now: 216-555-0940")
+    for page in (quiet, loud):
+        result = A.audit_from_html({"https://x.test/": page}, "https://x.test/")
+        assert "contact_form_only" not in _codes(result), page
+    print("a call to action is not what makes a number real: OK")
+
+
+def test_prices_are_read_with_the_symbol_on_either_side():
+    """"not a rate, a range or a starting figure on any page", to a price list.
+
+    Most of Europe writes `89,00 €` and the pattern demanded `€89.00`, so a page
+    whose whole purpose is publishing prices fired `price_opaque`.
+    """
+    for written in ("89,00 €", "1.850,00 €", "8,50 €", "£42", "$59.00", "€1,200.00"):
+        assert A._MONEY_RE.search(written), written
+
+    page = ("<html><body><h1>Zahnarztpraxis</h1><h2>Preise</h2>"
+            "<p>Zahnreinigung ab 89,00 € · Bleaching ab 349,00 € · "
+            "Implantat ab 1.850,00 €</p></body></html>")
+    result = A.audit_from_html({"https://beispiel.de/": page}, "https://beispiel.de/")
+    assert result["signals"]["has_pricing"] is True, result["signals"]
+    assert "price_opaque" not in _codes(result), _codes(result)
+    print("prices are read with the symbol on either side: OK")
+
+
+def test_booking_is_a_system_and_not_a_sentence():
+    """"Request an appointment" is the heading over the form on sites with none.
+
+    Reading it as proof of a booking system deleted `no_online_booking` from
+    exactly the leads it was written for, and left `has_online_booking: True` in
+    the audit of a clinic that answers the phone to make every appointment.
+    """
+    prose = ("<html><head><meta name='viewport' content='width=device-width'></head>"
+             "<body><h1>Riverbend Dental</h1>"
+             "<h2>Our Services</h2><ul><li>Dental cleaning and checkups</li>"
+             "<li>Root canal treatment</li><li>Teeth whitening</li></ul>"
+             "<h2>Request an appointment</h2>"
+             "<form method='post'><input type='email' name='email'>"
+             "<textarea name='message'></textarea></form></body></html>")
+    result = A.audit_from_html({"https://riverbend.ca/": prose}, "https://riverbend.ca/")
+    assert result["signals"]["has_online_booking"] is False, result["signals"]
+    assert "no_online_booking" in _codes(result), _codes(result)
+
+    # A control the visitor clicks is still evidence, in any of the languages
+    # this tool meets. A verb — `buchen` — and never the bare noun `Termin`,
+    # which titles the phone-only appointments page as often as a calendar.
+    booked = prose.replace("<h2>Request an appointment</h2>",
+                           "<a href='/termin-buchen/'>Termin online buchen</a>")
+    result = A.audit_from_html({"https://riverbend.ca/": booked}, "https://riverbend.ca/")
+    assert result["signals"]["has_online_booking"] is True, result["signals"]
+    assert "no_online_booking" not in _codes(result), _codes(result)
+    print("booking is a system and not a sentence: OK")
+
+
+def test_a_site_is_hiring_in_more_than_one_language():
+    """A German vacancies page was read as a business that is not hiring."""
+    for markup, market in (
+            ("<a href='/stellenangebote/'>Stellenangebote</a>"
+             "<p>Wir stellen ein: Elektroniker (m/w/d)</p>", "de"),
+            ("<a href='/recrutement/'>Recrutement</a>"
+             "<p>Nous recrutons un collaborateur</p>", "fr"),
+            ("<a href='/empleo'>Empleo</a><p>Trabaja con nosotros</p>", "es"),
+            ("<a href='/careers/'>Careers</a><p>We are hiring</p>", "en")):
+        page = "<html><body><h1>Firma</h1>" + markup + "</body></html>"
+        result = A.audit_from_html({"https://x.test/": page}, "https://x.test/")
+        assert result["signals"]["has_careers"] is True, market
+        assert "careers_manual" in _codes(result), market
+    print("a site is hiring in more than one language: OK")
+
+
+def test_a_date_in_the_markup_is_not_a_blog():
+    """`blog 2019` reached the model's brief for a site with no blog at all.
+
+    `datePublished` in a home page's JSON-LD is the page's own date, and every
+    CMS emits one. Read as a publishing date it described a machine shop with no
+    news section anywhere as having one, four years stale — and the brief is the
+    only thing the model sees, so it had no way to know better.
+    """
+    page = ('<html><head><meta name="viewport" content="width=device-width">'
+            '<script type="application/ld+json">{"@context":"https://schema.org",'
+            '"@type":"WebPage","datePublished":"2019-03-04"}</script></head>'
+            '<body><h1>Ferro Machine and Tool</h1>'
+            '<p>Precision machining since 1961.</p><p>216-555-0940</p></body></html>')
+    result = A.audit_from_html({"https://ferro.test/": page}, "https://ferro.test/")
+    assert result["signals"]["has_blog"] is False, result["signals"]
+    assert result["signals"]["blog_year"] == 0, result["signals"]
+    assert "blog 2019" not in A.digest(result), A.digest(result)
+    assert "no blog" in A.digest(result), A.digest(result)
+
+    # With a blog to date, the same markup is read exactly as before.
+    with_blog = page.replace("<h1>", '<a href="/blog/">Blog</a><h1>')
+    result = A.audit_from_html({"https://ferro.test/": with_blog}, "https://ferro.test/")
+    assert result["signals"]["has_blog"] is True, result["signals"]
+    assert result["signals"]["blog_year"] == 2019, result["signals"]
+    print("a date in the markup is not a blog: OK")
+
+
+def test_the_score_ranks_by_how_much_there_is_to_fix():
+    """The column the operator sorts by has to be monotone in the findings.
+
+    The per-gap taper that replaced straight addition stopped the pinning and
+    broke the ordering doing it: it made the score depend on where a gap landed
+    in the list rather than on what was found, so eighteen small findings scored
+    below three large ones and the fifth gap onward moved the number by less
+    than a point. Measured over a thirty-site corpus the tapered score ranked
+    those leads worse than counting the gaps and ignoring severity entirely.
+    """
+    def score(severities):
+        gaps = [{"severity": s} for s in severities]
+        return A._score(gaps, True, True)
+
+    # Order is a copywriting decision — which finding the email leads with — and
+    # it has no business moving an opportunity score.
+    assert score([3, 2, 1]) == score([1, 2, 3]) == score([2, 1, 3])
+
+    # More to fix always reads higher, however the severities are distributed.
+    ladder = [score([1] * n) for n in range(0, 25)]
+    assert ladder == sorted(ladder), ladder
+    assert score([1] * 18) > score([3, 3, 3]), (score([1] * 18), score([3, 3, 3]))
+    for small, large in (([3], [3, 1]), ([3, 3], [3, 3, 2]), ([2] * 6, [2] * 7)):
+        assert score(large) > score(small), (small, large)
+
+    # The cap is enforced by the shape of the curve, so no list of findings can
+    # reach it and pin two different leads at the same number.
+    assert score([3] * 40) < 100, score([3] * 40)
+
+    # And the floor the rest of the module relies on is unchanged: a reachable
+    # site with an address and nothing to fix scores something, but not much.
+    assert A._score([], True, True) == 15
+    assert 10 <= A._score([], True, False) < 20
+    print("the score ranks by how much there is to fix: OK")
+
+
+def test_what_a_business_sells_is_read_from_the_list_it_writes_it_in():
+    """A small business writes "Services" once and lists them underneath.
+
+    Nothing read that list, so the `WHAT:` line — the most concrete thing in the
+    brief the model is given, and the only part written in the prospect's own
+    words — was simply absent from most audits.
+    """
+    page = ("<html><body><h1>Elektro Baumgartner GmbH</h1>"
+            "<h2>Unsere Leistungen</h2>"
+            "<ul><li>Elektroinstallation Neubau</li><li>Photovoltaikanlagen</li>"
+            "<li>Wallbox Installation</li></ul>"
+            "<h2>Kontakt</h2><ul><li>Telefon</li><li>Anfahrt</li></ul>"
+            "</body></html>")
+    result = A.audit_from_html({"https://beispiel.de/": page}, "https://beispiel.de/")
+    services = result["services"]
+    assert "Elektroinstallation Neubau" in services, services
+    assert "Photovoltaikanlagen" in services, services
+    # The list belongs to the heading that introduced it. A second list under an
+    # unrelated heading is not a service, and scooping up every <li> on the page
+    # would fill the brief with nav and footer.
+    assert "Anfahrt" not in services, services
+    assert "WHAT: " in A.digest(result), A.digest(result)
+    print("what a business sells is read from the list it writes it in: OK")
+
+
 if __name__ == "__main__":
     test_catalogue_services_are_real()
     test_subject_phrases_are_neutral()
@@ -828,4 +1045,12 @@ if __name__ == "__main__":
     test_evidence_is_written_for_the_owner()
     test_evidence_never_hands_back_crawler_state()
     test_every_gap_reads_in_every_template()
+    test_a_printed_phone_number_is_seen_in_every_market()
+    test_a_call_to_action_is_not_what_makes_a_number_real()
+    test_prices_are_read_with_the_symbol_on_either_side()
+    test_booking_is_a_system_and_not_a_sentence()
+    test_a_site_is_hiring_in_more_than_one_language()
+    test_a_date_in_the_markup_is_not_a_blog()
+    test_the_score_ranks_by_how_much_there_is_to_fix()
+    test_what_a_business_sells_is_read_from_the_list_it_writes_it_in()
     print("\nALL AUDIT TESTS PASSED")

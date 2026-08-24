@@ -36,7 +36,8 @@ import urllib.request
 from ast import literal_eval
 
 from core import secrets
-from core.settings import SETTINGS_DIR, ai_budget_left, get_secret, note_ai_tokens
+from core import settings as _settings
+from core.settings import ai_budget_left, get_secret, note_ai_tokens
 
 # ── Providers ────────────────────────────────────────────────────────────────
 
@@ -257,8 +258,22 @@ def _parse_reply(text: str) -> dict:
 
 # ── Disk cache ───────────────────────────────────────────────────────────────
 
-CACHE_PATH = os.path.join(SETTINGS_DIR, "ai_cache.json")
+CACHE_FILENAME = "ai_cache.json"
 MAX_CACHE_ENTRIES = 5000
+
+
+def cache_path() -> str:
+    """Where the reply cache lives, resolved late.
+
+    `SETTINGS_DIR` is a string, so a module-level `os.path.join` of it froze the
+    cache to whatever the profile directory was at first import, and nothing
+    could redirect it afterwards — not the test suite, which repoints
+    `settings.SETTINGS_DIR`, and not a script. A single personalised lead in
+    either then read and rewrote the real user's cache file. Every other store
+    in this app resolves its path at call time for exactly this reason.
+    """
+    return os.path.join(_settings.SETTINGS_DIR, CACHE_FILENAME)
+
 
 # The audit worker personalises leads across a thread pool, so both the in-process
 # copy and the file are guarded. The settings budget counter is guarded too:
@@ -281,7 +296,7 @@ def _cache_entries() -> dict:
         return _cache
     entries: dict = {}
     try:
-        with open(CACHE_PATH, encoding="utf-8") as f:
+        with open(cache_path(), encoding="utf-8") as f:
             data = json.load(f)
         stored = data.get("entries") if isinstance(data, dict) else None
         if isinstance(stored, dict):
@@ -298,12 +313,13 @@ def _cache_write(entries: dict) -> None:
     The pid is in the temp name so two MapHarvest windows cannot overwrite each
     other's half-written file.
     """
-    tmp = f"{CACHE_PATH}.{os.getpid()}.tmp"
+    target = cache_path()
+    tmp = f"{target}.{os.getpid()}.tmp"
     try:
-        os.makedirs(SETTINGS_DIR, exist_ok=True)
+        os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump({"version": 1, "entries": entries}, f)
-        os.replace(tmp, CACHE_PATH)
+        os.replace(tmp, target)
     except OSError:
         try:
             os.remove(tmp)

@@ -66,13 +66,14 @@ from PyQt5.QtCore import QEvent, QPoint, QSize, Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QFontMetrics, QPainter, QRegion
 from PyQt5.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox,
-    QFileDialog, QFrame, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
-    QMenu, QMessageBox, QProgressBar, QScrollArea, QSizePolicy, QStackedWidget,
-    QStyle, QStyleOptionViewItem, QStyledItemDelegate, QTextBrowser,
-    QVBoxLayout, QWidget,
+    QDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QListWidget,
+    QListWidgetItem, QMenu, QMessageBox, QProgressBar, QScrollArea,
+    QSizePolicy, QStackedWidget, QStyle, QStyleOptionViewItem,
+    QStyledItemDelegate, QTextBrowser, QVBoxLayout, QWidget,
 )
 
 from core import campaign as _campaign
+from core import mailer as _mailer
 from core import outreach_db as _db
 from core import settings as _settings
 from core import templates as _templates
@@ -215,6 +216,42 @@ def _int_of(value, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _float_of(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _paper_html(body: str, size: int, ink: str, *, monospace: bool = False) -> str:
+    """Wrap a document in the recipient's font stack, at the light palette's ink.
+
+    Module level rather than a method because two surfaces draw on this paper
+    now — the preview of what a lead *would* get, and the record of what one
+    already did — and a second copy of the page style is how the two come to
+    disagree about what an email looks like.
+    """
+    return ('<div style="font-family:%s;font-size:%dpx;line-height:1.6;'
+            'color:%s;white-space:%s;">%s</div>'
+            % ("monospace" if monospace else _MAIL_FAMILY, size, ink,
+               "pre-wrap" if monospace else "normal", body))
+
+
+def _paint_paper(browser) -> None:
+    """Paint the document itself, in the palette a reader will see it in.
+
+    The QSS rule for `#email_paper` styles the well the document sits in; this
+    is the page inside it. Both come from the theme — the light one,
+    deliberately: the body carries near-black ink, and on the dark app's own
+    surface it would be invisible.
+    """
+    frame = browser.document().rootFrame()
+    fmt = frame.frameFormat()
+    fmt.setBackground(QColor(_PAPER.color["raised"]))
+    fmt.setMargin(_PAPER.space["5"])
+    frame.setFrameFormat(fmt)
 
 
 def _loads(blob) -> dict:
@@ -616,6 +653,149 @@ class _DayBars(QWidget):
             painter.setPen(Qt.NoPen)
 
 
+# ── What was actually sent ───────────────────────────────────────────────────
+
+class _SentMailDialog(QDialog):
+    """One message that has already gone, exactly as the server received it.
+
+    The user could not see this before. Everything on the Sending and Stats tabs
+    counted messages; nothing showed one, so the only way to find out what had
+    reached a stranger was to open the Gmail account's Sent folder — which is
+    the answer to "did it go", not to "what did it say".
+
+    It reads the stored wire form and nothing else. Re-rendering from the
+    template would be easier and would be wrong: the template store is editable,
+    the sender profile changes mid-campaign, and a February email redrawn from
+    today's copy is a message that was never sent, presented with the authority
+    of a record.
+
+    Two views, because the two questions are different. *Message* is what the
+    recipient read, footer included, on the light paper every preview in this
+    app uses. *Source* is the bytes — the headers a deliverability problem lives
+    in, and the HTML part underneath them.
+    """
+
+    # In characters, like every other measure in this file: what is being sized
+    # is text, and a dialog written down in pixels stops fitting the moment the
+    # user's font scale is not the developer's.
+    _BODY_CH = 84
+    _ROWS = 22
+
+    def __init__(self, row: dict, raw: str, parent=None):
+        super().__init__(parent)
+        self._row = row if isinstance(row, dict) else {}
+        self._wire = _mailer.read_wire(raw)
+        self._raw = _text_of(raw)
+        self.setWindowTitle("Sent message")
+        self.setModal(True)
+        self._build()
+
+    def _build(self) -> None:
+        t = components.active_theme()
+        box = QVBoxLayout(self)
+        box.setContentsMargins(t.space["5"], t.space["5"], t.space["5"], t.space["5"])
+        box.setSpacing(t.space["3"])
+
+        box.addWidget(components.heading(self._subject() or "(no subject)", "h2"))
+        box.addWidget(components.body_label(self._provenance(), tone="secondary",
+                                            max_chars=self._BODY_CH))
+
+        switch = _cols(margin="0", spacing="2", t=t)
+        switch.addWidget(components.section_label("What left"))
+        switch.addStretch()
+        self._view = QButtonGroup(self)
+        self._view.setExclusive(True)
+        for index, label in enumerate(("Message", "Source")):
+            tab = components.button(label, kind="tab", size="sm")
+            tab.setCheckable(True)
+            tab.setChecked(index == 0)
+            self._view.addButton(tab, index)
+            switch.addWidget(tab)
+        self._view.idClicked.connect(lambda _index: self._paint())
+        box.addLayout(switch)
+
+        self._paper = QTextBrowser()
+        self._paper.setObjectName("email_paper")
+        self._paper.setOpenExternalLinks(False)
+        self._paper.setOpenLinks(False)
+        self._paper.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        box.addWidget(self._paper, stretch=1)
+
+        box.addWidget(components.hint(
+            "This is the copy that was handed to Gmail, not the template it came "
+            "from. Editing the template later does not change it.",
+            max_chars=self._BODY_CH))
+
+        close = _cols(margin="0", spacing="2", t=t)
+        close.addStretch()
+        close.addWidget(components.button("Close", kind="secondary",
+                                          on_click=self.accept))
+        box.addLayout(close)
+
+        metrics = QFontMetrics(self.font())
+        self.setMinimumSize(QSize(_measure(metrics, self._BODY_CH) + t.space["5"] * 2,
+                                  metrics.lineSpacing() * self._ROWS))
+        self._paint()
+
+    def _subject(self) -> str:
+        for name, value in self._wire["headers"]:
+            if name == "Subject":
+                return value
+        return _text_of(self._row.get("subject"))
+
+    def _provenance(self) -> str:
+        """Who it went to, from which account, and when — off the row, not the copy."""
+        step = _int_of(self._row.get("step"))
+        parts = ["To %s" % (_text_of(self._row.get("to_email")) or "an unknown address"),
+                 "from %s" % (_text_of(self._row.get("account_email")) or "an unknown account"),
+                 _clock(_float_of(self._row.get("sent_at"))) if
+                 _float_of(self._row.get("sent_at")) else "at an unrecorded time",
+                 "follow-up %d" % step if step else "first touch"]
+        error = _text_of(self._row.get("error")).strip()
+        if error:
+            parts.append(error)
+        return "  ·  ".join(parts)
+
+    def _paint(self) -> None:
+        if self._view.checkedId() == 1:
+            self._paper.setHtml(_paper_html(html.escape(self._raw or
+                                            "Nothing was stored for this message."),
+                                            _PAPER.font["caption"][0],
+                                            _PAPER.color["text.secondary"],
+                                            monospace=True))
+        else:
+            self._paper.setHtml(self._message_html())
+        _paint_paper(self._paper)
+
+    def _message_html(self) -> str:
+        rows = "".join(
+            '<tr><td style="padding:0 %dpx %dpx 0;color:%s;white-space:nowrap;'
+            'vertical-align:top;">%s</td><td style="padding:0 0 %dpx 0;color:%s;">'
+            '%s</td></tr>'
+            % (_PAPER.space["3"], _PAPER.space["1"], _PAPER.color["text.tertiary"],
+               html.escape(name), _PAPER.space["1"], _PAPER.color["text.secondary"],
+               html.escape(value))
+            for name, value in self._wire["headers"])
+        head = ('<table style="border-collapse:collapse;margin:0 0 %dpx 0;">%s</table>'
+                '<hr style="border:none;border-top:%dpx solid %s;margin:0 0 %dpx 0;">'
+                % (_PAPER.space["4"], rows, components.BORDER,
+                   _PAPER.color["border.subtle"], _PAPER.space["4"])) if rows else ""
+
+        body = self._wire["text"] or _text_of(self._row.get("body_text"))
+        blocks = []
+        for para in re.split(r"\n\s*\n", body.strip()):
+            lines = [html.escape(line.strip()) for line in para.splitlines() if line.strip()]
+            if lines:
+                blocks.append('<p style="margin:0 0 %dpx 0;">%s</p>'
+                              % (_PAPER.space["3"], "<br>".join(lines)))
+        if not blocks:
+            blocks.append('<p style="margin:0;">%s</p>' % html.escape(
+                "Nothing was stored for this message. It was sent before this "
+                "version of MapHarvest, or the store was unwritable at the time."))
+        return _paper_html(head + "".join(blocks), _PAPER.font["h3"][0],
+                           _PAPER.color["text.primary"])
+
+
 # ── Planning worker ──────────────────────────────────────────────────────────
 
 class _PlanWorker(QThread):
@@ -716,9 +896,10 @@ class OutreachScreen(QWidget):
         self._plan: dict = {}
         self._sending = False
         self._paused = False
-        # (message, level) for every activity line, so a theme change can put
-        # the log back rather than emptying it mid-run.
-        self._log_lines: list[tuple[str, str]] = []
+        # (message, level, message id) for every activity line, so a theme
+        # change can put the log back rather than emptying it mid-run, and a
+        # line about a real send can be opened from where it was read.
+        self._log_lines: list[tuple[str, str, int]] = []
         # Per-account rehearsal tally, keyed by lowercased address. A dry run
         # keeps its sends out of the `sends` table on purpose so a rehearsal
         # cannot spend an account's real quota, which left the Accounts card
@@ -1207,6 +1388,7 @@ class OutreachScreen(QWidget):
         # Wrapped, the panel stays a column of text at every width and no line
         # is ever hidden off to the right.
         self.log_list.setWordWrap(True)
+        self.log_list.itemDoubleClicked.connect(self._on_sent_item_activated)
         log_side.addWidget(self.log_list, stretch=1)
         middle.addLayout(log_side, stretch=1)
         box.addLayout(middle, stretch=1)
@@ -1226,6 +1408,12 @@ class OutreachScreen(QWidget):
     _TILES = (
         ("queued", "Queued", "info", "Built and waiting for its slot."),
         ("sent", "Sent", "accent", "Delivered to the address, not yet answered."),
+        # Hidden at zero, which is every campaign that has never been rehearsed.
+        # It exists because a dry run moved no tile at all: five hundred
+        # messages were built, Sent stayed on 0, and the screen's answer to
+        # "did that work?" was six zeros.
+        ("rehearsed", "Rehearsed", "warning",
+         "Built by a dry run and not sent. Still owed to the lead."),
         ("failed", "Failed", "danger", "The server refused it. Check the account."),
         ("replied", "Replied", "accent", "Someone wrote back. This is the number that matters."),
         ("bounced", "Bounced", "danger", "The address does not exist. It is suppressed."),
@@ -1271,6 +1459,37 @@ class OutreachScreen(QWidget):
             "appear here, filling in as messages go out.")
         bars_card.body_layout.addWidget(self.bars_empty)
         box.addWidget(bars_card)
+
+        # The one surface in the app that shows a message rather than counting
+        # one. Six tiles could say two hundred were sent and none of them could
+        # say what any of them said, so "did that go out with the right footer?"
+        # had no answer inside MapHarvest at all.
+        sent_head = _cols(margin="0", spacing="2", t=t)
+        sent_head.addWidget(components.section_label("Sent mail"))
+        self.sent_count = components.body_label("", tone="tertiary")
+        self.sent_count.setWordWrap(False)
+        sent_head.addWidget(self.sent_count)
+        sent_head.addStretch()
+        self.open_sent_btn = components.button(
+            "Open message", kind="secondary", size="sm",
+            on_click=self._on_open_sent_clicked)
+        sent_head.addWidget(self.open_sent_btn)
+        box.addLayout(sent_head)
+
+        self.sent_list = QListWidget()
+        self.sent_list.setObjectName("saved_list")
+        self.sent_list.setWordWrap(True)
+        self.sent_list.itemDoubleClicked.connect(self._on_sent_item_activated)
+        self.sent_list.currentItemChanged.connect(
+            lambda *_a: self._refresh_sent_actions())
+        sent_row = _cols(margin="0", spacing="3", t=t)
+        sent_row.addWidget(self.sent_list, stretch=1)
+        sent_row.addWidget(components.hint(
+            "Open one to read exactly what left this machine — the subject, the "
+            "body, the footer and the headers, as they were handed to Gmail. "
+            "Stored at the moment of sending, so editing a template afterwards "
+            "does not rewrite the record."), stretch=1)
+        box.addLayout(sent_row, stretch=1)
 
         supp_head = _cols(margin="0", spacing="2", t=t)
         supp_head.addWidget(components.section_label("Suppression list"))
@@ -2128,7 +2347,13 @@ class OutreachScreen(QWidget):
         box.setIcon(QMessageBox.Warning)
         box.setWindowTitle(title)
         box.setText(body)
-        box.setCheckBox(QCheckBox("Do not ask again — warn me, never stop me"))
+        # Bound to a name, not passed as a temporary: setCheckBox does not take
+        # ownership on the Python side, so a temporary is freed the moment the
+        # call returns and exec_() then dereferences it. That is an access
+        # violation, not an exception -- the process disappears with no
+        # traceback, on the first Prepare of a fresh install.
+        remember = QCheckBox("Do not ask again — warn me, never stop me")
+        box.setCheckBox(remember)
         settings_btn = box.addButton("Open Settings", QMessageBox.AcceptRole)
         proceed_btn = box.addButton(proceed, QMessageBox.DestructiveRole)
         box.setDefaultButton(settings_btn)
@@ -2387,33 +2612,17 @@ class OutreachScreen(QWidget):
             if lines:
                 blocks.append('<p style="margin:0 0 %dpx 0;">%s</p>'
                               % (_PAPER.space["3"], "<br>".join(lines)))
-        return self._paper_html("".join(blocks), _PAPER.font["h3"][0],
-                                _PAPER.color["text.primary"])
+        return _paper_html("".join(blocks), _PAPER.font["h3"][0],
+                           _PAPER.color["text.primary"])
 
     def _show_paper(self, message: str) -> None:
-        self.preview.setHtml(self._paper_html(
+        self.preview.setHtml(_paper_html(
             html.escape(message), _PAPER.font["body"][0],
             _PAPER.color["text.secondary"]))
         self._paint_paper()
 
-    @staticmethod
-    def _paper_html(body: str, size: int, ink: str) -> str:
-        return ('<div style="font-family:%s;font-size:%dpx;line-height:1.6;'
-                'color:%s;">%s</div>' % (_MAIL_FAMILY, size, ink, body))
-
     def _paint_paper(self) -> None:
-        """Paint the document itself, in the palette a reader will see it in.
-
-        The QSS rule for `#email_paper` styles the well the document sits in;
-        this is the page inside it. Both come from the theme — the light one,
-        deliberately: the body carries near-black ink, and on the dark app's own
-        surface it would be invisible.
-        """
-        frame = self.preview.document().rootFrame()
-        fmt = frame.frameFormat()
-        fmt.setBackground(QColor(_PAPER.color["raised"]))
-        fmt.setMargin(_PAPER.space["5"])
-        frame.setFrameFormat(fmt)
+        _paint_paper(self.preview)
 
     # ── Campaign: planning ───────────────────────────────────────────────────
 
@@ -2653,6 +2862,17 @@ class OutreachScreen(QWidget):
             (spent if used >= cap else free).append(email)
         return free, spent
 
+    def _rehearsing(self) -> bool:
+        """Whether what is running (or about to) is a dry run.
+
+        Asked of the worker while one exists, and of the settings otherwise, so
+        the screen cannot describe a live run in a rehearsal's words after the
+        user flips the switch mid-campaign.
+        """
+        if self._sending and self.send_worker is not None:
+            return bool(getattr(self.send_worker, "dry_run", False))
+        return bool(self.settings.get("dry_run", True))
+
     def _send_health(self) -> tuple:
         """(what the queue is doing, why it is not moving) — never "ready".
 
@@ -2664,14 +2884,21 @@ class OutreachScreen(QWidget):
         """
         stats = self._stats()
         queued, total = _int_of(stats.get("queued")), _int_of(stats.get("total"))
-        sent = _int_of(stats.get("sent"))
+        # What the run has got through, counted the way this run counts. A
+        # rehearsal writes 'rehearsed' and never 'sent', so reading `sent`
+        # alone printed "Sending — 0 of 500 done" for the whole of a dry run:
+        # the one number the user watches, frozen through the one operation it
+        # was there to report on.
+        rehearsing = self._rehearsing()
+        verb, past = ("Rehearsing", "built") if rehearsing else ("Sending", "done")
+        sent = _int_of(stats.get("rehearsed" if rehearsing else "sent"))
 
         if not self._campaign_id:
             return "No campaign yet", ("Prepare one on the Campaign tab and it "
                                        "appears here.")
         if self._sending:
             if self._paused:
-                return ("Paused after %d of %d" % (sent, total),
+                return ("Paused after %d of %d %s" % (sent, total, past),
                         "The queue keeps its times. Press Resume to carry on.")
             # A running worker is not the same as a moving queue. Outside the
             # window the loop naps and the log says so exactly once, so the
@@ -2680,16 +2907,16 @@ class OutreachScreen(QWidget):
             # close, one branch further in.
             now = time.time()
             if not _campaign.in_send_window(now, self.settings):
-                return ("Holding — %d of %d done" % (sent, total),
+                return ("Holding — %d of %d %s" % (sent, total, past),
                         "Outside your sending window. The queue restarts at %s; "
                         "widen the window in Settings if that is too late."
                         % _clock(_campaign.next_window_open(now, self.settings)))
             free, _spent = self._spent_accounts()
             if not free:
-                return ("Holding — %d of %d done" % (sent, total),
+                return ("Holding — %d of %d %s" % (sent, total, past),
                         "Every account has hit today's cap. Sending resumes "
                         "tomorrow, or raise the cap in Settings.")
-            return "Sending — %d of %d done" % (sent, total), ""
+            return "%s — %d of %d %s" % (verb, sent, total, past), ""
         if queued <= 0:
             return ("Nothing left in this campaign's queue",
                     "Prepare another campaign on the Campaign tab to queue more.")
@@ -2852,7 +3079,8 @@ class OutreachScreen(QWidget):
     def _on_message_sent(self, row: dict) -> None:
         if not isinstance(row, dict):
             return
-        if getattr(self.send_worker, "dry_run", False):
+        rehearsal = getattr(self.send_worker, "dry_run", False)
+        if rehearsal:
             key = _text_of(row.get("account_email")).strip().lower()
             if key:
                 self._rehearsed[key] = self._rehearsed.get(key, 0) + 1
@@ -2861,7 +3089,11 @@ class OutreachScreen(QWidget):
         who = _text_of(lead.get("name")).strip() or _text_of(lead.get("email")).strip()
         step = _int_of(row.get("step"))
         label = "follow-up %d" % step if step else "first touch"
-        self._append_log("%s — %s" % (who or "lead", label), "done")
+        # The log line carries the row it is about, so the message can be
+        # opened from the tab the user is already watching. A rehearsal carries
+        # nothing: nothing left, so there is nothing to read back.
+        self._append_log("%s — %s" % (who or "lead", label), "done",
+                         message_id=0 if rehearsal else _int_of(row.get("id")))
 
     def _on_stats_signal(self, stats: dict) -> None:
         if isinstance(stats, dict):
@@ -2885,9 +3117,10 @@ class OutreachScreen(QWidget):
         self._log_lines = []
         self._repaint_log()
 
-    def _append_log(self, message: str, level: str = "info") -> None:
+    def _append_log(self, message: str, level: str = "info",
+                    message_id: int = 0) -> None:
         self._log_lines.insert(0, ("%s  %s" % (datetime.now().strftime("%H:%M:%S"),
-                                               message), level))
+                                               message), level, _int_of(message_id)))
         del self._log_lines[_LOG_LIMIT:]
         self._repaint_log()
 
@@ -2912,10 +3145,14 @@ class OutreachScreen(QWidget):
             item.setFlags(Qt.NoItemFlags)
             self.log_list.addItem(item)
             return
-        for message, level in self._log_lines:
+        for message, level, message_id in self._log_lines:
             item = QListWidgetItem(message)
             item.setForeground(QColor(
                 t.color[self._LOG_INK.get(level, "text.secondary")]))
+            if message_id:
+                item.setData(Qt.UserRole, message_id)
+                item.setData(Qt.UserRole + 1, True)
+                item.setToolTip("Double-click to read exactly what was sent")
             self.log_list.addItem(item)
 
     # ── Sending: accounts and countdown ──────────────────────────────────────
@@ -2982,18 +3219,18 @@ class OutreachScreen(QWidget):
 
         Read through `due_messages` with a far horizon rather than a query of
         its own, so the countdown and the send loop agree about which row is
-        next — including the suppression filter that view applies.
+        next — including the suppression filter that view applies, and the
+        campaign filter, which has to be part of the query. Narrowing a fixed
+        window of rows afterwards found none of this campaign's whenever
+        another campaign had that many queued ahead of it, and `_send_health`
+        reads an empty answer as "every address here is suppressed".
         """
         if not self._campaign_id:
             return 0.0
         horizon = time.time() + 366 * _DAY_SEC
-        for row in _db.due_messages(self.conn, horizon, limit=_LOG_LIMIT):
-            if _int_of(row.get("campaign_id")) == self._campaign_id:
-                try:
-                    return float(row.get("scheduled_at") or 0.0)
-                except (TypeError, ValueError):
-                    return 0.0
-        return 0.0
+        rows = _db.due_messages(self.conn, horizon, limit=1,
+                                campaign_id=self._campaign_id)
+        return _float_of(rows[0].get("scheduled_at")) if rows else 0.0
 
     def _on_tick(self) -> None:
         if self.pages.currentIndex() != 2 and not self._sending:
@@ -3024,14 +3261,23 @@ class OutreachScreen(QWidget):
         self._paint_stats(self._stats())
         self._refresh_personalisation()
         self._refresh_days()
+        self._refresh_sent_mail()
         self._refresh_suppression()
         row = _db.get_campaign(self.conn, self._campaign_id) if self._campaign_id else {}
         self.stats_campaign.setText(_text_of(row.get("name")) or "No campaign yet")
 
+    # Tiles that earn their place only when they have something to say. A zero
+    # here is not a finding, and six digits the user has to read past to reach
+    # the one that moved is worse than five.
+    _TILES_WHEN_NONZERO = ("rehearsed",)
+
     def _paint_stats(self, stats: dict) -> None:
         stats = stats if isinstance(stats, dict) else {}
         for key, tile in self.tiles.items():
-            tile.value_label.setText(str(_int_of(stats.get(key))))
+            count = _int_of(stats.get(key))
+            tile.value_label.setText(str(count))
+            if key in self._TILES_WHEN_NONZERO:
+                tile.setVisible(bool(count))
 
     # A campaign of five hundred is a long list to walk on a tab change, and the
     # answer past a couple of thousand would not change what the user does about
@@ -3123,6 +3369,89 @@ class OutreachScreen(QWidget):
         self.day_bars.set_days(days)
         self.day_bars.setVisible(bool(days))
         self.bars_empty.setVisible(not days)
+
+    # How many sent messages the list holds. A campaign of five hundred with
+    # two chasers each is fifteen hundred rows, and nobody scrolls to the
+    # bottom of that; the recent ones are the ones a question is ever about.
+    _SENT_SHOWN = 200
+
+    def _refresh_sent_mail(self) -> None:
+        rows = _db.sent_messages(self.conn, self._campaign_id,
+                                 limit=self._SENT_SHOWN) if self._campaign_id else []
+        self.sent_list.clear()
+        for row in rows:
+            step = _int_of(row.get("step"))
+            item = QListWidgetItem("%s  ·  %s  ·  %s" % (
+                _clock(_float_of(row.get("sent_at"))),
+                _text_of(row.get("to_email")) or "unknown address",
+                _clip(_text_of(row.get("subject")), _SUPPRESSION_CH)))
+            item.setData(Qt.UserRole, _int_of(row.get("id")))
+            # Whether the full message can be opened is a fact about the row,
+            # not a guess made after the click: messages sent by a build that
+            # kept no transcript have none, and saying so up front beats an
+            # empty dialog.
+            item.setData(Qt.UserRole + 1, bool(row.get("has_transcript")))
+            item.setToolTip("%s from %s%s" % (
+                "Follow-up %d" % step if step else "First touch",
+                _text_of(row.get("account_email")) or "an unknown account",
+                "" if row.get("has_transcript") else
+                " — no copy was kept of this one"))
+            self.sent_list.addItem(item)
+        if not rows:
+            item = QListWidgetItem(
+                "Nothing has been sent from this campaign yet. Each message "
+                "appears here once it reaches the server."
+                if self._campaign_id else
+                "No campaign yet. Prepare one on the Campaign tab.")
+            item.setFlags(Qt.NoItemFlags)
+            self.sent_list.addItem(item)
+        self.sent_count.setText(_plural(len(rows), "message"))
+        self._refresh_sent_actions()
+
+    def _refresh_sent_actions(self) -> None:
+        item = self.sent_list.currentItem()
+        message_id = _int_of(item.data(Qt.UserRole)) if item is not None else 0
+        self.open_sent_btn.setEnabled(bool(message_id))
+        self.open_sent_btn.setToolTip(
+            "Read the message exactly as it was handed to Gmail"
+            if message_id else "Select a sent message first")
+
+    def _on_open_sent_clicked(self) -> None:
+        item = self.sent_list.currentItem()
+        if item is None or not _int_of(item.data(Qt.UserRole)):
+            self._toast("Select a sent message first.", tone="warning")
+            return
+        self._on_sent_item_activated(item)
+
+    def _on_sent_item_activated(self, item) -> None:
+        message_id = _int_of(item.data(Qt.UserRole)) if item is not None else 0
+        if not message_id:
+            return
+        if item.data(Qt.UserRole + 1) is False:
+            self._toast("No copy was kept of that message — it went out before "
+                        "MapHarvest started storing them.", tone="warning")
+            return
+        self._open_sent_message(message_id)
+
+    def _open_sent_message(self, message_id: int) -> None:
+        """Show one already-sent message, or say why it cannot be shown.
+
+        The row and the transcript are read separately on purpose: the row is
+        always there and carries who, when and from where, so a message whose
+        bytes were never stored still opens and still answers three of the four
+        questions rather than refusing.
+        """
+        message_id = _int_of(message_id)
+        if not message_id or self.conn is None:
+            return
+        row = _db._one(self.conn, "SELECT messages.*, leads.email AS to_email, "
+                                  "leads.name AS to_name FROM messages "
+                                  "LEFT JOIN leads ON leads.id = messages.lead_id "
+                                  "WHERE messages.id = ?", (message_id,))
+        if not row:
+            self._toast("That message is no longer in the store.", tone="warning")
+            return
+        _SentMailDialog(row, _db.transcript(self.conn, message_id), self).exec_()
 
     def _refresh_suppression(self) -> None:
         rows = _db.suppression_list(self.conn)

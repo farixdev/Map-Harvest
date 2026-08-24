@@ -50,6 +50,18 @@ def _lead(conn, email: str, **extra) -> int:
 # ── Schema ───────────────────────────────────────────────────────────────────
 
 def test_init_db_is_idempotent_and_indexed():
+    """`idx_messages_campaign` is asserted gone, which is the opposite of before.
+
+    It indexed `messages(campaign_id)` alone, so every query that used it — the
+    stats counters, the per-day rollup, the follow-up's thread lookup — narrowed
+    to the campaign and then read the table for the columns it actually wanted,
+    and a `messages` row carries a whole rendered email. Measured against 20,000
+    queued messages that cost 63ms per counter on the GUI thread.
+    `idx_messages_campaign_status` opens with the same column and carries those
+    columns, which answers all three out of the index; keeping the narrower one
+    alongside it left a second btree to maintain on every insert and gave the
+    planner a worse option it sometimes took.
+    """
     with temp_db() as conn:
         DB.init_db(conn)
         DB.init_db(conn)
@@ -59,9 +71,14 @@ def test_init_db_is_idempotent_and_indexed():
                 "suppression", "sends", "events"} <= tables, tables
         indexes = {r["name"] for r in DB._query(
             conn, "SELECT name FROM sqlite_master WHERE type = 'index'")}
-        for expected in ("idx_messages_due", "idx_messages_campaign",
-                         "idx_sends_account_ts", "idx_leads_status", "idx_leads_domain"):
+        for expected in ("idx_messages_due", "idx_messages_campaign_status",
+                         "idx_messages_lead", "idx_messages_step",
+                         "idx_messages_header", "idx_sends_account_ts",
+                         "idx_leads_status", "idx_leads_domain"):
             assert expected in indexes, expected
+        assert "idx_messages_campaign" not in indexes, (
+            "superseded by idx_messages_campaign_status, which opens with the "
+            "same column and covers the queries that used it")
         assert DB._one(conn, "PRAGMA journal_mode")["journal_mode"].lower() == "wal"
     print("init_db idempotent + indexes + WAL: OK")
 

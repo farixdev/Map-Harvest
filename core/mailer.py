@@ -29,6 +29,14 @@ or `OTHER:`. The prefix is a control signal for `core/campaign.py`, not a label:
 AUTH and QUOTA mean stop the whole run for this account, RECIPIENT means skip
 this one lead, CONN means it is worth another try. Nothing here raises.
 
+`wire_form` and `read_wire` are the other half of `build_message`: the bytes as
+the server received them, and those bytes back as headers and body. They exist
+because the only honest answer to "what did you send?" is the message itself.
+The templates this app builds from are editable, so a sent email rebuilt from
+today's copy is a message that was never sent — presented with the authority of
+a record. `core/campaign.py` stores the wire form before every hand-off, and
+`ui/screen_outreach.py` reads it back.
+
 The IMAP half is the other side of the same bargain. The footer asks people to
 reply "unsubscribe" and the `List-Unsubscribe` header points at a mailto, so
 somebody has to read that mailbox: `check_bounces`, `check_replies` and
@@ -226,6 +234,82 @@ def build_message(*, to_email: str, to_name: str, from_email: str,
         msg.set_boundary("=_%s" % uuid.uuid4().hex)
 
     return msg, mid
+
+
+# ── What went out ────────────────────────────────────────────────────────────
+
+# The headers a person needs to answer "what did this look like in their
+# inbox?", in the order they answer it. Everything else an EmailMessage carries
+# is MIME plumbing, and a reader hunting for the subject through nine lines of
+# boundary declarations is being shown less, not more.
+WIRE_HEADERS = ("From", "To", "Reply-To", "Subject", "Date", "Message-ID",
+                "In-Reply-To", "References", "List-Unsubscribe",
+                "List-Unsubscribe-Post", "Auto-Submitted")
+
+
+def wire_form(message) -> str:
+    """The message serialised exactly as the server is handed it.
+
+    This is the only honest answer to "what did you send?". Re-rendering the
+    template would answer a different question — what the template says *now* —
+    and the template store is editable, so the two drift the first time the user
+    fixes a typo. Returns "" for anything that cannot be serialised; the caller
+    stores nothing rather than storing a lie.
+    """
+    try:
+        return message.as_string()
+    except Exception:
+        return ""
+
+
+def read_wire(raw) -> dict:
+    """A stored wire form as {headers, text, html} for display.
+
+    Headers come back RFC 2047-decoded and in `WIRE_HEADERS` order, so the
+    reader sees the words the recipient's client shows rather than
+    `=?utf-8?q?...?=`. A blob that will not parse yields empty parts and no
+    headers — never an exception, because this runs on the GUI thread.
+    """
+    blank = {"headers": [], "text": "", "html": ""}
+    raw = str(raw or "")
+    if not raw.strip():
+        return blank
+    try:
+        message = message_from_bytes(raw.encode("utf-8", "replace"))
+    except Exception:
+        return blank
+
+    headers = []
+    for name in WIRE_HEADERS:
+        for value in message.get_all(name, []):
+            headers.append((name, _decoded(value)))
+    text, html = _wire_parts(message)
+    return {"headers": headers, "text": text, "html": html}
+
+
+def _wire_parts(message) -> tuple[str, str]:
+    """(plain, html) out of a parsed message. Either may be empty."""
+    text = html = ""
+    try:
+        parts = list(message.walk())
+    except Exception:
+        parts = [message]
+    for part in parts:
+        content_type = part.get_content_type()
+        if content_type not in ("text/plain", "text/html"):
+            continue
+        try:
+            payload = part.get_payload(decode=True)
+        except Exception:
+            payload = None
+        if not payload:
+            continue
+        body = payload.decode(part.get_content_charset() or "utf-8", "replace")
+        if content_type == "text/plain":
+            text = text or body
+        else:
+            html = html or body
+    return text, html
 
 
 # ── Error classification ─────────────────────────────────────────────────────

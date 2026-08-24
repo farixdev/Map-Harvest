@@ -487,9 +487,16 @@ def list_campaigns(conn) -> list[dict]
 def set_campaign_status(conn, campaign_id: int, status: str) -> None
 
 def queue_message(conn, msg: dict) -> int
-def due_messages(conn, now_ts: float, limit: int = 50) -> list[dict]
+def due_messages(conn, now_ts: float, limit: int = 50,
+                 campaign_id: int = 0) -> list[dict]
 def mark_message(conn, message_id: int, status: str, **fields) -> None
 def campaign_stats(conn, campaign_id: int) -> dict
+def first_touch_sent(conn, campaign_id: int, lead_id: int) -> dict
+def first_touch_message_id(conn, campaign_id: int, lead_id: int) -> str
+
+def record_transcript(conn, message_id: int, raw: str) -> None
+def transcript(conn, message_id: int) -> str
+def sent_messages(conn, campaign_id: int = 0, limit: int = 200) -> list[dict]
 
 def suppress(conn, email: str, reason: str) -> None
 def is_suppressed(conn, email: str) -> bool
@@ -526,10 +533,23 @@ CREATE TABLE sends (
   id INTEGER PRIMARY KEY, account_email TEXT, ts REAL);
 CREATE TABLE events (
   id INTEGER PRIMARY KEY, ts REAL, kind TEXT, detail TEXT, lead_id INTEGER);
+CREATE TABLE sent_mail (
+  message_id INTEGER PRIMARY KEY, raw TEXT, wrote_at REAL);
 ```
 
 Indexes on `messages(status, scheduled_at)`, `messages(campaign_id)`,
 `sends(account_email, ts)`, `leads(status)`, `leads(domain)`.
+
+`sent_mail.raw` is the message serialised exactly as the SMTP server was handed
+it, written by `record_transcript` **before** the hand-off. It is the only
+honest answer to "what did you send?": the template store is editable and the
+sender profile changes mid-campaign, so re-rendering a sent message from today's
+copy would show a message that was never sent. Writing it before the hand-off is
+what lets a message the process died in the middle of still be read back.
+`due_messages` takes `campaign_id` for the same reason it takes the suppression
+filter: SQLite applies `LIMIT` before any row reaches Python, so a caller that
+narrowed the result afterwards read one campaign's queue through a window filled
+by another's.
 
 `lead["status"]`: `new | audited | queued | sent | replied | bounced | skipped | suppressed`.
 `message["status"]`: `queued | sending | sent | failed | skipped | bounced | replied`.
@@ -689,10 +709,18 @@ Four sub-tabs reusing the existing `QPushButton#tab` pattern:
    `settings["dry_run"]` is on.
 4. **Stats** — queued/sent/failed/replied/bounced tiles, per-day sparkline-ish bar
    row (plain QWidget painting or coloured labels — no chart dependency),
-   suppression list with a remove action.
+   a **Sent mail** list, and the suppression list with a remove action.
 
 The preview pane must show exactly what will be sent, including the footer and
 unsubscribe line. Never show a template with unresolved `{{...}}`.
+
+The Sent mail list is the same promise about mail that has already gone. Opening
+a row shows the stored `sent_mail.raw` — the real subject, recipient, sending
+account, time, footer and the headers that matter — and never a re-render from
+the template, which by then may have been edited. The Sending tab's activity log
+opens the same view on double-click, so the question can be asked from the tab
+the user is already watching. A rehearsal stores nothing and lists nothing:
+nothing left the machine, so there is nothing to read back.
 
 ---
 

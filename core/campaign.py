@@ -36,7 +36,6 @@ from __future__ import annotations
 import json
 import random
 import re
-import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
@@ -100,6 +99,12 @@ _NO_CAP = 1_000_000
 # How many times a follow-up pass may be nudged later and drawn again before it
 # is accepted as it stands. Each try costs one pure-function call and no I/O.
 _PLACEMENT_TRIES = 4
+
+# How far down an overdue queue one dispatch looks for a message that can go
+# now. A cap rather than the whole backlog: each candidate past the first costs
+# a lookup, and a head that nothing in twenty-five rows can get past is a queue
+# that wants replanning rather than scanning.
+_DISPATCH_SCAN = 25
 
 # draft (created) -> scheduled (planned) -> running -> paused -> stopped | done
 CAMPAIGN_STATUSES = ("draft", "scheduled", "running", "paused", "stopped", "done")
@@ -779,16 +784,16 @@ def _contacted_lead_ids(conn) -> set[int]:
     yet, but a first touch addressed to them is sitting in the store waiting to
     be put back on the queue, and queueing a second one behind it would mail
     the same stranger twice.
+
+    Through `core.outreach_db` rather than off the connection, because the
+    planner runs on its own thread beside the GUI and one shared connection is
+    one shared statement cache — see `core.outreach_db._query`.
     """
-    try:
-        rows = conn.execute(
-            "SELECT DISTINCT lead_id FROM messages WHERE step = 0 "
-            "AND status IN ('queued', 'sending', 'rehearsed', 'sent', "
-            "               'replied', 'bounced')"
-        ).fetchall()
-    except sqlite3.Error:
-        return set()
-    return {_int(row[0]) for row in rows}
+    return {_int(row.get("lead_id")) for row in _db.rows(
+        conn,
+        "SELECT DISTINCT lead_id FROM messages WHERE step = 0 "
+        "AND status IN ('queued', 'sending', 'rehearsed', 'sent', "
+        "               'replied', 'bounced')")}
 
 
 # Every pass below walks leads built out of scraped third-party text, and a
@@ -1306,33 +1311,50 @@ class OutreachWorker(QThread):
         _db.set_campaign_status(conn, self.campaign_id, "done")
 
     def _due(self, conn, now: float) -> list[dict]:
-        return [row for row in _db.due_messages(conn, now, limit=200)
-                if _int(row.get("campaign_id")) == self.campaign_id]
+        """This campaign's overdue queue, narrowed by SQLite and not by us.
+
+        The filter belongs in the query because `limit` is applied before any
+        row reaches Python. Filtering afterwards meant a second campaign
+        prepared behind a stale one saw a window of two hundred rows that were
+        all somebody else's, read its own queue as empty, and sat there.
+        """
+        return _db.due_messages(conn, now, limit=200, campaign_id=self.campaign_id)
 
     def _seconds_until_next(self, conn, now: float) -> float:
         """How long until this campaign's next message is due. 30 s if unknown."""
         horizon = now + _MAX_PLAN_DAYS * _DAY_SEC
-        for row in _db.due_messages(conn, horizon, limit=400):
-            if _int(row.get("campaign_id")) == self.campaign_id:
-                return max(1.0, _float(row.get("scheduled_at")) - now)
+        rows = _db.due_messages(conn, horizon, limit=1, campaign_id=self.campaign_id)
+        if rows:
+            return max(1.0, _float(rows[0].get("scheduled_at")) - now)
         return 30.0
 
     # ── one message ──
 
     def _dispatch(self, conn, due: list, now: float) -> None:
+        """Send the first overdue message that has an account free to take it.
+
+        It walks the head of the queue rather than only looking at `due[0]`
+        because a follow-up is pinned to the account its thread belongs to. One
+        chaser whose account is inside its pacing gap used to hold the whole
+        run behind it, and every unbound message behind that chaser could have
+        gone from the other account at once.
+        """
         if not in_send_window(now, self._settings):
             self._replan(conn, due, now, "Outside the sending window")
             return
 
-        account, wait = self._pick_account(conn, due[0], now)
-        if account is None:
-            if wait > 0:
-                self._nap(min(wait, 30.0))       # only the pacing gap is holding us
+        waits = []
+        for row in due[:_DISPATCH_SCAN]:
+            account, wait = self._pick_account(conn, row, now)
+            if account is not None:
+                self._send(conn, row, account, now)
                 return
-            self._replan(conn, due, now, "Every account is at its cap for today")
+            if wait > 0:
+                waits.append(wait)
+        if waits:
+            self._nap(min(min(waits), 30.0))     # only the pacing gap is holding us
             return
-
-        self._send(conn, due[0], account, now)
+        self._replan(conn, due, now, "Every account is at its cap for today")
 
     def _live_accounts(self, now: float = 0.0) -> list[dict]:
         """Enabled accounts that are not out of action for today.
@@ -1347,9 +1369,34 @@ class OutreachWorker(QThread):
                 if _text(a.get("email")).strip()
                 and self._stopped.get(_text(a.get("email")).strip().lower()) != today]
 
+    def _thread_account(self, conn, row: dict) -> str:
+        """The address a chaser has to leave from, or "" when it may move.
+
+        A follow-up carries `In-Reply-To` for the first touch, so its account is
+        not a preference. Before this was enforced, `_pick_account` handed a
+        chaser to whichever account was out of its pacing gap first: 186 of 400
+        follow-ups in a 200-lead campaign went out from the other address,
+        threaded into a conversation that address had never been part of, which
+        the reader sees as a second stranger answering their mail.
+        """
+        if _int(row.get("step")) <= 0:
+            return ""
+        parent = _db.first_touch_sent(conn, _int(row.get("campaign_id")),
+                                      _int(row.get("lead_id")))
+        return _text(parent.get("account_email")).strip().lower()
+
     def _pick_account(self, conn, row: dict, now: float) -> tuple[dict | None, float]:
         """(account to send from, seconds to wait). Both empty means all capped."""
         accounts = self._live_accounts(now)
+        # A benched or deleted account cannot hold its own thread hostage: the
+        # chaser falls back to whatever is standing, and `_thread_parent` then
+        # drops the headers so it goes as its own message rather than as a
+        # forged reply. Holding it instead would stall the campaign until
+        # midnight for a message that has somewhere perfectly good to go.
+        bound = self._thread_account(conn, row)
+        if bound and any(_text(a.get("email")).strip().lower() == bound for a in accounts):
+            accounts = [a for a in accounts
+                        if _text(a.get("email")).strip().lower() == bound]
         preferred = _text(row.get("account_email")).strip().lower()
         accounts.sort(key=lambda a: _text(a.get("email")).strip().lower() != preferred)
 
@@ -1388,17 +1435,44 @@ class OutreachWorker(QThread):
         hour += sum(1 for ts in rehearsed if ts > now - _HOUR_SEC)
         return hour < hourly
 
-    def _thread_parent(self, conn, row: dict) -> str:
+    def _thread_parent(self, conn, row: dict, account_email: str = "") -> str:
         """The first touch's Message-ID, for a chaser to reply into.
 
         Returns "" for a first touch, and for a chaser whose parent has not
         been sent — rehearsed included — in which case the chaser stands on its
         own rather than pointing at a conversation that does not exist.
+
+        Also "" when this message is leaving from a different address than the
+        first touch did. `_pick_account` keeps a chaser on its thread's account
+        while that account is standing, so this is the benched-account case; a
+        fresh message from the new address is honest where a reply from it
+        would not be.
         """
         if _int(row.get("step")) <= 0:
             return ""
-        return _db.first_touch_message_id(conn, _int(row.get("campaign_id")),
-                                          _int(row.get("lead_id")))
+        parent = _db.first_touch_sent(conn, _int(row.get("campaign_id")),
+                                      _int(row.get("lead_id")))
+        from_account = _text(parent.get("account_email")).strip().lower()
+        if account_email and from_account and from_account != account_email.strip().lower():
+            return ""
+        return _text(parent.get("message_id"))
+
+    def _reusable_header_id(self, row: dict, account_email: str) -> str:
+        """The `Message-ID` this row already carries, when it may be reused.
+
+        A retry from the same account keeps its id: the id was claimed before
+        the hand-off precisely so a message the process died in the middle of
+        can be rebuilt as the same message rather than as a second one.
+
+        A message handed to a *different* account may not. The id names the
+        sender's own domain — that is the only domain we can honestly claim —
+        so one minted for another address reads as forged.
+        """
+        stored = _text(row.get("message_id")).strip()
+        if not stored:
+            return ""
+        same = _text(row.get("account_email")).strip().lower() == account_email.strip().lower()
+        return stored if same else ""
 
     def _send(self, conn, row: dict, account: dict, now: float) -> None:
         message_id = _int(row.get("id"))
@@ -1420,19 +1494,36 @@ class OutreachWorker(QThread):
             body_text=_text(row.get("body_text")),
             body_html=_text(row.get("body_html")),
             unsubscribe_mailto=_text(self._settings.get("unsubscribe_mailto")),
-            message_id=_text(row.get("message_id")),
-            in_reply_to=self._thread_parent(conn, row),
+            message_id=self._reusable_header_id(row, account_email),
+            in_reply_to=self._thread_parent(conn, row, account_email),
         )
 
         if self.dry_run:
             ok, error = True, ""
         else:
-            # Claim it before the hand-off. A crash between the server taking
-            # the message and this process writing the result would otherwise
-            # leave the row `queued`, and the restart would send it a second
-            # time; `sending` is recoverable evidence that it may already be
-            # gone, which is the safer side to be wrong on.
-            _db.mark_message(conn, message_id, "sending", account_email=account_email)
+            # Claim it before the hand-off, and claim the whole of it: the
+            # status, the `Message-ID` it goes out under, and the bytes
+            # themselves. A crash between the server taking the message and
+            # this process writing the result would otherwise leave the row
+            # `queued`, and the restart would send it a second time; `sending`
+            # is recoverable evidence that it may already be gone, which is the
+            # safer side to be wrong on.
+            #
+            # The header id has to be written here rather than after the send
+            # for the same reason the status is. It was minted in memory a line
+            # ago, and a crash lost it — so the recovered row read as sent with
+            # no id at all, its lead's chaser threaded onto nothing, and a reply
+            # to it was never matched, which meant the sequence kept chasing
+            # somebody who had already answered.
+            _db.mark_message(conn, message_id, "sending",
+                             account_email=account_email, message_id=header_id)
+            _db.record_transcript(conn, message_id, _mailer.wire_form(message))
+            # The quota is charged here too, and for the same reason the status
+            # is. Caps count transactions, and a transaction the process died
+            # in the middle of is one Gmail has already seen — charged after
+            # the fact, it was not counted at all, and the restart sent one
+            # message per crash over the account's daily ceiling.
+            _db.record_send(conn, account_email, now)
             ok, error = self._sender(account).send(message)
 
         key = account_email.lower()
@@ -1446,11 +1537,12 @@ class OutreachWorker(QThread):
         # plainly as an acceptance, and a stretch of dead addresses in a scraped
         # list is the ordinary case — counting only successes let one account
         # put sixty rejected transactions on the wire against a cap of ten,
-        # which is the reputation damage the caps exist to prevent.
+        # which is the reputation damage the caps exist to prevent. A live send
+        # charged its slot before the hand-off; a rehearsal has none to charge
+        # and keeps its own tally instead, so a dry run paces like the real
+        # thing without spending the account's real quota.
         if self.dry_run:
             self._rehearsed.setdefault(key, []).append(now)
-        else:
-            _db.record_send(conn, account_email, now)
 
         if ok:
             self._conn_failures = 0
@@ -1614,13 +1706,11 @@ class OutreachWorker(QThread):
         header_id = _text(header_id).strip()
         if not header_id:
             return {}
-        try:
-            rows = conn.execute(
-                "SELECT id, lead_id, status FROM messages WHERE message_id = ? "
-                "ORDER BY id DESC LIMIT 1", (header_id,)).fetchall()
-        except sqlite3.Error:
-            return {}
-        return {"id": rows[0][0], "lead_id": rows[0][1], "status": rows[0][2]} if rows else {}
+        rows = _db.rows(conn,
+                        "SELECT id, lead_id, status FROM messages "
+                        "WHERE message_id = ? ORDER BY id DESC LIMIT 1",
+                        (header_id,))
+        return rows[0] if rows else {}
 
     def _cancel_queued(self, conn, lead_id: int, reason: str) -> int:
         """Drop everything still owed to one lead. Returns how many.
@@ -1632,14 +1722,12 @@ class OutreachWorker(QThread):
         lead_id = _int(lead_id)
         if not lead_id:
             return 0
-        try:
-            rows = conn.execute(
-                "SELECT id FROM messages WHERE lead_id = ? "
-                "AND status IN ('queued', 'sending', 'rehearsed')", (lead_id,)).fetchall()
-        except sqlite3.Error:
-            return 0
+        rows = _db.rows(conn,
+                        "SELECT id FROM messages WHERE lead_id = ? "
+                        "AND status IN ('queued', 'sending', 'rehearsed')",
+                        (lead_id,))
         for row in rows:
-            _db.mark_message(conn, _int(row[0]), "skipped", error=reason)
+            _db.mark_message(conn, _int(row.get("id")), "skipped", error=reason)
         return len(rows)
 
     # ── rescheduling ──
@@ -1676,8 +1764,13 @@ class OutreachWorker(QThread):
             return
 
         for row, (when, email) in zip(due, slots):
+            # The slot's account is a suggestion; a chaser's is not. Rewriting
+            # a follow-up onto whichever account the replan drew would leave the
+            # row disagreeing with the account `_pick_account` will actually
+            # send it from, and the countdown reads that column.
+            bound = self._thread_account(conn, row)
             _db.mark_message(conn, _int(row.get("id")), "queued",
-                             scheduled_at=when, account_email=email)
+                             scheduled_at=when, account_email=bound or email)
         self.log_signal.emit("%s — %d message(s) held until %s"
                              % (reason, len(slots), _clock(slots[0][0])), "info")
 

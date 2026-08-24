@@ -68,12 +68,19 @@ except ImportError:
 ENRICH_KEYS = ("email", "facebook", "instagram", "linkedin", "twitter", "youtube")
 
 # Departmental inboxes: not a person, but a real human reads them.
+# "hallo" and "kontakt" were already here, so the list had always reached past
+# English — just not far enough to rank `hei@` or `contacto@` as the front desk
+# they are, which left the general inbox losing to whatever department happened
+# to be printed on the contact page.
 EMAIL_ROLE_PREFIXES = frozenset({
     "info", "contact", "contactus", "hello", "hallo", "hey", "hi", "sales",
     "office", "enquiries", "enquiry", "inquiries", "inquiry", "admin",
     "bookings", "booking", "reception", "frontdesk", "reservations", "kontakt",
     "mail", "email", "general", "ask", "team", "support", "help", "service",
     "customerservice", "orders", "studio", "shop", "welcome", "post",
+    "hei", "hola", "bonjour", "ciao", "contacto", "contatto", "correo",
+    "buero", "sekretariat", "empfang", "praxis", "cabinet", "accueil",
+    "reservas", "citas", "atencioncliente", "recepcion",
 })
 
 # Machine mailboxes. Sending here is at best ignored and at worst a spam report.
@@ -89,6 +96,8 @@ EMAIL_JUNK_PREFIXES = frozenset({
 _CAREERS_PREFIXES = frozenset({
     "careers", "career", "jobs", "job", "hiring", "recruit", "recruiting",
     "recruitment", "resume", "resumes", "cv", "hr", "apply", "applications",
+    "bewerbung", "bewerbungen", "karriere", "stellen", "recrutement",
+    "candidature", "candidatures", "empleo", "rrhh",
 })
 _LEGAL_PREFIXES = frozenset({
     "privacy", "legal", "dpo", "gdpr", "compliance", "dmca", "copyright",
@@ -553,6 +562,10 @@ def _js_unescape(text: str) -> str:
 
 
 _SCRIPT_STYLE_RE = re.compile(r"<(script|style|noscript)\b[^>]*>.*?</\1>", re.I | re.S)
+# A script can hold an address a page means to show; a stylesheet never can, and
+# on a page builder's output it is most of the bytes. Kept separate so the
+# expensive scans can drop the one without losing the other.
+_STYLE_RE = re.compile(r"<style\b[^>]*>.*?</style\s*>", re.I | re.S)
 _TAG_RE = re.compile(r"<[^>]+>")
 
 
@@ -818,7 +831,34 @@ def _scan_page(html: str, page_url: str = "") -> dict:
     marked = _mark_joins(plain)
     if plain != html:
         _scan_plain(marked, found, "deobfuscated")
-    _scan_obfuscated(marked, found)
+    # An obfuscated address is one a human is meant to read, so the scan for it
+    # runs over what a human sees. Two reasons, and they point the same way.
+    #
+    # Correctness: `bookings <b>[at]</b> acme <b>[dot]</b> com` renders as one
+    # line and is one of the commonest ways a small site hides its address, but
+    # the tags sit *between* the tokens rather than inside a word, so
+    # `_mark_joins` rightly leaves them and the spelled pattern never closed.
+    #
+    # Cost: `_OBFUSCATED_RE` is the most expensive pattern in this file and its
+    # price is the length of the text, not the number of addresses in it. Run
+    # over raw markup it spent its whole budget on an inlined stylesheet — 21 ms
+    # of a 160 KB page, against 6 ms with the CSS dropped and 0.1 ms over the
+    # readable text alone, on a scan that runs once per page per lead. Scripts
+    # stay in the first pass: an address written into a JS string is one the
+    # page means to show, and dropping them costs it its provenance.
+    #
+    # Order is the safety argument and it is not interchangeable. `_mark_joins`
+    # runs first, so every split a reader cannot see is already a `_JOIN` that
+    # the pattern refuses on the leading side; strip first and `in<b></b>fo@`
+    # comes back as `fo@`, a truncation that cleans and looks real and goes
+    # nowhere. Then the tags are replaced by a space, never by nothing, because
+    # a space is a boundary `_LOCAL_ATOM` cannot cross and joining
+    # `Contact</h2><p>info@` into `contactinfo@` is the fabrication this file
+    # exists to prevent. Cut here rather than through `_strip_tags`, whose
+    # trailing unescape would decode `&amp;#8203;` a second time and hand back
+    # the zero-width space `_mark_joins` was given no chance to see.
+    _scan_obfuscated(_STYLE_RE.sub(" ", marked), found)
+    _scan_obfuscated(_TAG_RE.sub(" ", _SCRIPT_STYLE_RE.sub(" ", marked)), found)
     return found
 
 
