@@ -218,6 +218,7 @@ Each of these is a real-world miss in the current implementation. Implement all:
 | Signal | Delta |
 |---|---|
 | domain matches the site's registrable domain | `+50` |
+| a sibling domain the business plainly owns — the same brand under another suffix (`acmeroofing.ca` → `acmeroofing.com`), or a brand one of them begins (`wrenfield.works` → `wrenfieldjoinery.com`) | `+35` |
 | found via `mailto:` | `+25` |
 | found via JSON-LD or `data-cfemail` | `+20` |
 | local part is a role prefix (`info`, `contact`, `hello`, `sales`, `office`, `enquiries`, `admin`, `bookings`, `reception`) | `+18` |
@@ -229,8 +230,21 @@ Each of these is a real-world miss in the current implementation. Implement all:
 | `privacy`/`legal`/`dpo`/`gdpr`/`compliance` | `-20` |
 | domain fails DNS (`deliverable is False`) | `-60` |
 | disposable-domain list hit | `-100` |
+| on a domain the business does not own, and not free mail | `-100` |
+| appears nowhere on the site but inside a credit line (`Site by`, `Powered by`, `Theme by`, a designer byline) | `-100` |
 
 Anything scoring `<= 0` is dropped from `emails` entirely.
+
+The last two are ownership vetoes, and `-100` is deliberate: a role prefix, a
+`mailto:` and a `/contact` page together are worth 53, so a withheld bonus
+would still let the agency that built the site outrank nothing at all. Free
+mail is the exception to the first — nobody owns `gmail.com`, and a plumber
+writing from one is the case the `+8` exists for — and so is a site *on* a
+builder platform (`*.wixsite.com`, `*.myshopify.com`, …), where the registrable
+domain belongs to the platform and ownership cannot be read at all. The credit
+veto applies to free mail too, because a freelancer's Gmail address in a
+byline is still not the business; it does not apply to an address the business
+owns, because an agency's own site credits itself.
 
 ### Deliverability check (`verify_dns=True`)
 

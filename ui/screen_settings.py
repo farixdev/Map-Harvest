@@ -1654,6 +1654,14 @@ class SettingsScreen(QWidget):
 
         holder = QWidget()
         holder.setLayout(self.layout())
+        # setLayout moves the LAYOUT to the holder but leaves the widgets it
+        # manages parented to this screen, so deleting the holder reclaimed an
+        # empty box and the old tree survived every rebuild. Each appearance
+        # change abandoned ~868 widgets, and setStyleSheet repolishes every
+        # widget alive, so each change cost more than the last without bound.
+        for _stale in self.children():
+            if isinstance(_stale, QWidget):
+                _stale.setParent(holder)
         holder.deleteLater()
         self._build()
         self._load_into_ui()

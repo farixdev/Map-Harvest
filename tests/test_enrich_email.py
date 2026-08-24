@@ -139,7 +139,11 @@ def test_bracketed_markers_carry_any_case_and_any_suffix():
         "office (at) polka (dot) salon": "office@polka.salon",
     }
     for raw, expected in cases.items():
-        assert email_of("<p>%s</p>" % raw) == expected, raw
+        # Read on the site that owns the address. An address on a domain the
+        # business does not own is refused by the ranker however it is spelled,
+        # and this fixture is about the brackets, not about ownership.
+        assert email_of("<p>%s</p>" % raw,
+                        "https://" + expected.partition("@")[2]) == expected, raw
     for tld in MODERN_GTLDS:
         html = "<p>Reach us: info (at) joespizza (dot) %s</p>" % tld
         assert E._scan_page(html, "x") == {"info@joespizza." + tld: "deobfuscated"}, tld
@@ -426,12 +430,23 @@ def test_no_page_is_ever_read_backwards():
     and outscores the real one. `service.desk@partnerco.com` scores 18 as a
     role; its mirror `moc.ocrentrap@ksed.ecivres` scores 30 as a person, and
     that was best_email on any themed page carrying a dotted local part.
+
+    The reseller's own line is now refused as well, and the assertion below is
+    inverted to say so: `partnerco.com` is not a domain `acmeroofing.ca` owns,
+    so nothing on this page can be the roofer's address. That is the ownership
+    rule, not this one — the mirror is what is on trial here, and it is now
+    provably absent on both sides of the floor.
     """
     themed = ('<style>.rtl-support{direction:rtl}</style>'
               '<p>our reseller: service.desk@partnerco.com</p>')
     assert E._scan_page(themed, "x") == {"service.desk@partnerco.com": "text"}
     ranked = E._rank_emails({"https://acmeroofing.ca/": E._scan_page(themed)},
                             "acmeroofing.ca")
+    assert [r["email"] for r in ranked] == [], ranked
+    # On the site that does own it, the address comes back whole and the mirror
+    # is still nowhere.
+    ranked = E._rank_emails({"https://partnerco.com/": E._scan_page(themed)},
+                            "partnerco.com")
     assert [r["email"] for r in ranked] == ["service.desk@partnerco.com"], ranked
 
     for markup in ('<div style="direction:rtl">%s</div>',
@@ -641,6 +656,332 @@ def test_dns_penalty_and_unknown():
     assert unknown[0]["score"] == 93, unknown
     assert unknown[0]["deliverable"] is None
     print("dns penalty: OK")
+
+
+# ── Ownership ──
+
+# A large share of small-business sites were built by somebody else and say so
+# in the footer, and those bylines carry real, deliverable addresses: the
+# agency's studio inbox, the theme author's, the host's support desk. An
+# address is not the business's for having been printed on its page — and this
+# failure is worse than finding nothing, because the letter opens by naming
+# what is wrong with the site and then lands in the inbox of the people who
+# built it.
+#
+# Four shapes, so that neither half of the rule can be satisfied by breaking
+# the other: a page whose only address is the builder's must yield nothing; a
+# business genuinely on free mail must still yield it; a page carrying both
+# must yield the business's; and a business writing from a sibling domain it
+# plainly owns must keep it.
+OWNERSHIP_CORPUS = [
+
+    # The only address on the page belongs to whoever built it.
+    ("credit-footer-mailto", "https://coastlinedrywall.com/", """
+     <html><body><h1>Coastline Drywall</h1>
+     <p>Taping and boarding across the South Shore since 2004.</p>
+     <p>Call 902-555-0148 for a quote.</p>
+     <footer><p>&copy; 2026 Coastline Drywall. Site by
+     <a href="https://northpixelmedia.com">North Pixel Media</a> &mdash;
+     <a href="mailto:studio@northpixelmedia.com">studio@northpixelmedia.com</a>
+     </p></footer></body></html>""", ""),
+
+    ("builder-support-desk", "https://oakvillewindows.com/", """
+     <html><body><h1>Oakville Windows &amp; Doors</h1>
+     <p>Vinyl and wood replacement windows. Free measure, 905-555-0110.</p>
+     <footer><p>Powered by <a href="https://webcraftstudios.com">WebCraft
+     Studios</a>. Site issues? support@webcraftstudios.com</p></footer>
+     </body></html>""", ""),
+
+    ("theme-author", "https://brightlanelandscapes.ca/", """
+     <html><body><h1>Brightlane Landscapes</h1>
+     <p>Beds, borders and dry stone walling in the Annapolis Valley.</p>
+     <footer><small>Theme by Lumen Themes (hello@lumenthemes.com)</small>
+     </footer></body></html>""", ""),
+
+    ("designer-byline", "https://rivertonautobody.com/", """
+     <html><body><h1>Riverton Auto Body</h1>
+     <p>Collision repair, insurance work, courtesy cars.</p>
+     <p class="credit">Website designed by
+     <a href="https://kestreldesign.co">Kestrel Design Co.</a>
+     <a href="mailto:hello@kestreldesign.co">say hello</a></p>
+     </body></html>""", ""),
+
+    ("hosting-support", "https://pineboughcafe.ca/", """
+     <html><body><h1>Pinebough Cafe</h1>
+     <p>Breakfast until two. 14 Mill Street.</p>
+     <footer><p>Hosting by Northwind Hosting &mdash; help@northwindhosting.net
+     </p></footer></body></html>""", ""),
+
+    ("dev-shop-credit", "https://summitcranehire.co.uk/", """
+     <html><body><h1>Summit Crane Hire</h1>
+     <p>Spider cranes and operators across the North West.</p>
+     <footer><p>Web development by Halo Digital, dev@halodigital.co.uk</p>
+     </footer></body></html>""", ""),
+
+    # The freelancer works from a Gmail account, which is exactly the shape the
+    # free-mail rule exists to keep. Position is the only thing that tells them
+    # apart, and without it this address is the lead.
+    ("freelancer-on-gmail", "https://maplegroveplumbing.ca/", """
+     <html><body><h1>Maple Grove Plumbing</h1>
+     <p>Drains, boilers, emergency call-outs. Ring 613-555-0177.</p>
+     <footer><p>Site by Jane Mercer Design &mdash; janemercerdesign@gmail.com
+     </p></footer></body></html>""", ""),
+
+    ("credit-behind-cloudflare", "https://quaysidebooks.ie/", """
+     <html><body><h1>Quayside Books</h1>
+     <p>Second-hand and antiquarian, open Thursday to Sunday.</p>
+     <footer><p>Site by Tern Studio
+     <a href="/cdn-cgi/l/email-protection" class="__cf_email__"
+        data-cfemail="__CF__">[email&#160;protected]</a></p></footer>
+     </body></html>""", ""),
+
+    # The business really is on free mail.
+    ("free-mail-alone", "https://delrayelectric.ca/", """
+     <html><body><h1>Delray Electric</h1>
+     <p>Panel upgrades and EV chargers. Email delrayelectric@gmail.com
+     or call 519-555-0163.</p></body></html>""", "delrayelectric@gmail.com"),
+
+    ("free-mail-mailto", "https://thecopperkettle.co.uk/", """
+     <html><body><h1>The Copper Kettle</h1>
+     <p>Bookings: <a href="mailto:thecopperkettle@outlook.com">email us</a>
+     </p></body></html>""", "thecopperkettle@outlook.com"),
+
+    ("free-mail-family-tld", "https://hillsidefarmshop.ca/", """
+     <html><body><h1>Hillside Farm Shop</h1>
+     <p>Beef boxes and preserves. Orders to hillsidefarm@yahoo.ca.</p>
+     </body></html>""", "hillsidefarm@yahoo.ca"),
+
+    ("free-mail-beside-a-credit", "https://northshoretiling.com/", """
+     <html><body><h1>North Shore Tiling</h1>
+     <p>Wet rooms and floors. Email northshoretiling@gmail.com for quotes.</p>
+     <footer><p>Powered by <a href="https://webcraftstudios.com">WebCraft
+     Studios</a>. Support: support@webcraftstudios.com</p></footer>
+     </body></html>""", "northshoretiling@gmail.com"),
+
+    # The business's own address, with a credit underneath it.
+    ("own-domain-plus-credit", "https://acmeroofing.ca/", """
+     <html><body><h1>Acme Roofing</h1>
+     <p>Shingles and flat roofs. info@acmeroofing.ca</p>
+     <footer><p>Site by <a href="https://northpixelmedia.com">North Pixel
+     Media</a> &mdash; studio@northpixelmedia.com</p></footer>
+     </body></html>""", "info@acmeroofing.ca"),
+
+    ("own-mailto-plus-theme", "https://harbourviewdental.ca/contact/", """
+     <html><body><h1>Contact</h1>
+     <a href="mailto:reception@harbourviewdental.ca">Reception</a>
+     <footer><p>Theme by Lumen Themes (hello@lumenthemes.com)</p></footer>
+     </body></html>""", "reception@harbourviewdental.ca"),
+
+    ("own-domain-plus-powered-by", "https://fernhillbakery.ca/", """
+     <html><body><h1>Fernhill Bakery</h1>
+     <p>Trade orders: orders@fernhillbakery.ca</p>
+     <footer><p>Powered by WebCraft Studios &mdash;
+     support@webcraftstudios.com</p></footer></body></html>""",
+     "orders@fernhillbakery.ca"),
+
+    ("jsonld-plus-credit", "https://wrenfieldironworks.co.uk/", """
+     <html><head><script type="application/ld+json">
+     {"@type":"LocalBusiness","name":"Wrenfield Ironworks",
+      "email":"orders@wrenfieldironworks.co.uk"}
+     </script></head><body><h1>Wrenfield Ironworks</h1>
+     <footer><p>Web design by Halo Digital, dev@halodigital.co.uk</p></footer>
+     </body></html>""", "orders@wrenfieldironworks.co.uk"),
+
+    ("own-person-plus-credit", "https://stonebridgelaw.ca/", """
+     <html><body><h1>Stonebridge Law</h1>
+     <p>Wills and estates. Write to e.novak@stonebridgelaw.ca.</p>
+     <footer><p>Site by Kestrel Design Co. &mdash; hello@kestreldesign.co</p>
+     </footer></body></html>""", "e.novak@stonebridgelaw.ca"),
+
+    # A sibling domain the business plainly owns.
+    ("sibling-longer-name", "https://harbourviewdental.ca/", """
+     <html><body><h1>Harbourview Dental</h1>
+     <p>New patients welcome. Write to info@harbourviewdentalgroup.com.</p>
+     </body></html>""", "info@harbourviewdentalgroup.com"),
+
+    ("sibling-other-tld", "https://acmeroofing.ca/contact/", """
+     <html><body><h1>Contact Acme Roofing</h1>
+     <a href="mailto:info@acmeroofing.com">info@acmeroofing.com</a>
+     </body></html>""", "info@acmeroofing.com"),
+
+    ("sibling-trading-name", "https://wrenfield.works/", """
+     <html><body><h1>Wrenfield</h1>
+     <p>Bench joinery since 1954. Trade orders: orders@wrenfieldjoinery.com</p>
+     </body></html>""", "orders@wrenfieldjoinery.com"),
+
+    ("sibling-hyphen", "https://oakville-windows.ca/", """
+     <html><body><h1>Oakville Windows</h1>
+     <p>Showroom open Saturdays. sales@oakvillewindows.ca</p>
+     </body></html>""", "sales@oakvillewindows.ca"),
+
+    # Controls.
+    ("third-party-no-credit", "https://bramptontowing.ca/", """
+     <html><body><h1>Brampton Towing</h1>
+     <p>24-hour recovery, 905-555-0192.</p>
+     <p>Franchise enquiries are handled by
+     partners@fleetgroupholdings.com.</p></body></html>""", ""),
+
+    ("own-domain-beats-a-vendor", "https://lakeshoredental.ca/contact/", """
+     <html><body><h1>Contact</h1>
+     <p>Reception: info@lakeshoredental.ca</p>
+     <p>Invoices are handled by billing@dentalbillingpartners.com.</p>
+     </body></html>""", "info@lakeshoredental.ca"),
+
+    # An agency credits itself, on its own site, and keeps its own address.
+    ("the-agency-s-own-site", "https://northpixelmedia.com/", """
+     <html><body><h1>North Pixel Media</h1>
+     <p>Websites for trades and clinics.</p>
+     <footer><p>Site by North Pixel Media &mdash;
+     <a href="mailto:studio@northpixelmedia.com">studio@northpixelmedia.com</a>
+     </p></footer></body></html>""", "studio@northpixelmedia.com"),
+]
+
+
+def ownership_pages():
+    """The corpus with its Cloudflare payload encoded the way Cloudflare does."""
+    return [(name, url, html.replace("__CF__", cf_encode("hello@ternstudio.ie")),
+             want) for name, url, html, want in OWNERSHIP_CORPUS]
+
+
+def test_no_page_hands_back_somebody_elses_address():
+    """24 pages, one right answer each, and nine of them are "nothing".
+
+    Precision on this corpus was 63.6% — 14 of the 22 addresses it handed back
+    were the business's, and 7 of the other 8 were the agency, theme author or
+    host printed in the footer. The eighth was worse: a tiler's own Gmail
+    address lost to the builder's support desk sitting on the same page.
+    """
+    wrong, given = [], 0
+    for name, url, html, want in ownership_pages():
+        got = E.extract_contacts(html, url)["email"]
+        given += bool(got)
+        if got != want:
+            wrong.append((name, got or "(nothing)", want or "(nothing)"))
+    assert wrong == [], (
+        "%d of %d pages answer with the wrong address:\n" % (len(wrong), given)
+        + "\n".join("  %-26s gave %-34s want %s" % w for w in wrong))
+    print("ownership corpus: OK (%d pages, %d addresses, all correct)"
+          % (len(OWNERSHIP_CORPUS), given))
+
+
+def test_a_credit_line_is_not_a_page_stating_its_address():
+    """The byline is read as provenance, and only when it is the sole one.
+
+    An address written plainly anywhere on the site keeps its own method, so a
+    footer credit that repeats an address the business also states outright
+    cannot demote it — which is what happens on an agency's own site, and on
+    any business whose builder links its address twice.
+    """
+    credit = ('<footer><p>Site by <a href="https://northpixelmedia.com">North'
+              ' Pixel</a> &mdash; studio@northpixelmedia.com</p></footer>')
+    assert E._scan_page(credit, "x") == {"studio@northpixelmedia.com": "credit"}
+    stated = '<p>Write to studio@northpixelmedia.com.</p>' + credit
+    assert E._scan_page(stated, "x") == {"studio@northpixelmedia.com": "text"}
+    # Across a crawl, too: one page's byline says nothing about a page that
+    # prints the address outright.
+    per_page = {"https://acme.ca/": {"hello@buildco.com": "credit"},
+                "https://acme.ca/contact/": {"hello@buildco.com": "mailto"}}
+    ranked = E._rank_emails(per_page, "buildco.com")
+    assert [r["email"] for r in ranked] == ["hello@buildco.com"], ranked
+    assert ranked[0]["method"] == "mailto", ranked
+
+    # The window is one line. A credit above the shop's own address must not
+    # reach down into it, or the rule deletes the only address it has.
+    footer = ('<footer><p>Proudly powered by WordPress</p>'
+              '<p>Email thekiln@gmail.com</p></footer>')
+    assert E._scan_page(footer, "x") == {"thekiln@gmail.com": "text"}
+    print("a credit line is not a stated address: OK")
+
+
+def test_only_a_domain_the_business_owns_counts_as_its_own():
+    """Same domain, same brand under another suffix, or a brand it extends.
+
+    A prefix and not a shared substring, deliberately: `windows.io` and
+    `oakvillewindows.com` share a tail and are two companies, while a business
+    that outgrows its name extends it to the right.
+    """
+    for domain, site in (("acmeroofing.ca", "acmeroofing.ca"),
+                         ("mail.acmeroofing.ca", "acmeroofing.ca"),
+                         ("acmeroofing.com", "acmeroofing.ca"),
+                         ("acme-roofing.ca", "acmeroofing.ca"),
+                         ("wrenfieldjoinery.com", "wrenfield.works"),
+                         ("harbourviewdental.ca", "harbourviewdentalgroup.com")):
+        assert E._owns(domain, site), (domain, site)
+    for domain, site in (("northpixelmedia.com", "coastlinedrywall.com"),
+                         ("webcraftstudios.com", "oakvillewindows.com"),
+                         ("windows.io", "oakvillewindows.com"),
+                         ("notacmeroofing.ca", "acmeroofing.ca"),
+                         ("gmail.com", "acmeroofing.ca"),
+                         ("acme.com", "acmecorp.ca"),
+                         ("acmeroofing.ca", "")):
+        assert not E._owns(domain, site), (domain, site)
+    print("only an owned domain counts as the business's: OK")
+
+
+def test_the_credit_scan_cannot_invent_an_address():
+    """A window is a raw slice of markup, so it cuts tags and addresses in half.
+
+    That has to be harmless, because a fabricated recipient is the one failure
+    worse than the one this rule fixes. It is: the window scan can only
+    nominate addresses the page already yielded, and the blanked scan is only
+    ever subtracted from that nomination, so neither can put a key into the
+    result. The pad walks the cut through the address a character at a time.
+    """
+    for pad in range(280, 341):
+        page = ('<p>Site by North Pixel ' + "x" * pad
+                + ' write to office@coastlinedrywall.com</p>')
+        found = E._scan_page(page, "https://coastlinedrywall.com/")
+        assert set(found) == {"office@coastlinedrywall.com"}, (pad, found)
+        ranked = E._rank_emails({"https://coastlinedrywall.com/": found},
+                                "coastlinedrywall.com")
+        assert [r["email"] for r in ranked] == ["office@coastlinedrywall.com"], pad
+    print("the credit scan invents nothing: OK (%d cut positions)"
+          % len(range(280, 341)))
+
+
+def test_a_crawl_never_mails_the_agency_that_built_the_site():
+    """The whole path, because the byline is on every page of a real site.
+
+    This is the shape that was measured on live sites: a drywall contractor
+    with no address of its own, whose footer credit made the agency's studio
+    inbox `best_email` — the pitch opens by naming what is wrong with the site
+    and arrives at the people who built it.
+    """
+    credit = ('<footer><p>&copy; 2026 Coastline Drywall. Site by '
+              '<a href="https://northpixelmedia.com">North Pixel Media</a> '
+              '<a href="mailto:studio@northpixelmedia.com">studio</a></p>'
+              '</footer>')
+    home = ('<html><body><h1>Coastline Drywall</h1><a href="/contact/">Contact'
+            '</a>' + credit + '</body></html>')
+    for contact, expected in (
+            ('<html><body><h1>Contact</h1><p>Call 902-555-0148.</p>'
+             + credit + '</body></html>', ""),
+            ('<html><body><h1>Contact</h1>'
+             '<a href="mailto:office@coastlinedrywall.com">office</a>'
+             + credit + '</body></html>', "office@coastlinedrywall.com")):
+        pages = {"https://coastlinedrywall.com": home,
+                 "https://coastlinedrywall.com/contact/": contact}
+        with _StubFetch(pages):
+            site = E.harvest_site("coastlinedrywall.com", max_pages=4,
+                                  verify_dns=False)
+        assert site["best_email"] == expected, site["emails"]
+        assert [r["email"] for r in site["emails"]] == (
+            [expected] if expected else []), site["emails"]
+    print("a crawl never mails the agency: OK")
+
+
+def test_a_site_on_a_builder_platform_keeps_its_address():
+    """`stitchandsole.wixsite.com` registers as `wixsite.com`, which is not the
+    shop. Ownership cannot be read there at all, so the off-domain rule stands
+    down rather than throwing away the one address such a business has."""
+    page = '<p>Orders: hello@stitchandsole.ca</p>'
+    ranked = E._rank_emails({"https://stitchandsole.wixsite.com/home":
+                             E._scan_page(page)}, "wixsite.com")
+    assert [r["email"] for r in ranked] == ["hello@stitchandsole.ca"], ranked
+    # And the same address on an ordinary site that does not own it is refused.
+    assert E._rank_emails({"https://someoneelse.ca/": E._scan_page(page)},
+                          "someoneelse.ca") == []
+    print("a builder-platform site keeps its address: OK")
 
 
 # ── Junk ──
@@ -1169,6 +1510,12 @@ if __name__ == "__main__":
     test_contact_page_bonus()
     test_the_contact_bonus_cannot_lift_a_candidate_over_the_floor()
     test_dns_penalty_and_unknown()
+    test_no_page_hands_back_somebody_elses_address()
+    test_a_credit_line_is_not_a_page_stating_its_address()
+    test_only_a_domain_the_business_owns_counts_as_its_own()
+    test_the_credit_scan_cannot_invent_an_address()
+    test_a_crawl_never_mails_the_agency_that_built_the_site()
+    test_a_site_on_a_builder_platform_keeps_its_address()
     test_junk_rejected()
     test_percent_encoded_mailto_yields_one_address_not_two()
     test_a_mailto_local_part_is_never_rewritten()

@@ -12,6 +12,31 @@ Three rules shape the code below.
 Nothing slow runs on the GUI thread. Crawling a site, calling a model and
 opening an SMTP session are minutes of network time, so they happen in the
 workers in `core.campaign`; this file starts them and draws what they emit.
+The same rule reaches the drawing, because a redraw that walks the whole lead
+list once per lead is a network wait by another name. Two shapes of that were
+measured and both are closed here.
+
+  * every audited lead used to rebuild the screen's whole idea of the table.
+    `_on_lead_audited` called `_apply_filters`, which walked every row, and
+    `_refresh_lead_actions` inside it walked the table three more times purely
+    to write button labels — so a run of N audits cost O(N²). At 500 leads that
+    was 77.1ms a lead, 38.6 seconds of frozen window for one audit pass; at
+    5,000 it was 796.4ms a lead and over an hour. An audited lead now touches
+    its own row and nothing else: the row it lives on is looked up in a map
+    rather than searched for, the counts under the table are carried and
+    adjusted rather than recounted, and the labels ask for a number and three
+    names rather than for two whole lists.
+  * a lead's record used to ride on its own table cell through `Qt.UserRole`.
+    Qt has to marshal a dict in and out of a QVariant on every read, which
+    measured 50µs a call — so reading the leads a filter pass needs cost more
+    than everything else on the screen put together. Row `n` is `self._leads[n]`
+    by construction, and that is what `_lead_at` answers with.
+
+Nothing on screen is rebuilt for a screen nobody is looking at. Changing the
+theme or the density asks every built screen to `restyle()`, and this one used
+to spend 913ms rebuilding four tab pages and re-reading the store for a window
+the user had walked away from — inside the click that changed the setting. A
+hidden screen records that it is stale and rebuilds when it is next shown.
 
 Nothing is previewed that could not be sent. The preview goes through
 `core.templates.render` — the same call the send loop makes — and refuses to
@@ -361,25 +386,36 @@ def _norm_key(key: str) -> str:
     return re.sub(r"_+", "_", re.sub(r"[^a-z0-9]+", "_", _text_of(key).strip().lower())).strip("_")
 
 
-def _names_of(leads, limit: int = _NAMED_IN_SUMMARY) -> str:
+def _named(count: int, head, limit: int = _NAMED_IN_SUMMARY) -> str:
     """"Alpha Plumbing, Zeta Roofing and 41 more" — who a run is about to touch.
 
     Prepare campaign never said how many leads it was queueing or who they
     were, and it acts on the selection when there is one and on everything the
     filters show when there is not — so the two readings of "prepare" differed
     by hundreds of strangers and the button looked identical either way.
+
+    A count and the first few, rather than the list, because the sentence only
+    ever names three of them: the callers on the audit path have the count in
+    hand already and materialising five thousand records to print "and 4,997
+    more" is the whole of the second finding, one level down.
     """
     named = [_text_of(lead.get("name")).strip()
              or _text_of(lead.get("email")).strip() or "an unnamed lead"
-             for lead in leads[:limit]]
+             for lead in list(head)[:limit]]
     if not named:
         return "nobody"
-    rest = len(leads) - len(named)
+    rest = _int_of(count) - len(named)
     if rest > 0:
         named.append("%d more" % rest)
     if len(named) == 1:
         return named[0]
     return "%s and %s" % (", ".join(named[:-1]), named[-1])
+
+
+def _names_of(leads, limit: int = _NAMED_IN_SUMMARY) -> str:
+    """`_named` for a caller that is already holding the whole list."""
+    leads = list(leads)
+    return _named(len(leads), leads, limit)
 
 
 def _clear_layout(layout) -> None:
@@ -890,6 +926,30 @@ class OutreachScreen(QWidget):
         # comes out of `core.templates` and the table is the only place that
         # walks every lead.
         self._generic: dict[int, str] = {}
+        # The three derived facts about a lead that cost real time to work out,
+        # kept against its id so no pass has to work them out twice. `_gaps` is
+        # the Headline gap cell and whether it is a form letter — one JSON
+        # decode and one `core.templates` call; `_blobs` is everything the
+        # filter box searches, lowercased once instead of once per keystroke
+        # per row. Both are dropped for a lead the moment an audit rewrites it,
+        # and wholesale when the list is re-read.
+        self._gaps: dict[int, tuple] = {}
+        self._blobs: dict[int, str] = {}
+        # lead id -> the row it is painted on. Row `n` holds `self._leads[n]`,
+        # so this is also the index of the record, and it is what lets an
+        # audited lead find itself without a search.
+        self._row_of: dict[int, int] = {}
+        # What the line above the table says, carried rather than recounted.
+        # `_buckets` is leads per status, `_generic_count` how many would send a
+        # form letter, `_visible` how many rows the filters leave showing.
+        self._buckets: dict[str, int] = {}
+        self._generic_count = 0
+        self._visible = 0
+        # (column, value) -> the words the badge in that cell reads.
+        self._badge_text: dict[tuple, str] = {}
+        # Set when a theme change reaches this screen while it is off screen,
+        # and spent by `showEvent`.
+        self._stale = False
         self._search = ""
         self._sort = (_COL_SCORE, Qt.DescendingOrder)
         self._campaign_id = 0
@@ -967,6 +1027,12 @@ class OutreachScreen(QWidget):
         copy.
         """
         super().showEvent(event)
+        if self._stale:
+            # A theme change that landed while this screen was behind another
+            # one. It is paid for here, where the user is about to look at the
+            # result, rather than inside the click that changed the setting.
+            self._stale = False
+            self._restyle_now()
         if self._handed_over:
             return
         host, key = self._host()
@@ -1135,6 +1201,9 @@ class OutreachScreen(QWidget):
         this screen already holds.
         """
         table = components.table(_LEAD_COLUMNS, density=t.density, sortable=False)
+        # New table, new delegates, so the labels cached off the old ones are
+        # answers about widgets that no longer exist.
+        self._badge_text = {}
         table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         table.setItemDelegateForColumn(
             _COL_SCORE, _BadgeDelegate(components.score_badge, table))
@@ -1537,23 +1606,65 @@ class OutreachScreen(QWidget):
         settings file. A campaign half set up in memory — an account being
         tried, a switch thrown from a dialog and not yet saved — would be
         rolled back by a repaint, which is the last thing a repaint may do.
+
+        Deferred while this screen is off screen, and that is the second
+        finding. Picking a theme or a density asks every built screen to do
+        this, so the click paid for four rebuilds and got one back: 913ms of it
+        was this screen, rebuilding four tab pages and re-reading the store for
+        a window nobody was looking at. `showEvent` spends the debt at the one
+        moment it buys the user anything.
+        """
+        if not self.isVisible():
+            self._stale = True
+            return
+        self._stale = False
+        self._restyle_now()
+
+    def _restyle_now(self) -> None:
+        """The rebuild itself, once there is somebody to show it to.
+
+        Painting is held off across the whole of it. Every `addWidget` into a
+        visible tree schedules a repaint of what it lands on, and a rebuild is
+        two hundred of them. That, the leads coming from memory rather than
+        from the store, and the tab not being refreshed twice took a rebuild on
+        a 500-lead store from 1,543ms to 541ms.
+
+        The tab is restored by moving the stack rather than through `_goto_tab`,
+        because `_redraw` has just refreshed all four pages and
+        `_on_tab_changed` would run the whole of one of them a second time.
         """
         tab = self.pages.currentIndex()
         search, status = self._search, self.status_filter.currentIndex()
         view = self.view_group.checkedId()
 
-        holder = QWidget()
-        holder.setLayout(self.layout())
-        holder.deleteLater()
+        self.setUpdatesEnabled(False)
+        try:
+            holder = QWidget()
+            holder.setLayout(self.layout())
+            # setLayout moves the LAYOUT to the holder but leaves the widgets it
+            # manages parented to this screen, so deleting the holder reclaimed an
+            # empty box and the old tree survived every rebuild. Each appearance
+            # change abandoned ~868 widgets, and setStyleSheet repolishes every
+            # widget alive, so each change cost more than the last without bound.
+            for _stale in self.children():
+                if isinstance(_stale, QWidget):
+                    _stale.setParent(holder)
+            holder.deleteLater()
 
-        self._build()
-        self.status_filter.setCurrentIndex(max(0, status))
-        for button in self.view_group.buttons():
-            button.setChecked(self.view_group.id(button) == max(0, view))
-        self._redraw()
-        if search:
-            self.lead_search.setText(search)
-        self._goto_tab(tab)
+            self._build()
+            self.status_filter.setCurrentIndex(max(0, status))
+            for button in self.view_group.buttons():
+                button.setChecked(self.view_group.id(button) == max(0, view))
+            # `reload=False`: the records are already in hand and a palette has
+            # nothing to say about them, so the new widgets are filled from the
+            # list this screen is holding rather than from a fresh query.
+            self._redraw(reload=False)
+            if search:
+                self.lead_search.setText(search)
+            self.pages.setCurrentIndex(max(0, min(len(self.TABS) - 1, tab)))
+        finally:
+            self.setUpdatesEnabled(True)
+        self._tell_shell(self.pages.currentIndex())
 
     # ── Public API ───────────────────────────────────────────────────────────
 
@@ -1574,12 +1685,22 @@ class OutreachScreen(QWidget):
         except Exception:
             pass
 
-    def _redraw(self) -> None:
-        """Everything `refresh` does except going back to the settings file."""
+    def _redraw(self, *, reload: bool = True) -> None:
+        """Everything `refresh` does except going back to the settings file.
+
+        `reload=False` keeps the leads this screen is already holding. It is
+        for a rebuild that changed nothing about the data — a palette, a
+        density — where a fresh `list_leads` and a discarded per-lead cache buy
+        the same rows at the cost of the query and the audit-derived work
+        behind every Headline gap cell.
+        """
         self._refresh_mode()
         self._refresh_templates()
         self._refresh_campaigns()
-        self._reload_leads()
+        if reload:
+            self._reload_leads()
+        else:
+            self._repaint_leads()
         self._refresh_profile()
         self._refresh_accounts()
         self._refresh_stats()
@@ -1704,6 +1825,18 @@ class OutreachScreen(QWidget):
     def _reload_leads(self) -> None:
         self._leads = _db.list_leads(self.conn)
         self._generic.clear()
+        self._gaps.clear()
+        self._blobs.clear()
+        self._repaint_leads()
+
+    def _repaint_leads(self) -> None:
+        """Draw the table from the leads in hand, without going to the store.
+
+        Split out of `_reload_leads` for the one caller that has not changed
+        the data: a theme rebuild needs new widgets holding the same records,
+        and re-reading them would also throw away every Headline gap this
+        screen has already worked out.
+        """
         self._fill_table()
         self.lead_stack.setCurrentIndex(0 if self._leads else 1)
         self._refresh_preview_choices()
@@ -1715,20 +1848,50 @@ class OutreachScreen(QWidget):
         and Status columns are painted from data on the item rather than from
         its text and Qt's own sort reorders the items under a painted row. A
         rebuild is one pass over a list this screen is already holding.
+
+        One pass, and it leaves behind everything the rest of the screen would
+        otherwise walk the table for: which row each lead is on, how many leads
+        each status holds, and how many would send a form letter. Those three
+        are the difference between a button label costing a table walk and
+        costing a dictionary lookup.
+
+        What is left of the cost is not here: at 5,000 leads this takes 706ms
+        and almost all of it is `components._Table.add_row` building 35,000
+        items one row at a time. Pre-sizing the table and filling it, rather
+        than inserting a row per lead, belongs there beside the spec it reads;
+        see the handover note.
         """
         table = self.lead_table
         column, order = self._sort
         self._leads.sort(key=lambda lead: self._sort_key(lead, column),
                          reverse=order == Qt.DescendingOrder)
-        table.setRowCount(0)
-        for lead in self._leads:
-            self._append_lead_row(lead)
-        table.horizontalHeader().setSortIndicator(column, order)
-        # Retaking the widths is also what clears a horizontal scrollbar left
-        # behind by a hand-dragged column: the width the user set survives
-        # until the next reload, and a reload is when the table gets its
-        # geometry back from the spec.
-        table.relayout()
+        # Held off for the same reason `_restyle_now` holds it off: five
+        # thousand rows is five thousand repaint requests against a visible
+        # viewport that is going to be repainted once at the end anyway.
+        table.setUpdatesEnabled(False)
+        try:
+            table.setRowCount(0)
+            rows: dict[int, int] = {}
+            buckets: dict[str, int] = {}
+            generic = 0
+            for index, lead in enumerate(self._leads):
+                status = self._append_lead_row(lead)
+                buckets[status] = buckets.get(status, 0) + 1
+                lead_id = _int_of(lead.get("id"))
+                rows[lead_id] = index
+                if self._generic.get(lead_id):
+                    generic += 1
+            self._row_of = rows
+            self._buckets = buckets
+            self._generic_count = generic
+            table.horizontalHeader().setSortIndicator(column, order)
+            # Retaking the widths is also what clears a horizontal scrollbar
+            # left behind by a hand-dragged column: the width the user set
+            # survives until the next reload, and a reload is when the table
+            # gets its geometry back from the spec.
+            table.relayout()
+        finally:
+            table.setUpdatesEnabled(True)
         self._apply_filters()
 
     def _sort_key(self, lead: dict, column: int):
@@ -1748,27 +1911,58 @@ class OutreachScreen(QWidget):
         self._sort = (column, order)
         self._fill_table()
 
-    def _gap_text(self, lead: dict) -> tuple:
-        """(what the Headline gap column says, and whether it is a form letter)."""
-        audit = _loads(lead.get("audit_json"))
-        gaps = [g for g in (audit.get("gaps") or []) if isinstance(g, dict)]
-        reason = self._generic_reason(lead, audit)
-        gap = _text_of(gaps[0].get("title")).strip() if gaps else ""
-        if not gap and reason:
-            # This lead's email is three paragraphs that could have been written
-            # before the crawl. That is what the column has to say, because "no
-            # clear gap" reads as a thin prospect rather than as a form letter.
-            gap = "form letter — " + _templates.generic_reason(reason)
-        return (gap or ("not audited yet" if not audit else "no clear gap"),
-                bool(reason))
+    def _gap_text(self, lead: dict, audit=None) -> tuple:
+        """(what the Headline gap column says, and whether it is a form letter).
 
-    def _append_lead_row(self, lead: dict) -> None:
+        Cached against the lead's id, because working it out is a JSON decode
+        and a `core.templates.personalisation` call and four separate passes
+        wanted the same answer for the same lead: the sort key, the row, the
+        filter box and the tooltip. `audit` is the already-decoded blob when a
+        caller has one, so the row build does not decode it twice.
+        """
+        lead_id = _int_of(lead.get("id"))
+        answer = self._gaps.get(lead_id)
+        if answer is None:
+            audit = _loads(lead.get("audit_json")) if audit is None else audit
+            gaps = [g for g in (audit.get("gaps") or []) if isinstance(g, dict)]
+            reason = self._generic_reason(lead, audit)
+            gap = _text_of(gaps[0].get("title")).strip() if gaps else ""
+            if not gap and reason:
+                # This lead's email is three paragraphs that could have been
+                # written before the crawl. That is what the column has to say,
+                # because "no clear gap" reads as a thin prospect rather than
+                # as a form letter.
+                gap = "form letter — " + _templates.generic_reason(reason)
+            answer = (gap or ("not audited yet" if not audit else "no clear gap"),
+                      bool(reason))
+            self._gaps[lead_id] = answer
+        return answer
+
+    def _forget_lead(self, lead_id: int) -> None:
+        """Drop everything derived from one lead's record, after it changed."""
+        lead_id = _int_of(lead_id)
+        self._generic.pop(lead_id, None)
+        self._gaps.pop(lead_id, None)
+        self._blobs.pop(lead_id, None)
+
+    def _append_lead_row(self, lead: dict) -> str:
+        """Paint one lead onto the end of the table. Returns its status.
+
+        The status comes back rather than being read again by the caller
+        because `_fill_table` is counting them and this is the one place that
+        has already worked it out.
+
+        The record is deliberately not attached to the row through
+        `Qt.UserRole`. Qt marshals a dict through a QVariant on every read, at
+        50µs a call measured, and row `n` is `self._leads[n]` by construction —
+        so `_lead_at` can answer from the list instead.
+        """
         table = self.lead_table
         score = _int_of(lead.get("opportunity_score"))
         status = _text_of(lead.get("status")).strip() or "new"
         audit = _loads(lead.get("audit_json"))
         gaps = [g for g in (audit.get("gaps") or []) if isinstance(g, dict)]
-        gap, generic = self._gap_text(lead)
+        gap, generic = self._gap_text(lead, audit)
 
         row = table.add_row((
             Cell(text=_text_of(lead.get("name")).strip() or "—",
@@ -1786,7 +1980,7 @@ class OutreachScreen(QWidget):
                      "nothing about it. Filter to Generic email to review or "
                      "exclude these before sending." if generic else ""),
             Cell(text="", sort=status, tip=self._status_tip(status)),
-        ), data=lead)
+        ))
 
         # The two badge columns carry their value rather than their words: the
         # delegate paints `components.status_pill()` and `score_badge()` from
@@ -1794,17 +1988,31 @@ class OutreachScreen(QWidget):
         # and the filter box are told what the pill says.
         self._set_badge(row, _COL_SCORE, score)
         self._set_badge(row, _COL_STATUS, status)
+        return status
 
     def _set_badge(self, row: int, column: int, key) -> None:
         item = self.lead_table.item(row, column)
         if item is None:
             return
         item.setData(_BADGE_ROLE, key)
-        delegate = self.lead_table.itemDelegateForColumn(column)
-        label = delegate.badge(key).text() if isinstance(delegate, _BadgeDelegate) \
-            else _text_of(key)
+        label = self._badge_label(column, key)
         item.setText(label)
         item.setData(components.FULL_ROLE, label)
+
+    def _badge_label(self, column: int, key) -> str:
+        """What the pill in `column` reads for `key`, asked once per value.
+
+        The delegate already keeps one widget per distinct value; this keeps
+        the string it renders, so ten thousand cells do not each cross into Qt
+        to read back a label that is one of fifteen.
+        """
+        cached = self._badge_text.get((column, key))
+        if cached is None:
+            delegate = self.lead_table.itemDelegateForColumn(column)
+            cached = delegate.badge(key).text() \
+                if isinstance(delegate, _BadgeDelegate) else _text_of(key)
+            self._badge_text[(column, key)] = cached
+        return cached
 
     @staticmethod
     def _status_tip(status: str) -> str:
@@ -1845,24 +2053,52 @@ class OutreachScreen(QWidget):
         self._search = _text_of(text).strip().lower()
         self._apply_filters()
 
+    def _wanted_status(self) -> str:
+        return _STATUS_FILTERS[max(0, self.status_filter.currentIndex())][1]
+
+    def _hidden_by(self, lead: dict, wanted: str) -> bool:
+        """Would the filters as they stand hide this lead? One row's worth."""
+        if wanted.startswith("~"):
+            generic = bool(self._generic.get(_int_of(lead.get("id"))))
+            hide = generic != (wanted == "~generic")
+        else:
+            status = _text_of(lead.get("status")).strip() or "new"
+            hide = bool(wanted) and status != wanted
+        return bool(hide or (self._search and not self._matches(lead)))
+
     def _apply_filters(self) -> None:
-        wanted = _STATUS_FILTERS[max(0, self.status_filter.currentIndex())][1]
+        """Re-decide every row's visibility. The whole-table pass.
+
+        For a change that reaches one row — an audit landing — `_refilter_row`
+        does the same work for that row and adjusts the count, which is what
+        turns an audit run from O(N²) back into O(N).
+        """
+        wanted = self._wanted_status()
         table = self.lead_table
         visible = 0
-        for row in range(table.rowCount()):
-            lead = self._lead_at(row)
-            status = _text_of(lead.get("status")).strip() or "new"
-            if wanted.startswith("~"):
-                generic = bool(self._generic.get(_int_of(lead.get("id"))))
-                hide = generic != (wanted == "~generic")
-            else:
-                hide = bool(wanted) and status != wanted
-            hide = hide or (self._search and not self._matches(lead))
-            table.setRowHidden(row, bool(hide))
-            visible += 0 if hide else 1
+        table.setUpdatesEnabled(False)
+        try:
+            for row in range(table.rowCount()):
+                hide = self._hidden_by(self._lead_at(row), wanted)
+                table.setRowHidden(row, hide)
+                visible += 0 if hide else 1
+        finally:
+            table.setUpdatesEnabled(True)
 
-        self._refresh_lead_counts(visible)
+        self._visible = visible
+        self._refresh_lead_counts()
         self._refresh_lead_actions()
+
+    def _refilter_row(self, row: int, lead: dict) -> None:
+        """Re-decide one row, and keep the shown count in step with it."""
+        table = self.lead_table
+        if not 0 <= row < table.rowCount():
+            return
+        hide = self._hidden_by(lead, self._wanted_status())
+        if hide == table.isRowHidden(row):
+            return
+        table.setRowHidden(row, hide)
+        self._visible += -1 if hide else 1
 
     def _matches(self, lead: dict) -> bool:
         """Does the filter box's text appear anywhere in this lead?
@@ -1872,59 +2108,116 @@ class OutreachScreen(QWidget):
         badge columns searchable now that what they paint is a pill rather than
         a word.
         """
-        needle = self._search
-        haystack = [_text_of(lead.get(field))
-                    for field in ("name", "email", "city", "category", "phone",
-                                  "website", "status", "source")]
-        haystack.append(self._gap_text(lead)[0])
-        haystack.append(components.score_band(
-            _int_of(lead.get("opportunity_score")))[1])
-        return any(needle in value.lower() for value in haystack if value)
+        return self._search in self._haystack(lead)
 
-    def _refresh_lead_counts(self, visible: int) -> None:
+    def _haystack(self, lead: dict) -> str:
+        """Everything about one lead the filter box reads, lowercased once.
+
+        Kept against the lead's id because the alternative is rebuilding ten
+        strings and lowercasing them for every row on every keystroke.
+        Newline-joined rather than space-joined so a needle still has to sit
+        inside one field: "toronto roofing" must not match a Toronto lead in
+        the roofing category that says neither.
+        """
+        lead_id = _int_of(lead.get("id"))
+        blob = self._blobs.get(lead_id)
+        if blob is None:
+            parts = [_text_of(lead.get(field))
+                     for field in ("name", "email", "city", "category", "phone",
+                                   "website", "status", "source")]
+            parts.append(self._gap_text(lead)[0])
+            parts.append(components.score_band(
+                _int_of(lead.get("opportunity_score")))[1])
+            blob = "\n".join(part for part in parts if part).lower()
+            self._blobs[lead_id] = blob
+        return blob
+
+    def _refresh_lead_counts(self) -> None:
+        """The line above the table, from counts that were kept as they moved.
+
+        It used to walk every lead for the status buckets and every cached
+        reason for the generic tally, on every filter pass — and every audited
+        lead caused one. `_fill_table` counts them once and `_on_lead_audited`
+        moves one lead between two buckets.
+        """
         total = len(self._leads)
-        buckets: dict[str, int] = {}
-        for lead in self._leads:
-            key = _text_of(lead.get("status")).strip() or "new"
-            buckets[key] = buckets.get(key, 0) + 1
-        audited = total - buckets.get("new", 0)
+        audited = total - self._buckets.get("new", 0)
 
         parts = [_plural(total, "lead")]
-        if visible != total:
-            parts = ["%d of %d shown" % (visible, total)]
+        if self._visible != total:
+            parts = ["%d of %d shown" % (self._visible, total)]
         parts.append("%d audited" % audited)
-        generic = sum(1 for reason in self._generic.values() if reason)
-        if generic:
-            parts.append("%d generic" % generic)
+        if self._generic_count:
+            parts.append("%d generic" % self._generic_count)
         for key, label in (("queued", "queued"), ("sent", "sent"),
                            ("replied", "replied"), ("suppressed", "suppressed")):
-            if buckets.get(key):
-                parts.append("%d %s" % (buckets[key], label))
+            if self._buckets.get(key):
+                parts.append("%d %s" % (self._buckets[key], label))
         self.lead_counts.setText(" · ".join(parts))
 
     def _lead_at(self, row: int) -> dict:
-        item = self.lead_table.item(row, _COL_NAME)
-        data = item.data(Qt.UserRole) if item is not None else None
-        return data if isinstance(data, dict) else {}
+        """The record painted on `row`.
+
+        From the list rather than from the cell. `_fill_table` appends
+        `self._leads` in order, so row `n` is `self._leads[n]` — and asking Qt
+        instead meant a dict marshalled out of a QVariant at 50µs a row, which
+        was more than half the cost of every pass over this table.
+        """
+        return self._leads[row] if 0 <= row < len(self._leads) else {}
+
+    def _selected_rows(self) -> list:
+        """The rows the user has picked that the filters are still showing."""
+        table = self.lead_table
+        return sorted(row for row in {index.row()
+                                      for index in table.selectedIndexes()}
+                      if not table.isRowHidden(row))
 
     def _selected_leads(self) -> list[dict]:
-        rows = {index.row() for index in self.lead_table.selectedIndexes()}
-        return [self._lead_at(row) for row in sorted(rows)
-                if not self.lead_table.isRowHidden(row)]
+        return [self._lead_at(row) for row in self._selected_rows()]
 
     def _target_leads(self) -> list[dict]:
-        """Selection if there is one, otherwise everything the filters show."""
-        chosen = self._selected_leads()
-        if chosen:
-            return chosen
-        return [self._lead_at(row) for row in range(self.lead_table.rowCount())
-                if not self.lead_table.isRowHidden(row)]
+        """Selection if there is one, otherwise everything the filters show.
 
-    def _target_sentence(self, verb: str) -> str:
-        leads = self._target_leads()
-        scope = "selected" if self._selected_leads() else "shown by the filter"
-        return "%s %s (%s) — %s." % (verb, _plural(len(leads), "lead"), scope,
-                                     _names_of(leads))
+        The whole list, for the three callers that are about to act on it.
+        Anything that only needs to *describe* the target asks `_target_head`,
+        which is the same answer without materialising five thousand records.
+        """
+        rows = self._selected_rows()
+        if rows:
+            return [self._lead_at(row) for row in rows]
+        table = self.lead_table
+        return [self._lead_at(row) for row in range(table.rowCount())
+                if not table.isRowHidden(row)]
+
+    def _target_head(self, limit: int = _NAMED_IN_SUMMARY) -> tuple:
+        """(how many an action would touch, the first few of them, from a pick?)
+
+        What every button label on this screen actually needs. The labels used
+        to get it by building two whole lists — `_target_leads` walked the
+        table, and `_target_sentence` walked it twice more — three passes over
+        five thousand rows to write "Audit all (5000)". The count is carried by
+        `_apply_filters`; the names stop at three.
+        """
+        rows = self._selected_rows()
+        if rows:
+            return len(rows), [self._lead_at(row) for row in rows[:limit]], True
+
+        head: list = []
+        if self._visible > 0:
+            table = self.lead_table
+            for row in range(table.rowCount()):
+                if table.isRowHidden(row):
+                    continue
+                head.append(self._lead_at(row))
+                if len(head) >= limit or len(head) >= self._visible:
+                    break
+        return self._visible, head, False
+
+    def _target_sentence(self, verb: str, target=None) -> str:
+        count, head, chosen = self._target_head() if target is None else target
+        scope = "selected" if chosen else "shown by the filter"
+        return "%s %s (%s) — %s." % (verb, _plural(count, "lead"), scope,
+                                     _named(count, head))
 
     def _on_lead_selection_changed(self) -> None:
         self._refresh_lead_actions()
@@ -1937,15 +2230,20 @@ class OutreachScreen(QWidget):
 
         A disabled one says what would enable it: the audit found controls that
         simply stopped responding, with nothing on screen saying why.
+
+        One look at the target for the whole row. This used to take three —
+        `_selected_leads`, `_target_leads`, then `_target_sentence` re-running
+        both, twice over — which at 5,000 leads was 1,048ms to write four
+        strings, and an audit run asked for them once per lead.
         """
         if not hasattr(self, "audit_btn"):
             return
-        chosen = self._selected_leads()
-        targets = self._target_leads()
-        count = len(chosen)
+        target = self._target_head()
+        targets, head, from_selection = target
+        count = targets if from_selection else 0
 
         self.audit_btn.setText("Audit selected (%d)" % count if count
-                               else "Audit all (%d)" % len(targets))
+                               else "Audit all (%d)" % targets)
         self.audit_btn.setEnabled(bool(targets) and not self._auditing)
         if self._auditing:
             self.audit_btn.setToolTip("A crawl is already running")
@@ -1958,14 +2256,14 @@ class OutreachScreen(QWidget):
             self.audit_btn.setToolTip(
                 "%s Crawl each website, score the automation gaps and write "
                 "the personalised lines (%s). Nothing is sent."
-                % (self._target_sentence("Audits"), self._ai_summary()))
+                % (self._target_sentence("Audits", target), self._ai_summary()))
 
         self.suppress_btn.setText("Suppress…" if count <= 1
                                   else "Suppress %d…" % count)
-        self.suppress_btn.setEnabled(bool(chosen))
+        self.suppress_btn.setEnabled(bool(count))
         self.suppress_btn.setToolTip(
             "Never contact %s again. You will be asked first."
-            % _names_of(chosen) if chosen else
+            % _named(count, head) if count else
             "Select the rows to exclude — this acts on the whole selection")
 
         self.copy_btn.setText("Copy emails" if count <= 1
@@ -1973,12 +2271,12 @@ class OutreachScreen(QWidget):
         self.copy_btn.setEnabled(bool(targets))
         self.copy_btn.setToolTip(
             "Copy every address %s to the clipboard, one per line"
-            % ("selected" if chosen else "shown") if targets else
+            % ("selected" if count else "shown") if targets else
             "There are no addresses on screen to copy")
 
         if hasattr(self, "plan_targets"):
-            self.plan_targets.setText(self._target_sentence("Queues"))
-            self.prepare_btn.setText("Prepare campaign (%d)" % len(targets)
+            self.plan_targets.setText(self._target_sentence("Queues", target))
+            self.prepare_btn.setText("Prepare campaign (%d)" % targets
                                      if targets else "Prepare campaign")
 
     def _on_lead_double_clicked(self, row: int, _column: int) -> None:
@@ -2158,23 +2456,29 @@ class OutreachScreen(QWidget):
         In place, and not re-sorted: a table that reorders itself under the
         pointer while five hundred crawls come back is a table nobody can read
         a row of. The order is retaken when the run ends.
+
+        One row's worth of work, and that is the first finding closed. This
+        used to search the record list and then the table for the lead, and
+        then hand the whole screen to `_apply_filters`, which re-walked every
+        row and had `_refresh_lead_actions` walk it three more times — so an
+        audit of N leads cost N² row visits. Measured at 77.1ms a lead over 500
+        leads (38.6 seconds of frozen window for one run) and 796.4ms a lead
+        over 5,000 (66 minutes). The row is found in a map, the two counts it
+        moves are adjusted rather than recomputed, and only its own visibility
+        is re-decided.
         """
         if not isinstance(lead, dict):
             return
         lead_id = _int_of(lead.get("id"))
-        row = -1
-        for index, existing in enumerate(self._leads):
-            if _int_of(existing.get("id")) == lead_id:
-                self._leads[index] = lead
-                break
-        for index in range(self.lead_table.rowCount()):
-            if _int_of(self._lead_at(index).get("id")) == lead_id:
-                row = index
-                break
-        if row < 0:
+        row = self._row_of.get(lead_id, -1)
+        if not 0 <= row < len(self._leads):
             return
 
-        self._generic.pop(lead_id, None)
+        was_status = _text_of(self._leads[row].get("status")).strip() or "new"
+        was_generic = bool(self._generic.get(lead_id))
+        self._leads[row] = lead
+        self._forget_lead(lead_id)
+
         score = _int_of(lead.get("opportunity_score"))
         status = _text_of(lead.get("status")).strip() or "new"
         gap, generic = self._gap_text(lead)
@@ -2194,12 +2498,15 @@ class OutreachScreen(QWidget):
                 "Nothing is known about this business, so the email says "
                 "nothing about it. Filter to Generic email to review or "
                 "exclude these before sending.")
-        name_item = table.item(row, _COL_NAME)
-        if name_item is not None:
-            name_item.setData(Qt.UserRole, lead)
         self._set_badge(row, _COL_SCORE, score)
         self._set_badge(row, _COL_STATUS, status)
-        self._apply_filters()
+
+        self._buckets[was_status] = max(0, self._buckets.get(was_status, 0) - 1)
+        self._buckets[status] = self._buckets.get(status, 0) + 1
+        self._generic_count += int(bool(generic)) - int(was_generic)
+        self._refilter_row(row, lead)
+        self._refresh_lead_counts()
+        self._refresh_lead_actions()
 
     def _retire(self, worker) -> bool:
         """True once `worker` is safe to drop — finished, or never started."""
@@ -2873,7 +3180,7 @@ class OutreachScreen(QWidget):
             return bool(getattr(self.send_worker, "dry_run", False))
         return bool(self.settings.get("dry_run", True))
 
-    def _send_health(self) -> tuple:
+    def _send_health(self, stats=None) -> tuple:
         """(what the queue is doing, why it is not moving) — never "ready".
 
         The finding this closes is the worst kind: a campaign that had stalled
@@ -2881,8 +3188,12 @@ class OutreachScreen(QWidget):
         frozen, so the screen's most reassuring sentence was printed at exactly
         the moment nothing was going to happen. Every branch below either
         describes movement or names what is stopping it.
+
+        `stats` is the tally the caller already has. `_refresh_send_controls`
+        reads it and then asked for it again through here, so every second of
+        every run counted the same campaign twice.
         """
-        stats = self._stats()
+        stats = self._stats() if stats is None else stats
         queued, total = _int_of(stats.get("queued")), _int_of(stats.get("total"))
         # What the run has got through, counted the way this run counts. A
         # rehearsal writes 'rehearsed' and never 'sent', so reading `sent`
@@ -2994,7 +3305,7 @@ class OutreachScreen(QWidget):
         self.send_progress.setRange(0, max(1, total))
         self.send_progress.setValue(total - queued if total else 0)
 
-        headline, why = self._send_health()
+        headline, why = self._send_health(stats)
         self.send_status.setText(headline)
         self.send_reason.setText(why)
         self.send_reason.setVisible(bool(why))

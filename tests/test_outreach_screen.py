@@ -710,6 +710,292 @@ def test_every_hint_on_the_screen_uses_that_colour():
     assert checked >= 4, "expected hints on more than one tab"
 
 
+# ── P1: the lead table must not cost O(N²) to fill in ────────────────────────
+# Every assertion here counts row visits rather than milliseconds. The finding
+# was a complexity, not a constant — 77.1ms a lead at 500 leads and 796.4ms a
+# lead at 5,000 — and a clock cannot tell those apart on a machine that happens
+# to be fast. A count that does not move when the table quadruples can.
+
+
+@contextlib.contextmanager
+def _extra_leads(count: int):
+    """`count` throwaway leads in the store, with the screen showing them."""
+    screen = _screen()
+    conn = DB.connect(os.path.join(_TMP, "outreach.db"))
+    for index in range(count):
+        DB.upsert_lead(conn, {"email": "bulk%04d@example.com" % index,
+                              "name": "Bulk Business %04d" % index,
+                              "city": "Toronto", "category": "Roofing contractor",
+                              "opportunity_score": index % 101,
+                              "status": "new", "source": "bulk"})
+    screen._reload_leads()
+    try:
+        yield screen
+    finally:
+        conn.execute("DELETE FROM leads WHERE source = 'bulk'")
+        conn.commit()
+        screen.status_filter.setCurrentIndex(0)
+        screen._reload_leads()
+        _app().processEvents()
+
+
+def _audit_cost(screen, row: int) -> tuple:
+    """(rows read, rows re-hidden) for one audited lead landing on `row`.
+
+    The two surfaces the old code walked. `_lead_at` is every record the screen
+    reads to answer a question about the table; `setRowHidden` is every row the
+    filter pass re-decides. Both used to be O(N) per audited lead, and
+    `_refresh_lead_actions` inside the pass made it three times O(N).
+    """
+    table = screen.lead_table
+    seen = {"read": 0, "hidden": 0}
+    real_read = type(screen)._lead_at
+    real_hide = type(table).setRowHidden
+
+    def counted_read(index):
+        seen["read"] += 1
+        return real_read(screen, index)
+
+    def counted_hide(index, hide):
+        seen["hidden"] += 1
+        return real_hide(table, index, hide)
+
+    screen._lead_at = counted_read
+    table.setRowHidden = counted_hide
+    try:
+        lead = screen._leads[row]
+        screen._on_lead_audited(dict(lead, status="audited",
+                                     opportunity_score=64,
+                                     audit_json='{"gaps": [{"title": "No booking"}]}'))
+    finally:
+        del screen._lead_at
+        del table.setRowHidden
+    return seen["read"], seen["hidden"]
+
+
+def test_an_audited_lead_costs_the_same_whatever_the_table_holds():
+    """The whole of the first finding, as a number that must not move.
+
+    `_on_lead_audited` used to call `_apply_filters`, which walked every row,
+    and `_refresh_lead_actions` inside it walked the table three more times to
+    write four button labels. So one audit pass over N leads cost N² row
+    visits: 38.6 seconds of frozen window at 500 leads, 66 minutes at 5,000.
+
+    An audited lead now rewrites its own row, adjusts the counts it moved, and
+    re-decides the visibility of that row alone — so quadrupling the table
+    leaves the cost of one audit exactly where it was.
+    """
+    small = large = None
+    with _extra_leads(40) as screen:
+        small = _audit_cost(screen, 0)
+    with _extra_leads(160) as screen:
+        large = _audit_cost(screen, 0)
+
+    assert small == large, (
+        "one audited lead cost %s row visits in a 43-row table and %s in a "
+        "163-row one — the work is still proportional to the table"
+        % (small, large))
+    reads, hidden = large
+    assert hidden <= 1, (
+        "an audited lead re-decided %d rows' visibility; only its own may move"
+        % hidden)
+    assert reads <= 8, (
+        "an audited lead read %d records; the labels need a count and three "
+        "names" % reads)
+
+
+def test_a_row_is_read_from_the_list_it_was_built_from():
+    """Not through `Qt.UserRole`, which marshals a dict at 50µs a read.
+
+    The record used to ride on the row's own first cell, so every pass over
+    the table paid Qt to convert a dict out of a QVariant once per row — more
+    than half the cost of filtering, and it was paid again for every audited
+    lead. Row `n` is `self._leads[n]` by construction, so the list is the
+    answer and the cell carries nothing.
+    """
+    screen = _screen()
+    screen._reload_leads()
+    assert screen.lead_table.rowCount() == len(screen._leads)
+    for row in range(screen.lead_table.rowCount()):
+        assert screen._lead_at(row) is screen._leads[row], \
+            "row %d does not answer with the record it was built from" % row
+        assert screen.lead_table.item(row, SO._COL_NAME).data(Qt.UserRole) is None, \
+            "the row is still carrying its record through a QVariant"
+    assert screen._lead_at(-1) == {} and screen._lead_at(9999) == {}, \
+        "a row off either end has to read as nothing, not raise"
+
+
+def test_an_audit_run_leaves_the_counts_a_full_recount_would():
+    """The bookkeeping the brute-force rebuild used to do for free.
+
+    Carrying the counts instead of recounting them is only worth anything if
+    they come out the same, so this drives a run of audits through a *filtered*
+    table — where each one changes whether its row is shown — and then checks
+    every carried number against one worked out from scratch.
+    """
+    with _extra_leads(60) as screen:
+        screen.status_filter.setCurrentIndex(
+            [key for _label, key in SO._STATUS_FILTERS].index("audited"))
+        _app().processEvents()
+        before = screen._visible
+
+        audited = 0
+        for row in range(0, 60, 4):
+            lead = screen._leads[row]
+            if SO._text_of(lead.get("status")).strip() == "audited":
+                continue
+            screen._on_lead_audited(
+                dict(lead, status="audited", opportunity_score=91,
+                     audit_json='{"gaps": [{"title": "No online booking"}]}'))
+            audited += 1
+        assert audited, "the run audited nothing, so it proved nothing"
+
+        table = screen.lead_table
+        shown = sum(1 for row in range(table.rowCount())
+                    if not table.isRowHidden(row))
+        assert screen._visible == shown == before + audited, (
+            "the shown count drifted: carried %d, actually %d, expected %d"
+            % (screen._visible, shown, before + audited))
+
+        fresh: dict = {}
+        for lead in screen._leads:
+            key = SO._text_of(lead.get("status")).strip() or "new"
+            fresh[key] = fresh.get(key, 0) + 1
+        assert {k: v for k, v in screen._buckets.items() if v} == fresh, (
+            "the status buckets drifted: carried %s, actually %s"
+            % (screen._buckets, fresh))
+        assert screen._generic_count == \
+            sum(1 for reason in screen._generic.values() if reason)
+
+        line = screen.lead_counts.text()
+        screen._apply_filters()
+        assert screen.lead_counts.text() == line, (
+            "the incremental line %r is not what the full pass writes (%r)"
+            % (line, screen.lead_counts.text()))
+        assert screen.audit_btn.text() == "Audit all (%d)" % shown
+
+
+def test_the_send_controls_ask_the_store_for_the_tally_once():
+    """It read `campaign_stats` and then had `_send_health` read it again.
+
+    Once per second while a campaign runs, and once more on every stats signal,
+    for a query that answers the same question both times.
+    """
+    screen = _screen()
+    calls = []
+    real = DB.campaign_stats
+
+    def counted(conn, campaign_id):
+        calls.append(campaign_id)
+        return real(conn, campaign_id)
+
+    DB.campaign_stats = counted
+    try:
+        screen._campaign_id = 1
+        screen._refresh_send_controls()
+    finally:
+        DB.campaign_stats = real
+        screen._campaign_id = 0
+    assert len(calls) == 1, \
+        "one refresh counted the campaign %d times" % len(calls)
+
+
+def test_naming_a_target_agrees_however_it_was_counted():
+    """`_named` takes a count and three records; `_names_of` takes the list.
+
+    The button labels moved onto the first because materialising five thousand
+    records to print "and 4,997 more" is the finding one level down. The two
+    have to keep saying the same thing.
+    """
+    leads = [{"name": "Alpha Plumbing"}, {"name": "Mid Electric"},
+             {"name": "Zeta Roofing"}, {"email": "four@example.com"}, {}]
+    for size in range(len(leads) + 1):
+        picked = leads[:size]
+        assert SO._named(len(picked), picked) == SO._names_of(picked)
+    assert SO._named(0, []) == "nobody"
+    assert SO._named(1, leads[:1]) == "Alpha Plumbing"
+    assert SO._named(500, leads[:3]) == \
+        "Alpha Plumbing, Mid Electric, Zeta Roofing and 497 more"
+    assert SO._named(5, [{}]) == "an unnamed lead and 4 more"
+
+
+# ── P2: a theme change must not rebuild a screen nobody is looking at ─────────
+
+def test_a_theme_change_waits_for_a_hidden_screen_to_be_shown():
+    """913ms of this screen was charged to a click on another one.
+
+    `MainWindow._repolish` asks every built screen to `restyle()`, and this one
+    answered by rebuilding four tab pages and re-reading the store — for a
+    window the user had walked away from, inside the click that changed the
+    setting. The debt is recorded and paid by `showEvent`, which is the first
+    moment paying it buys the user anything.
+    """
+    screen = _screen()
+    app = _app()
+    other = TH.theme("light" if _WEARING.name == "dark" else "dark")
+    table = screen.lead_table
+    screen.hide()
+    app.processEvents()
+    try:
+        TH.apply(app, other)
+        CO.use_theme(other)
+        screen.restyle()
+        assert screen._stale, "a hidden screen has to remember what it owes"
+        assert screen.lead_table is table, \
+            "a screen nobody is looking at rebuilt itself inside the click"
+
+        screen.show()
+        app.processEvents()
+        assert not screen._stale, "the debt was recorded and never paid"
+        assert screen.lead_table is not table, \
+            "being shown did not rebuild the screen the theme change skipped"
+        painted = screen.send_note.palette().color(
+            QPalette.WindowText).name().upper()
+        assert painted == other.color["text.tertiary"].upper(), (
+            "the screen came back wearing %s, not the %s theme's %s"
+            % (painted, other.name, other.color["text.tertiary"]))
+    finally:
+        TH.apply(app, _WEARING)
+        CO.use_theme(_WEARING)
+        screen.show()
+        screen.restyle()
+        screen.resize(QSize(*DEFAULT_SIZE))
+        app.processEvents()
+
+
+def test_a_theme_change_does_not_go_back_to_the_store_for_the_leads():
+    """A palette has nothing to say about a lead.
+
+    Re-reading them also threw away every Headline gap the screen had worked
+    out — a JSON decode and a `core.templates` call per row — so the rebuild
+    paid for the audit-derived half of the table twice.
+    """
+    screen = _screen()
+    app = _app()
+    screen._reload_leads()
+    held = list(screen._leads)
+    calls = []
+    real = DB.list_leads
+
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    DB.list_leads = counted
+    try:
+        screen.restyle()
+        app.processEvents()
+    finally:
+        DB.list_leads = real
+    assert not calls, "a theme change went back to the store %d times" % len(calls)
+    assert [lead.get("email") for lead in screen._leads] == \
+        [lead.get("email") for lead in held], "the rebuild lost the leads"
+    assert screen.lead_table.rowCount() == len(held), \
+        "the rebuilt table does not hold the leads the screen was holding"
+    assert screen._lead_at(0) is screen._leads[0], \
+        "the rebuilt table lost the row-to-record mapping"
+
+
 def test_close_all_at_exit():
     """Not a test — Windows will not delete the temp dir with the db open."""
     DB.close_all()

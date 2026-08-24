@@ -14,6 +14,13 @@ small-business website:
   five-minute scrape into an hour.
 * **Encoding.** A hardcoded utf-8 decode mangles the Latin-1, cp1252 and
   Shift-JIS sites that are exactly the neglected businesses worth pitching.
+* **Ownership.** An address printed on a page is not always the page's own. A
+  "Site by" footer, a theme credit and a builder's support desk are all real
+  mailboxes belonging to somebody else, and the pitch opens by naming what is
+  wrong with the site — so mailing one sends that letter to the agency that
+  built it. An address counts as the business's only when it sits on a domain
+  the business plainly owns, or on free mail, which is what a plumber with a
+  Gmail account genuinely uses.
 
 Candidates are **scored, not first-one-wins**. One page routinely carries a
 webmaster alias, a careers inbox, a privacy contact and the owner's address;
@@ -339,6 +346,68 @@ def _registrable(host: str) -> str:
     return ".".join(labels[-2:])
 
 
+# A site *on* one of these has no registrable domain of its own —
+# `stitchandsole.wixsite.com` registers as `wixsite.com`, which is the
+# platform's domain and not the shop's. Ownership is unjudgeable there, so the
+# off-domain rule below stands down rather than throwing away the one address
+# such a business has. Missing a platform here costs a lead; listing one that
+# does not belong only restores the older, laxer behaviour for that host — both
+# failure modes are bounded, which is why a short list is safe where the
+# denylist in `_clean_email` would not be.
+_PLATFORM_DOMAINS = frozenset({
+    "wixsite.com", "wix.com", "squarespace.com", "myshopify.com",
+    "wordpress.com", "weebly.com", "business.site", "godaddysites.com",
+    "jimdosite.com", "jimdofree.com", "webnode.com", "blogspot.com",
+    "github.io", "netlify.app", "vercel.app", "webflow.io", "square.site",
+    "site123.me", "tilda.ws", "mystrikingly.com", "yolasite.com",
+    "companysite.net", "websitebuilder.com", "duda.co", "ionos.space",
+})
+
+# The shortest name worth reading as a brand. Below it, `long.startswith(short)`
+# is coincidence rather than evidence: half the web starts with `mail`, `north`
+# or `west`, and a four-letter head would hand a whole hosting company the
+# ownership of a business that merely shares its first syllable.
+_BRAND_MIN = 5
+
+
+def _brand(domain: str) -> str:
+    """The name a business trades under: `oakville-windows.ca` -> `oakvillewindows`."""
+    return _registrable(domain).split(".")[0].replace("-", "")
+
+
+def _owns(domain: str, site_domain: str) -> bool:
+    """True when `domain` plainly belongs to the business behind `site_domain`.
+
+    Three shapes, and only three, because every one of them has to be a shape a
+    third party cannot wear by accident:
+
+    * the site's own registrable domain;
+    * the same brand under another suffix — `acmeroofing.ca` writing from
+      `acmeroofing.com` is the commonest sibling there is;
+    * a brand the site's brand *begins*, or that begins the site's brand:
+      `wrenfield.works` -> `wrenfieldjoinery.com`, `harbourviewdental.ca` ->
+      `harbourviewdentalgroup.com`. A prefix, deliberately, not a shared
+      substring: a business extends its name to the right, while a suffix match
+      is what `windows.io` and `oakvillewindows.com` share and they are two
+      companies.
+
+    Everything else — the agency in the footer, the theme author, the host's
+    support desk — is somebody else's mail, however plausible it looks.
+    """
+    reg = _registrable(domain)
+    if not reg or not site_domain:
+        return False
+    if reg == site_domain:
+        return True
+    name, site = _brand(reg), _brand(site_domain)
+    if not name or not site:
+        return False
+    if name == site:
+        return True
+    short, long = (name, site) if len(name) < len(site) else (site, name)
+    return len(short) >= _BRAND_MIN and long.startswith(short)
+
+
 # ── Address cleaning ──
 
 # A split a reader cannot see is not a token boundary. Zero-width marks, the
@@ -628,9 +697,9 @@ def _mark_joins(text: str) -> str:
 # a plainly written address is a *better* provenance than the same string
 # rebuilt by the deobfuscator, so "text" outranks "deobfuscated".
 _METHOD_RANK = {"mailto": 0, "jsonld": 1, "cfemail": 2, "text": 3,
-                "deobfuscated": 4, "js": 5}
+                "deobfuscated": 4, "js": 5, "credit": 6}
 _METHOD_BONUS = {"mailto": 25, "jsonld": 20, "cfemail": 20, "deobfuscated": 0,
-                 "js": 0, "text": 0}
+                 "js": 0, "text": 0, "credit": 0}
 
 _MAILTO_RE = re.compile(r"mailto:([^\"'>\s\\]+)", re.I)
 _CFEMAIL_RE = re.compile(
@@ -815,11 +884,8 @@ def _scan_obfuscated(text: str, found: dict) -> None:
             _add(found, email, "text" if rebuilt == m.group(0) else "deobfuscated")
 
 
-def _scan_page(html: str, page_url: str = "") -> dict:
-    """Every address on one page, as `{email: method}`. Pure, no network."""
-    found: dict = {}
-    if not html:
-        return found
+def _scan_into(html: str, found: dict) -> None:
+    """Run every extraction pass over one chunk of markup."""
     _scan_mailto(html, found)
     _scan_jsonld(html, found)
     _scan_cfemail(html, found)
@@ -859,6 +925,131 @@ def _scan_page(html: str, page_url: str = "") -> dict:
     # the zero-width space `_mark_joins` was given no chance to see.
     _scan_obfuscated(_STYLE_RE.sub(" ", marked), found)
     _scan_obfuscated(_TAG_RE.sub(" ", _SCRIPT_STYLE_RE.sub(" ", marked)), found)
+
+
+# ── Credit lines ──
+
+# "Site by", "Powered by", "Theme by": the byline of whoever built the site,
+# and the one place on a business's own page where a printed address reliably
+# belongs to somebody else. The window opens at the marker and only runs
+# forwards: a credit sits under the footer's contact block often enough that
+# reaching backwards would swallow the business's own address, and losing a
+# real one is the failure this whole module is arranged against.
+#
+# The heads are the vocabulary of *web* work on purpose. `made by`, `created by`
+# and `crafted by` were left out although they are credits too — on a maker's
+# site they are the business describing its own product ("every loaf made by
+# hand — hello@fernhill.ca"), and a marker that fires there deletes the address
+# it was meant to protect.
+_SP = r"(?:\s|&nbsp;|&#(?:160|[xX]0*[aA]0);)"
+_CREDIT_HEAD = (r"(?:web" + _SP + r"{0,2})?"
+                r"(?:site|design|development|dev|build|branding|theme|template"
+                r"|hosting)"
+                r"|website|powered|designed|developed|built|hosted|maintained"
+                r"|managed|realisiert|erstellt|umgesetzt|r[eé]alis[eé]")
+#
+# The marker is matched backwards from its `by`, and that is a cost decision,
+# not a stylistic one. Run forwards, the head alternation has to be tried at
+# every word boundary on the page: 12 ms of a 142 KB page, against 4 ms for the
+# same answer read backwards, on a scan that runs once per page per lead. `by`
+# is a plain literal alternation the engine can skip through, and the expensive
+# half then runs once per `by` against a 56-character window rather than a
+# hundred thousand times against the page.
+_CREDIT_BY_RE = re.compile(r"\b(?:by|par|von|door)\b", re.I)
+_CREDIT_HEAD_RE = re.compile(
+    r"\b(?:" + _CREDIT_HEAD + r")"
+    r"(?:" + _SP + r"{1,8}(?:&amp;|&|\+|and|und|/)?" + _SP + r"{0,8}"
+    r"(?:" + _CREDIT_HEAD + r"))?"
+    + _SP + r"{1,8}\Z", re.I)
+# How far back of its `by` a credit's head can sit: `Design &amp; development by`
+# is the longest shape here, with room for the entity spelling of its spaces.
+_CREDIT_LEAD = 56
+# A credit is one line, and a line ends where a block does. Without this the
+# window runs on into whatever the footer prints next, and a footer that prints
+# `Proudly powered by WordPress` above the shop's own Gmail address would have
+# the credit rule delete the one address the business has. Inline markup — the
+# anchor around the agency's name, the em dash, the `<span>` around its logo —
+# is not a line ending and must not close the window early.
+_BLOCK_EDGE_RE = re.compile(
+    r"<\s*/?\s*(?:br|p|div|footer|section|article|main|header|nav|aside|form|"
+    r"address|blockquote|hr|table|thead|tbody|tr|td|th|ul|ol|li|dl|dt|dd|"
+    r"h[1-6])\b", re.I)
+# The cap for a byline that wraps its anchor over three indented lines.
+_CREDIT_WINDOW = 320
+_CREDIT_MAX = 12
+
+
+def _credit_spans(html: str) -> list:
+    """The credit lines on a page, as merged `(start, end)` offsets."""
+    spans: list = []
+    for by in _CREDIT_BY_RE.finditer(html):
+        head = _CREDIT_HEAD_RE.search(html, max(0, by.start() - _CREDIT_LEAD),
+                                      by.start())
+        if head is None:
+            continue
+        start, end = head.start(), min(by.start() + _CREDIT_WINDOW, len(html))
+        edge = _BLOCK_EDGE_RE.search(html, by.end(), end)
+        if edge is not None:
+            end = edge.start()
+        if spans and start <= spans[-1][1]:
+            spans[-1] = (spans[-1][0], max(spans[-1][1], end))
+            continue
+        if len(spans) >= _CREDIT_MAX:
+            break
+        spans.append((start, end))
+    return spans
+
+
+def _blank_spans(html: str, spans: list) -> str:
+    """`html` with `spans` replaced by spaces of the same length.
+
+    Spaces, never nothing: a boundary the scan cannot cross is the point, and
+    closing the gap would join `Contact</p>` to the address after the credit.
+    """
+    out, cut = [], 0
+    for start, end in spans:
+        out.append(html[cut:start])
+        out.append(" " * (end - start))
+        cut = end
+    out.append(html[cut:])
+    return "".join(out)
+
+
+def _credit_only(html: str, found: dict) -> tuple:
+    """The addresses on this page that appear *nowhere* but a credit line.
+
+    Two scans decide it, and the order of the subtraction is what keeps them
+    honest. The window scan can only nominate addresses `found` already holds,
+    and the blanked scan is only ever subtracted, so neither pass can add an
+    address to the page's results — a sliced tag or a blanked `<script>` open
+    tag can cost this a suppression, never mint a recipient.
+
+    Nothing is spent on the second scan unless the first found an address
+    inside a credit line, which on the overwhelming majority of pages — the
+    ones whose footer credit carries no address at all — is never.
+    """
+    spans = _credit_spans(html)
+    if not spans:
+        return ()
+    inside: dict = {}
+    for start, end in spans:
+        _scan_into(html[start:end], inside)
+    suspect = set(inside) & set(found)
+    if not suspect:
+        return ()
+    elsewhere: dict = {}
+    _scan_into(_blank_spans(html, spans), elsewhere)
+    return tuple(suspect - set(elsewhere))
+
+
+def _scan_page(html: str, page_url: str = "") -> dict:
+    """Every address on one page, as `{email: method}`. Pure, no network."""
+    found: dict = {}
+    if not html:
+        return found
+    _scan_into(html, found)
+    for email in _credit_only(html, found):
+        found[email] = "credit"
     return found
 
 
@@ -918,13 +1109,37 @@ def _scan_phones(html: str, limit: int = 5) -> list:
 
 # ── Scoring ──
 
-def _static_score(email: str, site_domain: str, accept_free_mail: bool) -> tuple:
-    """Score and kind from the address alone. Returns `(score, kind)`."""
+def _static_score(email: str, site_domain: str, accept_free_mail: bool,
+                  *, credit: bool = False) -> tuple:
+    """Score and kind from the address alone. Returns `(score, kind)`.
+
+    The two vetoes here are ownership vetoes, and they are -100 rather than a
+    withheld bonus because nothing else on the page may buy them back: a role
+    prefix, a `mailto:` and a /contact/ page together are worth 53 points, and
+    that was exactly the arithmetic that made `support@webcraftstudios.com` the
+    best address on a window fitter's site with no address of its own.
+
+    * An address on a domain the business does not own is somebody else's,
+      whatever else it has going for it. Free mail is the deliberate exception
+      — nobody *owns* gmail.com and a plumber writing from one is the case the
+      free-mail rule exists for — and so is a site on a builder platform, where
+      the registrable domain belongs to the platform and ownership cannot be
+      read at all.
+    * An address whose only appearance on the site is inside a credit line is
+      the builder's, and that holds for free mail too: `Site by Jane Mercer
+      Design — janemercerdesign@gmail.com` is a freelancer's inbox, and the
+      free-mail rule would otherwise hand it the lead. It does not hold for an
+      address the business owns, because an agency's own site credits itself.
+    """
     local, _, domain = email.partition("@")
     score, kind = 0, "generic"
+    free = _is_free_mail(domain)
+    owned = _owns(domain, site_domain)
 
-    if site_domain and _registrable(domain) == site_domain:
-        score += 50
+    if owned:
+        # The exact domain outranks a sibling: when a business writes from both,
+        # the one its website is on is the one it reads.
+        score += 50 if _registrable(domain) == site_domain else 35
 
     if _hits(local, EMAIL_JUNK_PREFIXES):
         score -= 100
@@ -943,12 +1158,28 @@ def _static_score(email: str, site_domain: str, accept_free_mail: bool) -> tuple
 
     if _is_disposable(domain):
         score -= 100
-    if _is_free_mail(domain):
+    if free:
         if kind == "generic":
             kind = "free"
         if not accept_free_mail:
             score -= 100
+
+    if not owned and (credit or (site_domain and not free
+                                 and site_domain not in _PLATFORM_DOMAINS)):
+        score -= 100
     return score, kind
+
+
+def _entry_key(entry: tuple) -> tuple:
+    """Which of two sightings of one address is the better provenance.
+
+    A credit line always loses, whatever page it is on: a footer byline on
+    /contact/ carries the page bonus, and comparing the bonuses alone would let
+    it outrank the same address written plainly on the home page and mark a
+    stated address as the builder's.
+    """
+    method_bonus, page_bonus, method, _ = entry
+    return (method != "credit", method_bonus + page_bonus)
 
 
 def _is_contact_url(url: str) -> bool:
@@ -965,18 +1196,26 @@ def _rank_emails(per_page: dict, site_domain: str, *, accept_free_mail: bool = T
     """
     deliverable = deliverable or {}
     best: dict = {}
+    credited: set = set()
+    stated: set = set()
     for page_url, found in (per_page or {}).items():
         page_bonus = 10 if _is_contact_url(page_url) else 0
         for email, method in (found or {}).items():
+            (credited if method == "credit" else stated).add(email)
             entry = (_METHOD_BONUS.get(method, 0), page_bonus, method, page_url)
             current = best.get(email)
-            if current is None or sum(entry[:2]) > sum(current[:2]):
+            if current is None or _entry_key(entry) > _entry_key(current):
                 best[email] = entry
+    # One page's footer credit says nothing about a page that states the same
+    # address outright: the builder is only the builder when *every* appearance
+    # of the address across the crawl is a byline.
+    credited -= stated
 
     rows = []
     for email, (method_bonus, page_bonus, method, page_url) in best.items():
         domain = email.partition("@")[2]
-        score, kind = _static_score(email, site_domain, accept_free_mail)
+        score, kind = _static_score(email, site_domain, accept_free_mail,
+                                    credit=email in credited)
         score += method_bonus
         verdict = deliverable.get(domain, None)
         if verdict is False:

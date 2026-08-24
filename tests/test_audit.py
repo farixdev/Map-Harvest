@@ -1025,6 +1025,551 @@ def test_what_a_business_sells_is_read_from_the_list_it_writes_it_in():
     print("what a business sells is read from the list it writes it in: OK")
 
 
+# ── One page shape, for the tests below and the corpus after them ──
+
+# A real page carries a viewport, a phone number and an address whatever else it
+# is missing, so every page built here does too: it keeps `no_mobile`,
+# `contact_form_only` and `multi_location` out of the way of the rule under test.
+_PAGE = """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>%s</title>
+%s</head><body>
+%s
+<footer><p>&copy; %d %s. 12 Mill St, Guelph, ON N1H 2A9. Call (905) 555-0134</p></footer>
+</body></html>"""
+
+# A form a stranger writes to, the site's own search box, and the same search
+# box marked up the other way — by input type rather than by role.
+_LEAD_FORM = ('<form action="/contact" method="post">'
+              '<input type="text" name="name" placeholder="Name">'
+              '<input type="email" name="email" placeholder="Email">'
+              '<textarea name="message"></textarea>'
+              '<button type="submit">Send</button></form>')
+_SEARCH_BOX = ('<form role="search" action="/search">'
+               '<input type="text" name="q" placeholder="Search the site">'
+               '<button type="submit">Search</button></form>')
+_SEARCH_INPUT = ('<form action="/results">'
+                 '<input type="search" name="s" placeholder="Find a plant">'
+                 '<button type="submit">Go</button></form>')
+
+
+def _site(name: str, body: str, head: str = "") -> str:
+    return _PAGE % (name, head, body, TODAY.year, name)
+
+
+def _built(body: str, head: str = "") -> dict:
+    return A.audit_from_html({"https://x.test/": _site("A business", body, head)},
+                             "https://x.test/")
+
+
+def test_a_list_of_services_is_not_a_thing_to_book():
+    """The headline gap fired on any business that sells anything.
+
+    `no_online_booking` is the highest severity in the catalogue and usually the
+    sentence the email opens with, and the rule behind it was "has a contact
+    form and sells something" — so a fabricator, a wholesaler and a print shop
+    were all told that asking them for a time means filling in a form and
+    waiting, about work no one books a time for. The worst of them was a barber
+    shop whose page reads "walk-ins only, we do not take appointments": the word
+    the rule matched on was inside the sentence denying it.
+    """
+    nothing_to_book = ("<h2>Our Services</h2><ul><li>CNC machining</li>"
+                       "<li>Powder coating</li><li>Sheet metal fabrication</li></ul>")
+    walk_in = ("<p>Walk-ins only. We do not take appointments.</p>"
+               "<h2>Services</h2><ul><li>Haircut</li><li>Beard trim</li></ul>")
+    # No appointment word anywhere on the page: what says this business books
+    # times is the work it lists, and losing that arm would cost the rule the
+    # leads it exists for.
+    books_times = ("<h2>Treatments</h2><ul><li>Sports injury treatment</li>"
+                   "<li>Manual therapy</li></ul>")
+    for body, expected in ((nothing_to_book, False), (walk_in, False), (books_times, True)):
+        codes = _codes(_built(body + _LEAD_FORM))
+        assert ("no_online_booking" in codes) is expected, (body, codes)
+
+    # A site that calls itself a dentist in its own JSON-LD books times too, and
+    # says so in the one place on the page that cannot be a turn of phrase.
+    declared = _built(_LEAD_FORM, head='<script type="application/ld+json">'
+                                       '{"@type":"Dentist","name":"A business"}</script>')
+    assert "no_online_booking" in _codes(declared), _codes(declared)
+    print("a list of services is not a thing to book: OK")
+
+
+def test_a_search_box_is_not_a_lead_form():
+    """One filter, or two rules read the same box two ways.
+
+    `_is_contact_form` rejected `role="search"` while the `tech["forms"]` tally
+    counted raw <form> tags, so a brochure site whose only form is the site
+    search was told nothing was hooked up behind its contact form — and the
+    finding that was true of it, that nothing on the site asks a visitor for a
+    name, was suppressed by that same box. One wrong claim, one real one hidden,
+    both out of a single disagreement.
+    """
+    only_search = _built(_SEARCH_BOX)
+    assert only_search["tech"]["forms"] == 0, only_search["tech"]
+    assert only_search["signals"]["has_contact_form"] is False, only_search["signals"]
+    assert "no_crm_signals" not in _codes(only_search), _codes(only_search)
+    assert "no_lead_capture" in _codes(only_search), _codes(only_search)
+
+    both = _built(_SEARCH_BOX + _LEAD_FORM)
+    assert both["tech"]["forms"] == 1, both["tech"]
+    assert "no_crm_signals" in _codes(both), _codes(both)
+    assert "no_lead_capture" not in _codes(both), _codes(both)
+
+    # The other half of the same rule: a newsletter a visitor can join is a lead
+    # route, and a newsletter mentioned in a paragraph is a promise.
+    promised = _built("<p>Our newsletter goes out every spring, ask us to add you.</p>")
+    assert "no_lead_capture" in _codes(promised), _codes(promised)
+    joinable = _built('<h2>Newsletter</h2><form action="/subscribe">'
+                      '<input type="email" name="EMAIL"><button>Subscribe</button></form>')
+    assert "no_lead_capture" not in _codes(joinable), _codes(joinable)
+    print("a search box is not a lead form: OK")
+
+
+def test_careers_has_to_head_a_job_listing():
+    """"Careers" is a section heading and an email label both.
+
+    The rule matched the bare words anywhere in the visible text, so a contact
+    page reading "Careers: jobs@clearviewhvac.ca" and a financing page with
+    "Apply now" over a credit application were both told they must be sifting
+    CVs by hand. The path arm had the same shape: "/careers" sits inside
+    "/blog/careers-in-the-trades/", which is an article about apprentice wages.
+    """
+    not_hiring = (
+        '<p>Careers: <a href="mailto:jobs@clearviewhvac.ca">jobs@clearviewhvac.ca</a></p>',
+        '<h2>Financing</h2><p>Good credit, bad credit. Apply now and drive today.</p>'
+        '<p><a href="/finance-application/">Apply Now</a></p>',
+        '<h2><a href="/blog/careers-in-the-trades/">Careers in the trades: what an '
+        'apprenticeship really pays</a></h2>',
+    )
+    hiring = (
+        '<nav><a href="/careers/">Careers</a></nav>',
+        '<h2>Careers</h2><ul><li>Journeyman Electrician, full time</li></ul>',
+        '<a href="/stellenangebote/">Stellenangebote</a><p>Wir stellen ein.</p>',
+    )
+    for body in not_hiring:
+        codes = _codes(_built(body + _LEAD_FORM))
+        assert "careers_manual" not in codes, (body, codes)
+    for body in hiring:
+        codes = _codes(_built(body + _LEAD_FORM))
+        assert "careers_manual" in codes, (body, codes)
+    print("careers has to head a job listing: OK")
+
+
+def test_a_marker_stops_where_the_word_stops():
+    """Three more of the same shape, found while the three above were being fixed.
+
+    "form" is inside "uniform", and the sentence it produced went out as "the
+    uniform catalogue is a PDF to print, fill in and send back". "x.com" is
+    inside "simplex.com", so a link to a supplier counted as a social profile
+    and buried a finding the business really did have. "formidable" is a plugin
+    directory and an English adjective, and the embed list was matched against
+    the copy rather than against the URLs that load an embed.
+    """
+    catalogue = _built('<p>Browse the <a href="/downloads/uniform-catalogue-2026.pdf">'
+                       "uniform catalogue</a>.</p>" + _LEAD_FORM)
+    assert "pdf_forms" not in _codes(catalogue), _codes(catalogue)
+    paperwork = _built('<p>Please <a href="/forms/new-patient-form.pdf">download the new '
+                       "patient form</a>.</p>" + _LEAD_FORM)
+    assert "pdf_forms" in _codes(paperwork), _codes(paperwork)
+    named = next(g for g in paperwork["gaps"] if g["code"] == "pdf_forms")
+    assert named["evidence"].startswith("the new patient form is a PDF"), named["evidence"]
+
+    supplier = _built('<p>We fit <a href="https://www.simplex.com/flooring">Simplex</a>'
+                      " products.</p>" + _LEAD_FORM)
+    assert supplier["signals"]["has_social"] is False, supplier["signals"]
+    assert "no_social_presence" in _codes(supplier), _codes(supplier)
+    profile = _built('<a href="https://www.facebook.com/abusiness/">Facebook</a>' + _LEAD_FORM)
+    assert profile["signals"]["has_social"] is True, profile["signals"]
+    assert "no_social_presence" not in _codes(profile), _codes(profile)
+
+    prose = _built("<p>Four decades and a formidable record in boundary disputes.</p>")
+    assert prose["signals"]["has_contact_form"] is False, prose["signals"]
+    assert "no_lead_capture" in _codes(prose), _codes(prose)
+    embedded = _built('<iframe src="https://form.jotform.com/2411234567890"></iframe>')
+    assert embedded["signals"]["has_contact_form"] is True, embedded["signals"]
+    assert "no_lead_capture" not in _codes(embedded), _codes(embedded)
+    print("a marker stops where the word stops: OK")
+
+
+# ── The labelled corpus ──
+
+# Twenty-nine pages, each labelled with the gaps a person who read the page
+# would say are true of it. Fixtures alone cannot hold these rules honest: a
+# rule that matches a substring where it means a structural fact still passes
+# every example written to prove it works, and only shows itself as a rate over
+# pages that merely *read* like the thing. So the corpus carries both — the
+# shapes each rule exists to catch, and the shapes that resemble them: a
+# services list with nothing bookable on it, a site-search box, "Careers:"
+# beside an email address, "Apply Now" over a credit application, a uniform
+# catalogue, a supplier called Simplex.
+#
+# Every label is a fact about the page rather than a restatement of a rule —
+# whether the business takes appointments, whether anything asks a visitor for
+# a name, whether the site is advertising a job. Every page is built from the
+# shape above, so `no_mobile`, `contact_form_only` and `multi_location` are
+# silent throughout and are measured by the fixtures earlier in the file.
+
+# What every page in the corpus has in common: no chat, no analytics, no
+# markup, no social profile and no price on the page.
+_BASE_GAPS = frozenset({"no_live_chat", "no_analytics", "no_schema",
+                        "no_social_presence", "price_opaque"})
+
+_FRESH_POST = TODAY - datetime.timedelta(days=30)
+
+
+def _labelled(name: str, body: str, gaps, head: str = "") -> tuple:
+    return name, _site(name, body, head), frozenset(gaps)
+
+
+CORPUS: tuple[tuple[str, str, frozenset], ...] = (
+    # ── A services list is not a thing to book ──
+    _labelled(
+        "Coastal Fabrication Ltd", """
+<nav><a href="/">Home</a> <a href="/services/">Services</a> <a href="/contact/">Contact</a></nav>
+<h1>Coastal Fabrication Ltd</h1>
+<p>Structural steel and custom metalwork for contractors across the region.</p>
+<h2>Our Services</h2>
+<ul><li>CNC machining</li><li>Structural steel welding</li><li>Powder coating</li>
+<li>Sheet metal fabrication</li></ul>
+<h2>Request a quote</h2>
+<p>Send us your drawings and we will price the job.</p>
+""" + _LEAD_FORM,
+        _BASE_GAPS | {"no_crm_signals", "quote_by_form"}),
+    _labelled(
+        "Northline Janitorial Supply", """
+<h1>Northline Janitorial Supply</h1>
+<p>Trade supplier to schools, offices and property managers.</p>
+<h2>What we do</h2>
+<ul><li>Next day delivery across the province</li><li>Bulk paper and chemical supply</li>
+<li>Account management for facilities teams</li><li>Dispenser stocking programmes</li></ul>
+<p>Open a trade account by sending the form below.</p>
+""" + _LEAD_FORM,
+        _BASE_GAPS | {"no_crm_signals"}),
+    _labelled(
+        "Riverside Print Co", """
+<h1>Riverside Print Co</h1>
+<h2>Services</h2>
+<ul><li>Business card printing</li><li>Large format banners</li><li>Vehicle wraps</li>
+<li>Brochure design and layout</li></ul>
+<h2>Get a quote</h2>
+<p>Tell us what you need printed and we will come back with a price.</p>
+""" + _LEAD_FORM,
+        _BASE_GAPS | {"no_crm_signals", "quote_by_form"}),
+    # The page says outright that it does not book times. Reading the word
+    # "appointments" out of that sentence as proof it does is the worst of the
+    # false positives: the email opens by contradicting the page it cites.
+    _labelled(
+        "Dundas Street Barbers", """
+<h1>Dundas Street Barbers</h1>
+<p>Walk-ins only. We do not take appointments &mdash; first come, first served,
+six days a week.</p>
+<h2>Services</h2><ul><li>Haircut</li><li>Beard trim</li><li>Hot towel shave</li></ul>
+<h2>Questions?</h2>
+""" + _LEAD_FORM,
+        _BASE_GAPS | {"no_crm_signals"}),
+
+    # ── And the businesses the rule exists for ──
+    _labelled(
+        "Riverbend Dental", """
+<h1>Riverbend Dental</h1>
+<h2>Request an appointment</h2>
+<p>Fill in the form and the front desk will call you back to confirm a time.</p>
+""" + _LEAD_FORM + """
+<h2>Our Services</h2><ul><li>Dental cleaning and check-ups</li>
+<li>Root canal treatment</li><li>Teeth whitening</li></ul>
+""",
+        _BASE_GAPS | {"no_crm_signals", "no_online_booking"}),
+    # No appointment word anywhere: what says this business books times is the
+    # work it lists. Lose this one and the rule stops paying for itself.
+    _labelled(
+        "Lakeshore Physiotherapy", """
+<h1>Lakeshore Physiotherapy</h1>
+<h2>Treatments</h2><ul><li>Sports injury treatment</li><li>Manual therapy</li>
+<li>Post-surgical rehabilitation</li></ul>
+<p>Send us a message and we will find you a slot this week.</p>
+""" + _LEAD_FORM,
+        _BASE_GAPS | {"no_crm_signals", "no_online_booking"}),
+    _labelled(
+        "Trattoria Bella", """
+<h1>Trattoria Bella</h1>
+<p>Reservations by telephone only &mdash; call the restaurant and we will hold a table.</p>
+<h2>Menu</h2><p>Antipasti from $12.00, pasta $22.00, secondi $31.00.</p>
+<h2>Private events</h2>
+""" + _LEAD_FORM,
+        (_BASE_GAPS - {"price_opaque"}) | {"no_crm_signals", "no_online_booking"}),
+    _labelled(
+        "Maple Ridge Veterinary", """
+<h1>Maple Ridge Veterinary</h1>
+<h2>Our Services</h2><ul><li>Vaccinations and wellness exams</li>
+<li>Dental cleaning</li><li>Pet grooming</li></ul>
+<p>New clients are welcome. Send us a note and we will be in touch.</p>
+""" + _LEAD_FORM,
+        _BASE_GAPS | {"no_crm_signals", "no_online_booking"}),
+    _labelled(
+        "Bloom Hair Studio", """
+<h1>Bloom Hair Studio</h1>
+<p><a href="https://my.setmore.com/bloomhair">Book an appointment</a></p>
+<h2>Services</h2><ul><li>Cut and blow dry</li><li>Balayage</li>
+<li>Keratin treatment</li></ul>
+""" + _LEAD_FORM,
+        _BASE_GAPS | {"no_crm_signals"}),
+    _labelled(
+        "Clearview Heating and Cooling", """
+<nav><a href="/">Home</a> <a href="/book-online/">Book online</a></nav>
+<h1>Clearview Heating and Cooling</h1>
+<h2>Services</h2><ul><li>Furnace repair</li><li>Air conditioning installation</li>
+<li>Annual maintenance plans</li></ul>
+""" + _LEAD_FORM,
+        _BASE_GAPS | {"no_crm_signals"}),
+
+    # ── A search box is not lead capture ──
+    _labelled(
+        "Grand River Hardware", """
+<h1>Grand River Hardware</h1>
+""" + _SEARCH_BOX + """
+<p>Four aisles of trade supplies, open seven days. Come and see us at the counter.</p>
+<h2>Departments</h2><ul><li>Plumbing supplies</li><li>Paint and stain</li>
+<li>Garden tools</li></ul>
+""",
+        _BASE_GAPS | {"no_lead_capture"}),
+    _labelled(
+        "Elmwood Garden Centre", """
+<h1>Elmwood Garden Centre</h1>
+""" + _SEARCH_INPUT + """
+<p>Ten acres of trees, shrubs and perennials just off the highway.</p>
+""",
+        _BASE_GAPS | {"no_lead_capture"}),
+    _labelled(
+        "Ferro Machine and Tool", """
+<h1>Ferro Machine and Tool</h1>
+""" + _SEARCH_BOX + """
+<h2>What we do</h2><ul><li>Precision turning</li><li>Surface grinding</li>
+<li>Short-run production</li></ul>
+<h2>Contact</h2>
+""" + _LEAD_FORM,
+        _BASE_GAPS | {"no_crm_signals"}),
+    _labelled(
+        "Hilltop Masonry", """
+<h1>Hilltop Masonry</h1>
+<p>Brick, block and stone work. Call the yard and we will come and look at the job.</p>
+<h2>Our Work</h2><ul><li>Chimney repointing</li><li>Stone veneer</li>
+<li>Retaining walls</li></ul>
+""",
+        _BASE_GAPS | {"no_lead_capture"}),
+    # A newsletter nobody can sign up to is a promise in a paragraph, not a
+    # route in, and reading it as one hides the finding on a site with no form
+    # at all.
+    _labelled(
+        "Rideau Upholstery", """
+<h1>Rideau Upholstery</h1>
+<p>Repairs and re-covering for antique and modern furniture. Drop in or call the workshop.</p>
+<p>Our newsletter goes out every spring &mdash; ask us to add you to the mailing
+list when you call.</p>
+""",
+        _BASE_GAPS | {"no_lead_capture"}),
+    # "formidable" is a plugin directory and an English adjective, and the
+    # embed list was matched against the whole page rather than against the
+    # URLs that load an embed.
+    _labelled(
+        "Ashworth Chartered Surveyors", """
+<h1>Ashworth Chartered Surveyors</h1>
+<p>Four decades and a formidable record in party wall and boundary disputes.</p>
+<p>Telephone the practice and ask for Mr Ashworth.</p>
+""",
+        _BASE_GAPS | {"no_lead_capture"}),
+    # And the case the embed list exists for: a form that renders no <form> of
+    # its own, loaded from the URL that proves it is there.
+    _labelled(
+        "Halton Fencing Supplies", """
+<h1>Halton Fencing Supplies</h1>
+<p>Panels, posts and gravel boards, collected from the yard or delivered on a flatbed.</p>
+<iframe src="https://form.jotform.com/2411234567890" title="Enquiry"></iframe>
+""",
+        _BASE_GAPS | {"no_crm_signals"}),
+    _labelled(
+        "Cedar Lane Bakery", """
+<h1>Cedar Lane Bakery</h1>
+<p>Sourdough baked every morning. Call ahead for large orders.</p>
+<h2>Join our mailing list</h2>
+<form action="https://cedarlane.us1.list-manage.com/subscribe/post">
+<input type="email" name="EMAIL" placeholder="Email"><button>Subscribe</button></form>
+""",
+        _BASE_GAPS),
+    _labelled(
+        "Northwind Logistics Software", """
+<h1>Northwind Logistics Software</h1>
+<h2>What we do</h2><ul><li>Fleet dispatch software</li><li>Route optimisation</li>
+<li>Integration support</li></ul>
+""" + _LEAD_FORM,
+        _BASE_GAPS,
+        head='<script src="https://js.hs-scripts.com/1234567.js"></script>\n'),
+
+    # ── "Careers" has to head a job listing ──
+    _labelled(
+        "Clearview HVAC", """
+<h1>Clearview HVAC</h1>
+<h2>Contact</h2>
+<p>Service: <a href="mailto:service@clearviewhvac.ca">service@clearviewhvac.ca</a><br>
+Careers: <a href="mailto:jobs@clearviewhvac.ca">jobs@clearviewhvac.ca</a></p>
+<h2>Services</h2><ul><li>Furnace repair</li><li>Air conditioning installation</li>
+<li>Duct cleaning</li></ul>
+""" + _LEAD_FORM,
+        _BASE_GAPS | {"no_crm_signals", "no_online_booking"}),
+    _labelled(
+        "Southgate Auto Sales", """
+<h1>Southgate Auto Sales</h1>
+<h2>Financing</h2>
+<p>Good credit, bad credit, no credit. Apply now and drive today.</p>
+<p><a href="/finance-application/">Apply Now</a> or print the
+<a href="/docs/credit-application.pdf">credit application</a> and bring it in.</p>
+""" + _LEAD_FORM,
+        _BASE_GAPS | {"no_crm_signals", "pdf_forms"}),
+    _labelled(
+        "Clearview HVAC Blog", """
+<h1>Clearview HVAC Blog</h1>
+<article>
+<h2><a href="/blog/careers-in-the-trades/">Careers in the trades: what an apprenticeship
+really pays</a></h2>
+<time datetime="%s">%s</time>
+<p>Every winter somebody asks us what a first-year apprentice earns.</p>
+</article>
+""" % (_FRESH_POST.isoformat(), _FRESH_POST.strftime("%B %d, %Y")) + _LEAD_FORM,
+        _BASE_GAPS | {"no_crm_signals"}),
+    _labelled(
+        "Bridgeport Electric", """
+<nav><a href="/">Home</a> <a href="/careers/">Careers</a></nav>
+<h1>Bridgeport Electric</h1>
+<h2>Current openings</h2>
+<ul><li>Journeyman Electrician, full time</li><li>Apprentice Electrician, first year</li></ul>
+<p>Send your resume to the office and we will call you in for a chat.</p>
+""" + _LEAD_FORM,
+        _BASE_GAPS | {"no_crm_signals", "careers_manual"}),
+    _labelled(
+        "Dominion Roofing", """
+<h1>Dominion Roofing</h1>
+<h2>Careers</h2>
+<ul><li>Roofing labourer, full time, year round</li><li>Crew lead, five years on the tools</li></ul>
+<p>Applications can be dropped off at the office any weekday.</p>
+""" + _LEAD_FORM,
+        _BASE_GAPS | {"no_crm_signals", "careers_manual"}),
+    _labelled(
+        "Elektro Baumgartner GmbH", """
+<h1>Elektro Baumgartner GmbH</h1>
+<h2>Unsere Leistungen</h2><ul><li>Elektroinstallation Neubau</li>
+<li>Photovoltaikanlagen</li><li>Wallbox Installation</li></ul>
+<p><a href="/stellenangebote/">Stellenangebote</a></p>
+<p>Wir stellen ein: Elektroniker (m/w/d) für Photovoltaik.</p>
+""" + _LEAD_FORM,
+        _BASE_GAPS | {"no_crm_signals", "careers_manual", "no_online_booking"}),
+
+    # ── Paperwork, and a word that only contains one ──
+    _labelled(
+        "Trailside Workwear", """
+<h1>Trailside Workwear</h1>
+<p>Browse the <a href="/downloads/uniform-catalogue-2026.pdf">uniform catalogue</a>
+or ask about bulk pricing for crews.</p>
+""" + _LEAD_FORM,
+        _BASE_GAPS | {"no_crm_signals"}),
+    _labelled(
+        "Bayview Family Chiropractic", """
+<h1>Bayview Family Chiropractic</h1>
+<p>New here? Please <a href="/forms/new-patient-form.pdf">download the new patient form</a>
+and bring it with you.</p>
+<h2>Our Services</h2><ul><li>Chiropractic adjustment</li><li>Massage therapy</li>
+<li>Custom orthotics</li></ul>
+""" + _LEAD_FORM,
+        _BASE_GAPS | {"no_crm_signals", "pdf_forms", "no_online_booking"}),
+
+    # ── A supplier whose name ends in the same three characters as a social host ──
+    _labelled(
+        "Kettle Creek Flooring", """
+<h1>Kettle Creek Flooring</h1>
+<p>We fit products from <a href="https://www.simplex.com/flooring">Simplex</a>
+and three other mills.</p>
+<h2>Services</h2><ul><li>Hardwood installation</li><li>Carpet supply and fitting</li>
+<li>Floor sanding and refinishing</li></ul>
+""" + _LEAD_FORM,
+        _BASE_GAPS | {"no_crm_signals", "no_online_booking"}),
+
+    # ── And a site with nothing to sell against ──
+    _labelled(
+        "Harbourview Dental", """
+<nav><a href="https://calendly.com/harbourview/checkup">Book online</a>
+<a href="https://www.facebook.com/harbourviewdental/">Facebook</a></nav>
+<h1>Harbourview Dental</h1>
+<p>Check-up $95.00, cleaning $140.00, whitening $350.00.</p>
+""" + _LEAD_FORM,
+        frozenset(),
+        head='<script async src="https://www.googletagmanager.com/gtag/js?id=G-XYZ"></script>\n'
+             '<script src="https://embed.tawk.to/hv/default"></script>\n'
+             '<script src="https://js.hs-scripts.com/778899.js"></script>\n'
+             '<script type="application/ld+json">{"@type":"Dentist",'
+             '"name":"Harbourview Dental"}</script>\n'),
+)
+
+
+def _corpus_rates() -> dict:
+    """Per-rule (true positives, false positives, false negatives) over CORPUS."""
+    rates = {code: [0, 0, 0] for code in A.GAP_CATALOGUE}
+    for name, html, expected in CORPUS:
+        url = "https://%s.test/" % re.sub(r"[^a-z]+", "-", name.lower())
+        fired = set(_codes(A.audit_from_html({url: html}, url)))
+        for code in A.GAP_CATALOGUE:
+            hit, want = code in fired, code in expected
+            if hit and want:
+                rates[code][0] += 1
+            elif hit:
+                rates[code][1] += 1
+            elif want:
+                rates[code][2] += 1
+    return rates
+
+
+def test_no_rule_stands_a_substring_in_for_the_fact_it_claims():
+    """Precision on the corpus, rule by rule, because a wrong headline is dear.
+
+    `gaps[0]` becomes the first sentence of a cold email, so a false positive
+    tells a stranger something untrue about their own website. Several rules
+    were built on a word appearing somewhere in the page rather than on a fact
+    about its structure, and over the pages above they scored, before -> after:
+
+        rule                 precision            recall
+        no_online_booking    0.571 -> 1.000       1.000 -> 1.000
+        no_crm_signals       0.875 -> 1.000       1.000 -> 1.000
+        no_lead_capture      1.000 -> 1.000       0.200 -> 1.000
+        careers_manual       0.500 -> 1.000       1.000 -> 1.000
+        pdf_forms            0.667 -> 1.000       1.000 -> 1.000
+        no_social_presence   1.000 -> 1.000       0.964 -> 1.000
+        every rule together  0.931 -> 1.000       0.972 -> 1.000
+
+    Recall is the other half of what this measures. Precision is cheap to buy
+    on its own — the rules could simply fire less — and the four pages that
+    exist only to be caught (a physiotherapist whose page never says
+    "appointment", a section headed Careers with no link under it, a new
+    patient form, a jotform embed) are what stops that being the fix.
+    """
+    wrong = {}
+    for name, html, expected in CORPUS:
+        url = "https://%s.test/" % re.sub(r"[^a-z]+", "-", name.lower())
+        fired = set(_codes(A.audit_from_html({url: html}, url)))
+        if fired != expected:
+            wrong[name] = {"claimed but false": sorted(fired - expected),
+                           "true but missed": sorted(expected - fired)}
+    assert not wrong, wrong
+
+    # The corpus only means something if every rule it grades is exercised by
+    # it, positives and negatives both.
+    rates = _corpus_rates()
+    for code in ("no_online_booking", "no_crm_signals", "no_lead_capture",
+                 "careers_manual", "pdf_forms", "no_social_presence"):
+        true_positives = rates[code][0]
+        assert true_positives >= 2, (code, rates[code])
+        assert true_positives < len(CORPUS), (code, rates[code])
+    print("no rule stands a substring in for the fact it claims: OK")
+
+
 if __name__ == "__main__":
     test_catalogue_services_are_real()
     test_subject_phrases_are_neutral()
@@ -1053,4 +1598,9 @@ if __name__ == "__main__":
     test_a_date_in_the_markup_is_not_a_blog()
     test_the_score_ranks_by_how_much_there_is_to_fix()
     test_what_a_business_sells_is_read_from_the_list_it_writes_it_in()
+    test_a_list_of_services_is_not_a_thing_to_book()
+    test_a_search_box_is_not_a_lead_form()
+    test_careers_has_to_head_a_job_listing()
+    test_a_marker_stops_where_the_word_stops()
+    test_no_rule_stands_a_substring_in_for_the_fact_it_claims()
     print("\nALL AUDIT TESTS PASSED")

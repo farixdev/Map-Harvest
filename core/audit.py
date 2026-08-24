@@ -300,6 +300,15 @@ _FRAMEWORK_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
 _FORM_EMBEDS = ("jotform", "typeform", "formstack", "wufoo", "docs.google.com/forms",
                 "gravityforms", "hsforms.net", "formidable", "cognitoforms")
 
+# Mailing tools, which put a signup on the page whether or not the markup shows
+# a field: most of them render the box in JavaScript or in a pop-up.
+_MAILING_LIST_MARKERS = ("list-manage.com", "mailchi.mp", "chimpstatic.com", "klaviyo",
+                         "activehosted.com", "constantcontact", "sendinblue",
+                         "brevo.com", "convertkit", "mailerlite", "aweber")
+_EMAIL_FIELD_RE = re.compile(
+    r"""(?is)<input\b[^>]*(?:type\s*=\s*["']?email|name\s*=\s*["'][^"']*e?mail)""")
+_URL_ATTR_RE = re.compile(r"""(?is)(?:src|href|action)\s*=\s*["']([^"']{4,300})["']""")
+
 # schema.org types that mean "a place customers walk into".
 _LOCALBUSINESS_TYPES = (
     "localbusiness", "restaurant", "plumber", "electrician", "dentist", "hvacbusiness",
@@ -367,6 +376,9 @@ _ASSET_RE = re.compile(
     r"\.(?:png|jpe?g|gif|webp|svg|ico|css|js|json|xml|zip|rar|mp4|mp3|avi|mov|"
     r"woff2?|ttf|eot|doc|docx|xls|xlsx|csv)(?:$|[?#])", re.I)
 
+# Matched against the parsed host, never against the href: "x.com" is inside
+# "simplex.com", so a link to a supplier counted as a social profile and the
+# finding it suppressed was one this business really did have.
 _SOCIAL_HOSTS = ("facebook.com", "fb.com", "instagram.com", "linkedin.com",
                  "twitter.com", "x.com", "youtube.com", "tiktok.com")
 _SOCIAL_JUNK_RE = re.compile(
@@ -421,9 +433,48 @@ _SERVICE_WORDS = (
     "cooling", "electrical", "dental", "legal", "accounting", "tutoring", "catering",
 )
 
+# Language that means a customer arranges a time. Not "emergency", "estimate",
+# "free quote" or "same day service": those are how a job gets priced and how
+# fast it gets done, and a quote arriving in a form is `quote_by_form` — a
+# different finding, with a different offer behind it. Reading them as booking
+# put the catalogue's highest-severity gap on top of businesses that book
+# nothing, which is the one place a wrong claim is unrecoverable.
 _APPOINTMENT_WORDS = (
-    "appointment", "book a", "booking", "schedule a", "consultation", "call us to book",
-    "same day service", "emergency", "estimate", "free quote", "walk-in", "reservation",
+    "appointment", "book a", "book an", "book your", "booking", "schedule a",
+    "schedule an", "schedule your", "consultation", "call us to book", "reservation",
+    "reserve a table", "terminvereinbarung", "termin vereinbaren", "termin buchen",
+    "cita previa", "rendez-vous",
+)
+
+# The page saying outright that it does not book times. "Walk-ins only, no
+# appointments" contains the word the rule was matching on, so the email opened
+# by contradicting the page it was quoting.
+_NO_APPOINTMENT_PHRASES = (
+    "walk-ins only", "walk in only", "walk-in only", "walk-ins welcome",
+    "no appointment", "no appointments", "without an appointment",
+    "first come, first served", "ohne termin", "sin cita previa",
+)
+
+# Work that is delivered at a time somebody has to agree to. A business whose
+# own list of what it sells reads like this books times whether or not the page
+# ever says so — and one whose list reads "CNC machining, powder coating, next
+# day delivery" does not. That distinction is the whole rule: before it, any
+# services list at all was enough, so every fabricator and wholesaler with a
+# contact form was told it was missing a booking system it has no use for.
+_BOOKABLE_WORDS = (
+    "appointment", "consultation", "consult", "treatment", "therapy", "massage",
+    "cleaning", "repair", "install", "inspection", "servicing", "service call",
+    "maintenance", "checkup", "check-up", "exam", "grooming", "detailing",
+    "haircut", "styling", "manicure", "pedicure", "facial", "tune-up",
+    "test drive", "fitting", "lesson", "tutoring", "valuation", "assessment",
+)
+
+# A site that calls itself a dentist in its own JSON-LD books times, and says so
+# in the one place on the page that cannot be a turn of phrase.
+_APPOINTMENT_SCHEMA_TYPES = (
+    "dentist", "medicalbusiness", "medicalclinic", "physician", "veterinarycare",
+    "healthandbeautybusiness", "beautysalon", "hairsalon", "spa", "autorepair",
+    "childcare", "daycare", "restaurant", "lodgingbusiness",
 )
 
 _QUOTE_PHRASES = (
@@ -436,18 +487,41 @@ _QUOTE_PHRASES = (
 # "Stellenangebote" was read as a business that is not hiring. Phrases, not bare
 # nouns, for the same reason the English list uses them: "recrutement" is what a
 # recruitment agency calls its whole business, "nous recrutons" is a vacancy.
-_CAREER_HREFS = ("/careers", "/career", "/jobs", "/join-us", "/join-our-team",
-                 "/work-with-us", "/employment", "/vacancies", "/hiring",
-                 "/karriere", "/stellenangebote", "/stellen", "/offene-stellen",
-                 "/recrutement", "/nous-rejoindre", "/offres-d-emploi",
-                 "/empleo", "/trabaja-con-nosotros", "/unete-al-equipo")
-_CAREER_WORDS = ("careers", "we're hiring", "we are hiring", "join our team",
-                 "current openings", "job openings", "now hiring", "apply now",
-                 "stellenangebote", "offene stellen", "wir stellen ein",
-                 "wir suchen verstärkung", "bewerbungen an",
-                 "nous recrutons", "offres d'emploi", "postes à pourvoir",
-                 "rejoignez notre équipe", "ofertas de empleo",
-                 "estamos contratando", "trabaja con nosotros")
+#
+# A path ends where the word ends, exactly as the booking link does. Without the
+# terminator "/careers" was inside "/blog/careers-in-the-trades/", so an article
+# about apprentice wages was read as a vacancy.
+_CAREER_LINK_RE = re.compile(
+    r"/(?:careers?|jobs?|join-us|join-our-team|work-with-us|employment|vacancies|hiring|"
+    r"karriere|stellenangebote|offene-stellen|stellen|"
+    r"recrutement|nous-rejoindre|offres-d-emploi|"
+    r"empleo|trabaja-con-nosotros|unete-al-equipo)(?:/|$|[?#.])", re.I)
+
+# Sentences that are a vacancy however they are worded. The bare words are not
+# here: "careers" and "apply now" are a heading and a button, and matched
+# anywhere in the visible text they found "Careers: jobs@clearviewhvac.ca" in a
+# contact block and "Apply now" over a credit application, then told both
+# businesses they were sifting CVs by hand.
+_HIRING_PHRASES = ("we're hiring", "we are hiring", "now hiring", "join our team",
+                   "current openings", "job openings", "send us your resume",
+                   "stellenangebote", "offene stellen", "wir stellen ein",
+                   "wir suchen verstärkung", "bewerbungen an",
+                   "nous recrutons", "offres d'emploi", "postes à pourvoir",
+                   "rejoignez notre équipe", "ofertas de empleo",
+                   "estamos contratando", "trabaja con nosotros")
+
+# The bare words earn their place when they *head* a section, which is the
+# structure a job listing actually has. Matched whole, so "Careers in the
+# trades: what an apprenticeship really pays" is still a headline about a trade.
+_CAREER_HEADINGS = frozenset({
+    "careers", "career", "careers and jobs", "jobs", "job opportunities",
+    "employment", "employment opportunities", "vacancies", "current vacancies",
+    "current openings", "open positions", "job openings", "join our team",
+    "join the team", "work with us", "work for us", "we're hiring", "we are hiring",
+    "karriere", "stellenangebote", "offene stellen", "jobs & karriere",
+    "recrutement", "offres d'emploi", "nous rejoindre",
+    "empleo", "ofertas de empleo", "trabaja con nosotros",
+})
 
 # A small business almost never links each service or gives it a heading. It
 # writes "Services" once and lists them underneath, which is the one place the
@@ -465,9 +539,15 @@ _LI_RE = re.compile(r"(?is)<li\b[^>]*>(.*?)</li\s*>")
 _BLOG_HREF_RE = re.compile(r"/(?:blog|news|articles|insights|updates|posts|stories)(?:/|$|\?)", re.I)
 _BLOG_WORDS = frozenset({"blog", "news", "articles", "insights", "stories"})
 
-_PDF_FORM_WORDS = ("form", "application", "intake", "waiver", "agreement", "contract",
-                   "registration", "questionnaire", "checklist", "new patient",
-                   "credit app", "quote request", "estimate request")
+# Whole words, and a slug read as words. "form" inside "uniform-catalogue.pdf"
+# is not paperwork, and the sentence it produced — "the uniform catalogue is a
+# PDF to print, fill in and send back" — is nonsense to the one reader who
+# knows what that file is.
+_PDF_FORM_RE = re.compile(
+    r"(?i)(?<![a-z])(?:forms?|applications?|intake|waivers?|agreements?|contracts?|"
+    r"registration|questionnaires?|checklists?|new patient|credit app|"
+    r"quote request|estimate request)(?![a-z])")
+_SLUG_RE = re.compile(r"[\-_+%/.]+")
 
 # Verbs a link label opens with before it gets to the name of the thing.
 _DOC_LEAD_RE = re.compile(
@@ -614,15 +694,63 @@ def _latest_content_date(pages, today: datetime.date):
     return max(dates) if dates else None
 
 
+# ── Forms ──
+
+
+def _is_contact_form(block: str) -> bool:
+    """A form a prospect writes to, as opposed to the site's search box."""
+    low = block.lower()
+    opening = low[:low.find(">") + 1] if ">" in low else low
+    if "search" in opening or 'role="search"' in low:
+        return False
+    if 'type="search"' in low or "type='search'" in low:
+        return False
+    if "<textarea" in low or 'type="email"' in low or "type='email'" in low:
+        return True
+    return bool(re.search(r"""name\s*=\s*["'][^"']*(?:email|message|enquiry|inquiry|comment|phone)""", low))
+
+
+def _embedded_forms(pages) -> bool:
+    """A third-party form embed, read from the URLs that load it and not from the copy.
+
+    `formidable` is a plugin directory and an ordinary English adjective both, so
+    a page that said "a formidable reputation" was credited with a lead form:
+    `no_crm_signals` went out about a form nobody can see, and `no_lead_capture`
+    — the finding that was actually true of that site — stayed silent.
+    """
+    for page in pages:
+        urls = " ".join(_URL_ATTR_RE.findall(page.low))
+        if any(embed in urls for embed in _FORM_EMBEDS):
+            return True
+    return False
+
+
+def _lead_forms(page) -> int:
+    """How many forms on `page` ask a visitor for something. Search boxes are not forms.
+
+    One filter, counted once, because two rules read this number against each
+    other: `no_lead_capture` needs it to be zero and `no_crm_signals` needs it to
+    be more. Counting raw `<form` tags here while `_is_contact_form` rejected the
+    search box made a site with nothing but a search box fire both — it was told
+    its contact form had no CRM behind it, and the true finding, that nothing on
+    the site asks for a name, was suppressed by the same box.
+    """
+    blocks = _FORM_RE.findall(page.html)
+    if blocks:
+        return sum(1 for block in blocks if _is_contact_form(block))
+    # Some builders never close the <form>, so fall back to the whole page.
+    if _FORM_OPEN_RE.search(page.html) and _is_contact_form(page.html):
+        return len(_FORM_OPEN_RE.findall(page.html))
+    return 0
+
+
 # ── Technology ──
 
 
 def _tech(pages) -> dict:
     low = "\n".join(p.low for p in pages)
 
-    forms = 0
-    for page in pages:
-        forms += len(_FORM_OPEN_RE.findall(page.html))
+    forms = sum(_lead_forms(p) for p in pages)
 
     cms = _best_vendor(low, _CMS_MARKERS)
     ecommerce = _best_vendor(low, _ECOMMERCE_MARKERS)
@@ -647,19 +775,6 @@ def _tech(pages) -> dict:
 # ── Page facts ──
 
 
-def _is_contact_form(block: str) -> bool:
-    """A form a prospect writes to, as opposed to the site's search box."""
-    low = block.lower()
-    opening = low[:low.find(">") + 1] if ">" in low else low
-    if "search" in opening or 'role="search"' in low:
-        return False
-    if 'type="search"' in low or "type='search'" in low:
-        return False
-    if "<textarea" in low or 'type="email"' in low or "type='email'" in low:
-        return True
-    return bool(re.search(r"""name\s*=\s*["'][^"']*(?:email|message|enquiry|inquiry|comment|phone)""", low))
-
-
 def _document_name(label: str, href: str) -> str:
     """What a downloadable form is called, in the words its owner uses for it.
 
@@ -678,10 +793,24 @@ def _document_name(label: str, href: str) -> str:
             continue
         if not _DOC_NAME_RE.fullmatch(name):
             continue
-        if not any(w in name for w in _PDF_FORM_WORDS):
+        if not _PDF_FORM_RE.search(name):
             continue
         return name if name.startswith("the ") else "the " + name
     return ""
+
+
+def _headings(pages) -> list[str]:
+    """Every h1-h3 the site prints, cleaned down to the words in it."""
+    out: list[str] = []
+    for page in pages:
+        for _level, body in _HEAD_RE.findall(page.html):
+            out.append(_clean_text(body).lower().strip(" :·•-–—"))
+    return out
+
+
+def _bookable(services) -> bool:
+    """True when the site's own list of what it sells is work booked for a time."""
+    return any(w in str(name).lower() for name in services for w in _BOOKABLE_WORDS)
 
 
 def _social_links(pages) -> list[str]:
@@ -689,7 +818,8 @@ def _social_links(pages) -> list[str]:
     for page in pages:
         for href, _label in page.links:
             low = href.lower()
-            if not any(h in low for h in _SOCIAL_HOSTS):
+            host = _host(low)
+            if not any(host == h or host.endswith("." + h) for h in _SOCIAL_HOSTS):
                 continue
             if _SOCIAL_JUNK_RE.search(low):
                 continue
@@ -743,16 +873,9 @@ def _signals(pages, tech: dict, base_url: str, load_ms: int) -> tuple[dict, dict
     hrefs = [(href.lower(), label.lower()) for page in pages for href, label in page.links]
 
     # ── lead routes ──
-    contact_form = False
-    for page in pages:
-        blocks = _FORM_RE.findall(page.html)
-        # Some builders never close the <form>, so fall back to the whole page.
-        if any(_is_contact_form(b) for b in blocks) or (
-                not blocks and _FORM_OPEN_RE.search(page.html) and _is_contact_form(page.html)):
-            contact_form = True
-            break
-    if not contact_form and any(e in low for e in _FORM_EMBEDS):
-        contact_form = True
+    # The boolean and the tally are the same fact counted once, so no two rules
+    # can read the same form differently.
+    contact_form = tech["forms"] > 0 or _embedded_forms(pages)
 
     booking_link = any(_BOOKING_LINK_RE.search(href) or any(t in label for t in _BOOKING_TEXT)
                        for href, label in hrefs)
@@ -768,11 +891,16 @@ def _signals(pages, tech: dict, base_url: str, load_ms: int) -> tuple[dict, dict
     has_phone = "tel:" in low or _phone_present(text)
     has_email = "mailto:" in low or "data-cfemail" in low or bool(_EMAIL_RE.search(text))
 
-    newsletter = any(w in text_low for w in ("newsletter", "mailing list", "subscribe to our"))
-    newsletter = newsletter or "list-manage.com" in low or "klaviyo" in low
+    # A newsletter is a lead route when a visitor can join it: an address field
+    # or the mailing tool's own script. The word by itself is a promise in a
+    # paragraph — "ask us to add you when you call" — and reading it as capture
+    # hid the finding on sites that have no form at all.
+    newsletter = any(m in low for m in _MAILING_LIST_MARKERS) or (
+        any(w in text_low for w in ("newsletter", "mailing list", "subscribe to our"))
+        and bool(_EMAIL_FIELD_RE.search(html_all)))
 
     quote_phrase = next((q for q in _QUOTE_PHRASES if q in text_low), "")
-    has_quote_form = bool(quote_phrase) and (contact_form or tech["forms"] > 0)
+    has_quote_form = bool(quote_phrase) and contact_form
     if quote_phrase:
         facts["quote_phrase"] = quote_phrase
 
@@ -793,14 +921,20 @@ def _signals(pages, tech: dict, base_url: str, load_ms: int) -> tuple[dict, dict
     if latest:
         facts["latest_date"] = latest.strftime("%B %Y")
 
-    careers = any(any(c in href for c in _CAREER_HREFS) for href, _ in hrefs)
-    careers = careers or any(w in text_low for w in _CAREER_WORDS)
+    # A link to a jobs page, a section headed by one, or a sentence that is a
+    # vacancy however it is phrased. An address labelled "Careers" is a way to
+    # reach somebody, not a listing, so the mail links are stepped over.
+    careers = any(_CAREER_LINK_RE.search(href) for href, _ in hrefs
+                  if not href.startswith(("mailto:", "tel:")))
+    careers = careers or any(_CAREER_LINK_RE.search(p.path) for p in pages)
+    careers = careers or any(h in _CAREER_HEADINGS for h in _headings(pages))
+    careers = careers or any(w in text_low for w in _HIRING_PHRASES)
 
     pdf_form = ""
     for href, label in hrefs:
         if ".pdf" not in href:
             continue
-        if any(w in href or w in label for w in _PDF_FORM_WORDS):
+        if _PDF_FORM_RE.search(_SLUG_RE.sub(" ", href)) or _PDF_FORM_RE.search(label):
             pdf_form = href
             facts["pdf_form"] = _document_name(label, href)
             break
@@ -827,6 +961,7 @@ def _signals(pages, tech: dict, base_url: str, load_ms: int) -> tuple[dict, dict
     schema_types += " " + " ".join(re.findall(
         r"""(?is)itemtype\s*=\s*["'][^"']*schema\.org/([A-Za-z]+)""", html_all)).lower()
     has_local_schema = any(t in schema_types for t in _LOCALBUSINESS_TYPES)
+    facts["appointment_trade"] = any(t in schema_types for t in _APPOINTMENT_SCHEMA_TYPES)
 
     viewport = bool(re.search(r"""(?is)<meta[^>]+name\s*=\s*["']viewport["'][^>]*>""", html_all))
     copyright_year = _copyright_year(pages, today)
@@ -863,6 +998,7 @@ def _signals(pages, tech: dict, base_url: str, load_ms: int) -> tuple[dict, dict
         "slow": load_ms > 3000,
     }
     facts["appointment_shaped"] = any(w in text_low for w in _APPOINTMENT_WORDS)
+    facts["takes_no_appointments"] = any(p in text_low for p in _NO_APPOINTMENT_PHRASES)
     return signals, facts
 
 
@@ -1009,14 +1145,19 @@ def _gaps(tech: dict, signals: dict, facts: dict) -> list[dict]:
     """
     fired: list[dict] = []
 
-    appointment_shaped = signals["has_contact_form"] and (
-        facts.get("appointment_shaped") or facts.get("has_services"))
+    # This gap is usually the headline, and the headline is the first sentence a
+    # stranger reads about their own website, so it asks for a business that
+    # books times and not merely for one that sells something. A page that says
+    # it takes no appointments settles the question by itself.
+    books_times = (facts.get("appointment_shaped") or facts.get("bookable_services")
+                   or facts.get("appointment_trade")) and not facts.get("takes_no_appointments")
 
-    if not signals["has_online_booking"] and appointment_shaped:
+    if (not signals["has_online_booking"] and signals["has_contact_form"]
+            and books_times):
         fired.append(_gap("no_online_booking",
                           "asking for a time means filling in the form and waiting "
                           "for someone to answer"))
-    if not tech["crm"] and (signals["has_contact_form"] or tech["forms"]):
+    if not tech["crm"] and signals["has_contact_form"]:
         fired.append(_gap("no_crm_signals",
                           "nothing is hooked up to file a name and a number after the "
                           "form is sent"))
@@ -1028,7 +1169,7 @@ def _gaps(tech: dict, signals: dict, facts: dict) -> list[dict]:
             and not signals["has_online_booking"] and not signals["has_phone"]):
         fired.append(_gap("contact_form_only",
                           "the form is the only way in: no chat, no booking, no number to tap"))
-    if not signals["has_contact_form"] and not signals["has_newsletter"] and tech["forms"] == 0:
+    if not signals["has_contact_form"] and not signals["has_newsletter"]:
         fired.append(_gap("no_lead_capture",
                           "nothing on the site asks a visitor for a name or an email"))
     if not tech["chat"]:
@@ -1182,7 +1323,7 @@ def _audit(pages: dict, base_url: str, *, final_url: str = "", status: int = 0,
     title, description, h1, brand = _meta(ordered, home_url)
     services = _services(ordered, title, brand)
     signals, facts = _signals(ordered, tech, home_url, load_ms)
-    facts["has_services"] = bool(services)
+    facts["bookable_services"] = _bookable(services)
     gaps = _gaps(tech, signals, facts)
 
     result.update({
