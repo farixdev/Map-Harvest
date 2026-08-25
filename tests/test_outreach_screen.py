@@ -24,6 +24,7 @@ so constructing it can never read or write a developer's real ~/.mapharvest —
 database goes to the same place.
 """
 import contextlib
+import json
 import os
 import sys
 import tempfile
@@ -721,6 +722,10 @@ def test_every_hint_on_the_screen_uses_that_colour():
 def _extra_leads(count: int):
     """`count` throwaway leads in the store, with the screen showing them."""
     screen = _screen()
+    screen.resize(QSize(*DEFAULT_SIZE))
+    screen._goto_tab(0)
+    screen.layout().activate()
+    _app().processEvents()
     conn = DB.connect(os.path.join(_TMP, "outreach.db"))
     for index in range(count):
         DB.upsert_lead(conn, {"email": "bulk%04d@example.com" % index,
@@ -734,6 +739,7 @@ def _extra_leads(count: int):
     finally:
         conn.execute("DELETE FROM leads WHERE source = 'bulk'")
         conn.commit()
+        screen.lead_search.setText("")
         screen.status_filter.setCurrentIndex(0)
         screen._reload_leads()
         _app().processEvents()
@@ -994,6 +1000,661 @@ def test_a_theme_change_does_not_go_back_to_the_store_for_the_leads():
         "the rebuilt table does not hold the leads the screen was holding"
     assert screen._lead_at(0) is screen._leads[0], \
         "the rebuilt table lost the row-to-record mapping"
+
+
+# ── P3: the table must not build a cell for a lead nobody is looking at ──────
+# The first finding closed the O(N²) audit tick. What was left was the constant:
+# every pass that rebuilt the table built a `QTableWidgetItem` per cell for
+# every lead in the store — 35,000 of them at 5,000 leads, for the twenty rows
+# an 800px window can show. These count items rather than milliseconds for the
+# same reason the P1 tests count row visits: the claim is about what the work is
+# proportional to, and a fast machine cannot tell 20 from 5,000 on a clock.
+
+
+@contextlib.contextmanager
+def _leads_tab_restored():
+    """Put the leads tab back the way the rest of this file expects it.
+
+    The screen is a module singleton, so a test that hides a column or saves a
+    view is writing state every test after it will read — and the tests above
+    leave it on the Sending tab at the window's minimum, where the lead table
+    has no laid-out viewport to answer questions about.
+    """
+    screen = _screen()
+    screen.resize(QSize(*DEFAULT_SIZE))
+    screen._goto_tab(0)
+    screen.layout().activate()
+    _app().processEvents()
+    try:
+        yield screen
+    finally:
+        screen._views = []
+        screen._view_name = ""
+        screen._set_columns(range(len(SO._LEAD_COLUMNS)))
+        screen.lead_search.setText("")
+        screen.status_filter.setCurrentIndex(0)
+        screen._sort = (SO._COL_SCORE, Qt.DescendingOrder)
+        screen._save_view_state(now=True)
+        screen._reload_leads()
+        _app().processEvents()
+
+
+def _built_rows(screen) -> int:
+    """How many of the table's rows are actually made of cells."""
+    table = screen.lead_table
+    return sum(1 for row in range(table.rowCount())
+               if table.item(row, 0) is not None)
+
+
+def test_only_the_rows_on_screen_are_made_of_cells():
+    """A row per lead so the scrollbar is honest; cells only where they show.
+
+    The old fill built every cell of every row. At 5,000 leads that was 35,000
+    items and 2,379ms of the 2,648ms pass inside `components._Table.add_row`,
+    once per reload, once per header click, and once at the end of every audit
+    run. Measured on the same store, before and after, back to back:
+    `_fill_table` 677ms -> 29ms, a column-header sort 781ms -> 32ms.
+    """
+    with _extra_leads(400) as screen:
+        table = screen.lead_table
+        assert table.rowCount() == len(screen._leads) == 403, table.rowCount()
+        built = _built_rows(screen)
+        assert built < 120, (
+            "%d of %d rows were built for a window that shows about twenty"
+            % (built, table.rowCount()))
+        assert built >= 1, "nothing was built at all"
+        assert screen._painted, "the screen does not know what it built"
+        assert built == len(screen._painted), (
+            "the screen thinks it built %d rows and the table holds %d"
+            % (len(screen._painted), built))
+
+
+def test_a_bigger_list_does_not_build_a_bigger_table():
+    """The whole of the second finding, as a number that must not move."""
+    with _extra_leads(100) as screen:
+        small = _built_rows(screen)
+    with _extra_leads(600) as screen:
+        large = _built_rows(screen)
+    assert large <= small + 8, (
+        "a 103-row table built %d rows and a 603-row one built %d — the work "
+        "is still proportional to the list" % (small, large))
+
+
+def test_a_filter_that_hides_almost_everything_builds_almost_nothing():
+    """The band is a stretch of the model, not a list of rows to build.
+
+    A search matching nothing leaves `rowAt(0)` with no visible row to answer
+    with, so the walk that finds the bottom of the band runs to the end of the
+    table. Painting that band whole would build the 35,000 items the virtual
+    window exists to avoid — on the keystroke that matched nothing.
+
+    The rows already built stay built; they are off screen and they cost
+    nothing to leave alone. What must not happen is the other 367 joining them.
+    """
+    with _extra_leads(400) as screen:
+        app = _app()
+        was = _built_rows(screen)
+        screen.lead_search.setText("nothing here matches this")
+        app.processEvents()
+        assert screen._visible == 0, screen._visible
+        assert _built_rows(screen) <= was, (
+            "a search that matched nothing built %d rows on top of the %d "
+            "already there" % (_built_rows(screen) - was, was))
+
+        screen.lead_search.setText("Bulk Business 0399")
+        app.processEvents()
+        assert screen._visible == 1, screen._visible
+        assert _built_rows(screen) <= was + 2, (
+            "one matching lead out of 403 brought %d more rows with it"
+            % (_built_rows(screen) - was))
+
+
+def test_scrolling_builds_the_row_it_scrolled_to():
+    """A row the user cannot see has no cells, and gets them the moment it shows."""
+    with _extra_leads(400) as screen:
+        table, app = screen.lead_table, _app()
+        last = table.rowCount() - 1
+        assert table.item(last, 0) is None, \
+            "the bottom of a 403-row table was built before anyone looked"
+        # `scrollToBottom` and not `setValue(maximum())`: the view lays itself
+        # out on a posted event, so a scrollbar asked for its range in the same
+        # turn as the rows were counted still answers 0.
+        table.scrollToBottom()
+        app.processEvents()
+        item = table.item(last, 0)
+        assert item is not None, "scrolling to the end left an empty row"
+        expected = SO._text_of(screen._lead_at(last).get("name")).strip() or "—"
+        assert item.text() == expected, (
+            "row %d reads %r and holds %r" % (last, item.text(), expected))
+        assert _built_rows(screen) < 400, \
+            "a scroll to the end kept every row it passed"
+
+
+def test_a_selection_of_hundreds_is_counted_rather_than_listed():
+    """`selectedIndexes()` is one object per cell, and there are seven per row.
+
+    Ctrl+A over 5,000 leads handed the label refresh 35,000 `QModelIndex`
+    objects to build a set of 5,000 numbers from, on the keystroke and again
+    for every button label. The ranges know the answer: 196ms -> 8ms.
+    """
+    with _extra_leads(400) as screen:
+        table, app = screen.lead_table, _app()
+        table.selectAll()
+        app.processEvents()
+        assert screen._selected_count() == table.rowCount()
+        assert screen.audit_btn.text() == "Audit selected (%d)" % table.rowCount()
+
+        indexes = len(table.selectedIndexes())
+        assert indexes == table.rowCount() * table.columnCount(), indexes
+        assert screen._selected_count() * table.columnCount() == indexes, (
+            "the count and the indexes disagree: %d rows, %d cells"
+            % (screen._selected_count(), indexes))
+        table.clearSelection()
+        app.processEvents()
+
+
+@contextlib.contextmanager
+def _counting_personalisation():
+    """Count the `core.templates` calls a reload makes. The expensive one."""
+    calls = []
+    real = SO._templates.personalisation
+
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    SO._templates.personalisation = counted
+    try:
+        yield calls
+    finally:
+        SO._templates.personalisation = real
+
+
+def test_a_reload_keeps_what_the_record_did_not_change():
+    """Suppressing one lead used to re-derive five thousand headline gaps.
+
+    The three derived caches were emptied wholesale on every reload, so one row
+    moving cost a JSON decode and a `core.templates.personalisation` call for
+    every lead in the store — 76ms of the reload at 5,000, for a question none
+    of them had a new answer to.
+    """
+    with _extra_leads(60) as screen:
+        conn = DB.connect(os.path.join(_TMP, "outreach.db"))
+        conn.execute("UPDATE leads SET audit_json = ? WHERE source = 'bulk'",
+                     ('{"gaps": [{"title": "No online booking"}]}',))
+        conn.commit()
+        screen._reload_leads()
+        held = dict(screen._gaps)
+        assert len(held) >= 60, "the reload derived nothing to keep"
+
+        with _counting_personalisation() as calls:
+            screen._reload_leads()
+        assert not calls, (
+            "an unchanged store asked core.templates %d times again"
+            % len(calls))
+        assert screen._gaps == held, "an unchanged store threw the answers away"
+
+        moved = screen._leads[0]
+        lead_id = SO._int_of(moved.get("id"))
+        DB.upsert_lead(conn, {"email": moved.get("email"),
+                              "audit_json": '{"gaps": [{"title": "No live chat"}]}'})
+        with _counting_personalisation() as calls:
+            screen._reload_leads()
+        assert len(calls) <= 1, (
+            "one changed lead cost %d personalisation calls" % len(calls))
+        assert screen._gaps.get(lead_id) != held.get(lead_id), \
+            "the lead whose crawl changed kept its old headline gap"
+        assert len(screen._gaps) >= len(held) - 1, \
+            "one changed lead emptied the whole cache again"
+
+
+def test_a_settings_change_does_not_leave_a_stale_answer_behind():
+    """The personalisation answer depends on the profile, not only on the lead.
+
+    Keeping the caches across a reload is only safe if what they were derived
+    from is compared in full — and half of that is the sender profile the
+    `core.templates` call reads. A stamp that only watched the record would
+    leave every Headline gap on screen answering for a company the user has
+    since renamed.
+    """
+    with _extra_leads(60) as screen:
+        conn = DB.connect(os.path.join(_TMP, "outreach.db"))
+        conn.execute("UPDATE leads SET audit_json = ? WHERE source = 'bulk'",
+                     ('{"gaps": [{"title": "No online booking"}]}',))
+        conn.commit()
+        screen._reload_leads()
+        assert screen._gaps, "nothing was derived to go stale"
+
+        saved = screen.settings.get("sender_profile")
+        try:
+            screen.settings = dict(screen.settings,
+                                   sender_profile={"company": "Somewhere Else"})
+            with _counting_personalisation() as calls:
+                screen._reload_leads()
+            assert len(calls) >= 60, (
+                "a changed sender profile re-asked core.templates %d times; "
+                "every audited lead's answer depends on it" % len(calls))
+            assert screen._rules_stamp == SO._rules_stamp(screen.settings), \
+                "the screen did not notice the settings had moved"
+        finally:
+            screen.settings = dict(screen.settings, sender_profile=saved)
+            screen._reload_leads()
+
+
+# ── B1: which columns the table shows ────────────────────────────────────────
+
+def test_a_hidden_column_leaves_no_gap_in_the_table():
+    """Hidden in place is not the same as absent from the spec.
+
+    `components._Table` shares the window out between the columns it was
+    handed, so a column hidden after the fact keeps its share and leaves a band
+    of unpainted table beside the last one. The table is rebuilt from the
+    columns that are wanted instead.
+    """
+    with _leads_tab_restored() as screen:
+        app = _app()
+        wanted = (SO._COL_NAME, SO._COL_EMAIL, SO._COL_SCORE, SO._COL_GAP)
+        before = {field: screen.lead_table.columnWidth(field)
+                  for field in wanted}
+
+        screen._set_columns(wanted)
+        app.processEvents()
+        table = screen.lead_table
+        assert table.columnCount() == len(wanted), table.columnCount()
+        assert [table.horizontalHeaderItem(i).text()
+                for i in range(table.columnCount())] == \
+            [SO._LEAD_COLUMNS[f].title for f in wanted]
+
+        after = {field: table.columnWidth(column)
+                 for column, field in enumerate(wanted)}
+        narrower = {SO._LEAD_COLUMNS[f].title: (before[f], after[f])
+                    for f in wanted if after[f] < before[f]}
+        assert not narrower, (
+            "switching three columns off left the rest no wider — the space "
+            "went to the columns that are not painted: %s" % narrower)
+        assert sum(after.values()) > sum(before.values()), (
+            "the four remaining columns take %dpx, the same four took %dpx "
+            "when there were seven" % (sum(after.values()), sum(before.values())))
+        assert table.item(0, 2).data(SO._BADGE_ROLE) is not None, \
+            "the score badge lost its value when the column moved"
+
+
+def test_business_cannot_be_switched_off():
+    """A table of nameless rows is a state no user should be able to reach."""
+    with _leads_tab_restored() as screen:
+        screen._set_columns({SO._COL_EMAIL})
+        assert SO._COL_NAME in screen._fields, screen._fields
+        assert screen.lead_table.columnCount() == 2, \
+            "Business did not come back with the one column that was asked for"
+
+
+def test_the_chosen_columns_outlive_the_screen():
+    """A column switched off this morning is off again this afternoon."""
+    with _leads_tab_restored() as screen:
+        screen._set_columns({SO._COL_NAME, SO._COL_EMAIL, SO._COL_STATUS})
+        with open(SO._views_path(), encoding="utf-8") as handle:
+            stored = json.load(handle)
+        assert stored["columns"] == ["name", "email", "status"], stored["columns"]
+        assert SO._fields_from_keys(stored["columns"], ()) == \
+            (SO._COL_NAME, SO._COL_EMAIL, SO._COL_STATUS)
+
+
+def test_a_sort_survives_the_column_it_sorts_on_being_hidden():
+    """The screen sorts by a field; a column is only where a field is painted."""
+    with _leads_tab_restored() as screen:
+        screen._on_header_clicked(0)                      # Business, ascending
+        assert screen._sort[0] == SO._COL_NAME
+        ordered = [SO._text_of(lead.get("name")) for lead in screen._leads]
+
+        screen._set_columns({SO._COL_NAME, SO._COL_EMAIL, SO._COL_SCORE})
+        assert screen._sort[0] == SO._COL_NAME, screen._sort
+        assert [SO._text_of(lead.get("name")) for lead in screen._leads] == ordered
+
+        screen._set_columns({SO._COL_EMAIL, SO._COL_SCORE})
+        assert [SO._text_of(lead.get("name")) for lead in screen._leads] == ordered, \
+            "hiding the sorted column reordered the table"
+
+
+# ── B2: a filter worth coming back to ────────────────────────────────────────
+
+def test_a_saved_view_comes_back_whole():
+    """A view is a filter, a sort and a set of columns under a name."""
+    with _leads_tab_restored() as screen:
+        app = _app()
+        screen.lead_search.setText("city:toronto")
+        screen.status_filter.setCurrentIndex(
+            [key for _label, key in SO._STATUS_FILTERS].index("audited"))
+        screen._on_header_clicked(0)
+        screen._set_columns({SO._COL_NAME, SO._COL_EMAIL, SO._COL_GAP})
+        app.processEvents()
+        screen._store_view("Toronto audited")
+
+        screen._clear_view()
+        app.processEvents()
+        assert screen.lead_search.text() == ""
+        assert screen._wanted_status() == ""
+        assert screen._view_name == ""
+
+        screen._apply_view("Toronto audited")
+        app.processEvents()
+        assert screen.lead_search.text() == "city:toronto"
+        assert screen._wanted_status() == "audited"
+        assert screen._sort[0] == SO._COL_NAME
+        assert screen.lead_table.columnCount() == 3
+        assert screen._view_name == "Toronto audited"
+
+
+def test_changing_a_filter_makes_it_an_unsaved_view():
+    """A saved view is only worth anything if it stays what it was saved as."""
+    with _leads_tab_restored() as screen:
+        app = _app()
+        screen._store_view("Everything")
+        assert "Everything" in screen.view_btn.text(), screen.view_btn.text()
+
+        screen.lead_search.setText("plumbing")
+        app.processEvents()
+        assert screen._view_name == "", \
+            "typing in the filter box rewrote the saved view under the user"
+        assert screen.view_btn.text() == "Views"
+        assert [view["name"] for view in screen._views] == ["Everything"], \
+            "the saved view itself was lost"
+
+
+def test_a_view_is_stored_by_column_name_not_by_index():
+    """A column added to the spec must not renumber a view saved last month."""
+    with _leads_tab_restored() as screen:
+        screen._set_columns({SO._COL_NAME, SO._COL_SCORE})
+        screen._store_view("Just the scores")
+        with open(SO._views_path(), encoding="utf-8") as handle:
+            stored = json.load(handle)
+        view = stored["views"][0]
+        assert view["columns"] == ["name", "score"], view
+        assert view["sort"][0] in SO._FIELD_OF_KEY, view["sort"]
+        assert not any(isinstance(value, int) for value in view["columns"])
+
+
+def test_a_keystroke_does_not_reach_the_disk_and_a_decision_does():
+    """A write-then-rename per character typed is 3.6ms of GUI-thread disk.
+
+    The file still has to be right — what is put off is only the write, and
+    only for the churn. Saving a view is a decision the user is owed the file
+    for, so it goes down in the same call.
+    """
+    with _leads_tab_restored() as screen:
+        app = _app()
+        writes = []
+        real = SO._write_views
+
+        def counted(state):
+            writes.append(dict(state))
+            return real(state)
+
+        SO._write_views = counted
+        try:
+            screen.lead_search.setText("roof")
+            screen.lead_search.setText("roofing")
+            app.processEvents()
+            assert not writes, "two keystrokes cost %d writes" % len(writes)
+            assert screen._save_timer.isActive(), \
+                "the write was skipped rather than put off"
+
+            screen._flush_view_state()
+            assert len(writes) == 1, len(writes)
+            assert writes[-1]["search"] == "roofing", writes[-1]
+
+            screen._store_view("Roofers")
+            assert len(writes) == 2, \
+                "saving a view did not reach the disk in the same call"
+            assert writes[-1]["current"] == "Roofers", writes[-1]
+        finally:
+            SO._write_views = real
+
+
+def test_the_filter_the_app_closed_on_is_the_one_it_opens_on():
+    """The lead filters survived a tab switch; a named view has to survive a night."""
+    with _leads_tab_restored() as screen:
+        app = _app()
+        screen.lead_search.setText("category:roofing")
+        screen.status_filter.setCurrentIndex(
+            [key for _label, key in SO._STATUS_FILTERS].index("audited"))
+        screen._set_columns({SO._COL_NAME, SO._COL_CITY})
+        app.processEvents()
+
+        second = SO.OutreachScreen()
+        try:
+            assert second.lead_search.text() == "category:roofing", \
+                second.lead_search.text()
+            assert second._wanted_status() == "audited"
+            assert second._fields == (SO._COL_NAME, SO._COL_CITY), second._fields
+            assert second.lead_table.columnCount() == 2
+        finally:
+            second._tick.stop()
+            second.deleteLater()
+            app.processEvents()
+
+
+# ── B3: what a selection can be told to do ───────────────────────────────────
+
+def test_every_bulk_action_reads_the_same_selection():
+    """Four actions, one selection, and every label says how many rows it acts on."""
+    with _leads_tab_restored() as screen:
+        app = _app()
+        table = screen.lead_table
+        table.clearSelection()
+        table.selectRow(0)
+        table.selectionModel().select(
+            table.model().index(1, 0),
+            table.selectionModel().Select | table.selectionModel().Rows)
+        app.processEvents()
+        assert screen._selected_count() == 2, screen._selected_count()
+        assert screen.audit_btn.text() == "Audit selected (2)"
+        assert screen.suppress_btn.text() == "Suppress 2…"
+        assert screen.remove_btn.text() == "Remove 2…"
+        assert screen.export_btn.text() == "Export 2…"
+        assert screen.copy_btn.text() == "Copy 2"
+        for button in (screen.suppress_btn, screen.remove_btn,
+                       screen.export_btn, screen.copy_btn):
+            assert button.isEnabled() and button.toolTip(), button.text()
+
+        table.clearSelection()
+        app.processEvents()
+        assert screen.remove_btn.text() == "Remove…"
+        assert not screen.remove_btn.isEnabled()
+        assert screen.remove_btn.toolTip(), \
+            "a disabled bulk action with nothing to read"
+
+
+def test_export_writes_the_rows_the_filter_shows_and_every_column():
+    """The filter is the list; switching a column off is not a redaction.
+
+    Exporting what is *shown* is the point — a filter narrowed to one lead is
+    the list the user built. Exporting only the columns on screen would not be:
+    hiding the Email column to read the table more easily is not an instruction
+    to throw the addresses away on the way out of the app.
+    """
+    with _leads_tab_restored() as screen:
+        app = _app()
+        target = os.path.join(_TMP, "exported-leads.csv")
+        screen.lead_search.setText("alpha")
+        screen._set_columns({SO._COL_NAME, SO._COL_SCORE})
+        app.processEvents()
+        assert screen._visible == 1, screen._visible
+
+        saved = SO.QFileDialog.getSaveFileName
+        SO.QFileDialog.getSaveFileName = staticmethod(lambda *a, **k: (target, ""))
+        try:
+            screen._on_export_clicked()
+        finally:
+            SO.QFileDialog.getSaveFileName = saved
+
+        with open(target, encoding="utf-8-sig") as handle:
+            lines = [line.rstrip("\n").rstrip("\r") for line in handle]
+        assert len(lines) == 2, "the filter shows one lead and the CSV has %d rows" \
+            % (len(lines) - 1)
+        assert lines[0].startswith(
+            ",".join(column.title for column in SO._LEAD_COLUMNS)), (
+            "the two columns switched off were left out of the file: %r"
+            % lines[0])
+        assert lines[0].endswith("Phone,Website,Source"), lines[0]
+        assert "Alpha Plumbing" in lines[1]
+        assert "alpha@example.com" in lines[1], \
+            "the hidden Email column was redacted out of the export"
+        assert ",88," in lines[1], \
+            "the score went out as a badge rather than as a number: %r" % lines[1]
+
+
+def test_remove_forgets_the_selection_without_unsubscribing_it():
+    """Suppress and Remove are not the same promise, and must not be confused.
+
+    A suppressed address is kept precisely so it can never be mailed again.
+    A removed lead is one that should not have been imported, and importing it
+    again tomorrow has to work.
+    """
+    with _leads_tab_restored() as screen:
+        app = _app()
+        conn = DB.connect(os.path.join(_TMP, "outreach.db"))
+        DB.upsert_lead(conn, {"email": "doomed@example.com", "name": "Doomed Ltd",
+                              "status": "new", "source": "test"})
+        screen._reload_leads()
+        before = len(screen._leads)
+        lead = next(l for l in screen._leads
+                    if l.get("email") == "doomed@example.com")
+
+        agreed = CO.confirm
+        CO.confirm = lambda *args, **kwargs: True
+        try:
+            screen._remove([lead])
+        finally:
+            CO.confirm = agreed
+        app.processEvents()
+
+        assert len(screen._leads) == before - 1, len(screen._leads)
+        assert "doomed@example.com" not in \
+            [l.get("email") for l in screen._leads]
+        assert screen.lead_table.rowCount() == before - 1
+        assert not DB.is_suppressed(conn, "doomed@example.com"), \
+            "Remove quietly unsubscribed an address as well as forgetting it"
+        assert DB.upsert_lead(conn, {"email": "doomed@example.com",
+                                     "name": "Doomed Ltd", "source": "test"}), \
+            "a removed lead cannot be imported again"
+        conn.execute("DELETE FROM leads WHERE email = ?", ("doomed@example.com",))
+        conn.commit()
+
+
+def test_remove_asks_before_it_forgets_anything():
+    with _leads_tab_restored() as screen:
+        asked = {}
+        agreed = CO.confirm
+        CO.confirm = lambda *args, **kwargs: asked.update(kwargs) or False
+        try:
+            screen._remove([screen._leads[0]])
+        finally:
+            CO.confirm = agreed
+        assert asked.get("danger") is True, asked
+        assert "Forget" in asked.get("title", ""), asked
+        assert "Suppress" in asked.get("body", ""), \
+            "the dialog does not say which of the two this is"
+        assert len(screen._leads) == 3, "a declined Remove removed something"
+
+
+# ── B4: the filter box ───────────────────────────────────────────────────────
+
+def test_two_words_in_two_fields_find_the_lead_that_says_both():
+    """`toronto roofing` used to match nothing at all.
+
+    The record says "Toronto" in the city and "Roofing contractor" in the
+    category, the two are newline-joined so a needle cannot span them, and a
+    single-substring match therefore had no way to ask for both. Every word is
+    a needle now, and each has to land somewhere.
+    """
+    with _leads_tab_restored() as screen:
+        conn = DB.connect(os.path.join(_TMP, "outreach.db"))
+        DB.upsert_lead(conn, {"email": "roofer@example.com", "name": "Peak Cover",
+                              "city": "Toronto", "category": "Roofing contractor",
+                              "status": "new", "source": "test"})
+        DB.upsert_lead(conn, {"email": "plumber@example.com", "name": "Peak Pipes",
+                              "city": "Toronto", "category": "Plumber",
+                              "status": "new", "source": "test"})
+        try:
+            screen._reload_leads()
+            assert _shown(screen, "toronto roofing") == {"Peak Cover"}
+            assert _shown(screen, "toronto") == {"Peak Cover", "Peak Pipes"}
+            assert _shown(screen, "peak plumber") == {"Peak Pipes"}
+            assert _shown(screen, "toronto nowhere") == set()
+        finally:
+            conn.execute("DELETE FROM leads WHERE source = 'test' "
+                         "AND email LIKE '%er@example.com'")
+            conn.commit()
+
+
+def test_a_field_in_front_of_the_colon_looks_in_that_field_alone():
+    with _leads_tab_restored() as screen:
+        conn = DB.connect(os.path.join(_TMP, "outreach.db"))
+        DB.upsert_lead(conn, {"email": "a@example.com", "name": "Toronto Roofing",
+                              "city": "Hamilton", "category": "Roofing contractor",
+                              "status": "new", "source": "test"})
+        DB.upsert_lead(conn, {"email": "b@example.com", "name": "Peak Cover",
+                              "city": "Toronto", "category": "Dentist",
+                              "status": "new", "source": "test"})
+        try:
+            screen._reload_leads()
+            assert _shown(screen, "toronto") == {"Toronto Roofing", "Peak Cover"}
+            assert _shown(screen, "city:toronto") == {"Peak Cover"}
+            assert _shown(screen, "business:toronto") == {"Toronto Roofing"}
+            assert _shown(screen, "category:dentist") == {"Peak Cover"}
+            # A colon that is not a field is text, not a bad query.
+            assert _shown(screen, "nosuchfield:toronto") == set()
+        finally:
+            conn.execute("DELETE FROM leads WHERE email IN "
+                         "('a@example.com', 'b@example.com')")
+            conn.commit()
+
+
+def test_a_quoted_phrase_stays_one_needle():
+    """One *term* still has to sit inside one field, which is what quoting says."""
+    with _leads_tab_restored() as screen:
+        conn = DB.connect(os.path.join(_TMP, "outreach.db"))
+        DB.upsert_lead(conn, {"email": "c@example.com", "name": "Roofing",
+                              "city": "Barrie", "category": "Contractor",
+                              "status": "new", "source": "test"})
+        DB.upsert_lead(conn, {"email": "d@example.com", "name": "Peak Cover",
+                              "city": "Barrie", "category": "Roofing contractor",
+                              "status": "new", "source": "test"})
+        try:
+            screen._reload_leads()
+            assert _shown(screen, '"roofing contractor"') == {"Peak Cover"}
+            assert _shown(screen, "roofing contractor") == \
+                {"Peak Cover", "Roofing"}
+        finally:
+            conn.execute("DELETE FROM leads WHERE email IN "
+                         "('c@example.com', 'd@example.com')")
+            conn.commit()
+
+
+def test_the_query_parser_reads_what_the_user_typed():
+    assert SO._parse_query("toronto") == [("", "toronto")]
+    assert SO._parse_query("toronto roofing") == \
+        [("", "toronto"), ("", "roofing")]
+    assert SO._parse_query("city:Toronto") == [("city", "toronto")]
+    assert SO._parse_query('city:"north york"') == [("city", "north york")]
+    assert SO._parse_query('"roofing contractor"') == [("", "roofing contractor")]
+    assert SO._parse_query("business:peak") == [("name", "peak")]
+    # Not a field, so not a query — a time is a string like any other.
+    assert SO._parse_query("9:30") == [("", "9:30")]
+    assert SO._parse_query("   ") == []
+
+
+def _shown(screen, needle) -> set:
+    """The business names the filter box leaves on screen for `needle`."""
+    screen.lead_search.setText(needle)
+    _app().processEvents()
+    table = screen.lead_table
+    names = {SO._text_of(screen._lead_at(row).get("name"))
+             for row in range(table.rowCount()) if not table.isRowHidden(row)}
+    assert screen._visible == len(names), (
+        "the count line says %d and %d rows are shown"
+        % (screen._visible, len(names)))
+    return names
 
 
 def test_close_all_at_exit():

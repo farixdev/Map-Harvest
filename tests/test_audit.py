@@ -303,7 +303,13 @@ def test_careers_page():
     assert result["tech"]["chat"] == "intercom", result["tech"]
     assert result["tech"]["crm"] == "hubspot", result["tech"]
     assert result["tech"]["booking"] == "calendly", result["tech"]
-    assert result["tech"]["analytics"] == ["ga4"], result["tech"]
+    # Was `== ["ga4"]`. This page loads js.hs-scripts.com, which is HubSpot's
+    # page-view tracking as well as its CRM and its chat widget, so a site with
+    # that one script on it is measured whether or not Google is also watching.
+    # Reading the script as a CRM and nothing else is what put "no analytics on
+    # any page, so last month's visits went uncounted" in front of businesses
+    # that count them.
+    assert result["tech"]["analytics"] == ["ga4", "hubspot"], result["tech"]
     assert result["signals"]["has_online_booking"] is True
     for absent in ("no_live_chat", "no_crm_signals", "no_online_booking", "no_analytics"):
         assert absent not in codes, (absent, codes)
@@ -1397,13 +1403,19 @@ list when you call.</p>
 <input type="email" name="EMAIL" placeholder="Email"><button>Subscribe</button></form>
 """,
         _BASE_GAPS),
+    # Relabelled. This page was labelled `no_live_chat` and `no_analytics` when
+    # HubSpot was held in the CRM table only, and both were wrong about it:
+    # js.hs-scripts.com is the loader for HubSpot Conversations and for HubSpot's
+    # page-view tracking as well as for the CRM, so the site this markup
+    # describes has a chat box in the corner and a record of last month's
+    # visits. Two false sentences out of one script the tables half knew.
     _labelled(
         "Northwind Logistics Software", """
 <h1>Northwind Logistics Software</h1>
 <h2>What we do</h2><ul><li>Fleet dispatch software</li><li>Route optimisation</li>
 <li>Integration support</li></ul>
 """ + _LEAD_FORM,
-        _BASE_GAPS,
+        _BASE_GAPS - {"no_live_chat", "no_analytics"},
         head='<script src="https://js.hs-scripts.com/1234567.js"></script>\n'),
 
     # ── "Careers" has to head a job listing ──
@@ -1510,10 +1522,330 @@ and three other mills.</p>
 )
 
 
-def _corpus_rates() -> dict:
-    """Per-rule (true positives, false positives, false negatives) over CORPUS."""
+# ── A second corpus: the fact behind a threshold, and behind a vendor list ──
+
+# Thirty-one more pages, every label written down before a line of the rules was
+# touched. The corpus above catches a rule that matched a *word* where it meant a
+# structure. These are the two remaining shapes of the same mistake.
+#
+# A threshold standing in for the fact. `price_opaque` asked for three money
+# matches anywhere in the whole crawl, so a page that publishes one or two prices
+# read as a page that publishes none — and the email opened by telling a business
+# with its rates on the home page that it has none. The same threshold read three
+# discounts as a price list.
+#
+# A vendor list standing in for the fact. `no_live_chat`, `no_online_booking`,
+# `no_analytics`, `no_crm_signals` and `ecommerce_manual` each ask "is one of
+# these seven scripts on the page" and answer "no such thing exists here" when
+# the site runs the eighth. Every page in that half carries a real product the
+# tables did not hold, and a person looking at the page can see the chat box.
+#
+# And the lookalikes, for the same reason they are up there: a discount is not a
+# price, "Booking terms" is not a booking system, "let's have a chat" is not a
+# chat box, and a page that says its prices are competitive has published none.
+
+PRICE_AND_VENDOR_CORPUS: tuple[tuple[str, str, frozenset], ...] = (
+    # ── One or two prices is not "no pricing anywhere" ──
+    _labelled(
+        "Kestrel Dog Grooming", """
+<h1>Kestrel Dog Grooming</h1>
+<h2>Grooming</h2>
+<ul><li>Full groom &mdash; $65</li><li>Nail trim &mdash; $15</li></ul>
+<p>Call the shop and we will find you a slot this week.</p>
+""" + _LEAD_FORM,
+        (_BASE_GAPS - {"price_opaque"}) | {"no_crm_signals", "no_online_booking"}),
+    _labelled(
+        "Tempo Driving School", """
+<h1>Tempo Driving School</h1>
+<h2>Driving lessons</h2>
+<p>Lessons are $60 per hour, with a ten-lesson package at $550.</p>
+<p>Tell us where you are and we will meet you at your door.</p>
+""" + _LEAD_FORM,
+        (_BASE_GAPS - {"price_opaque"}) | {"no_crm_signals", "no_online_booking"}),
+    _labelled(
+        "Ridgeway Self Storage", """
+<h1>Ridgeway Self Storage</h1>
+<h2>Unit sizes</h2>
+<table><tr><td>5x10</td><td>$89 per month</td></tr>
+<tr><td>10x10</td><td>$145 per month</td></tr>
+<tr><td>10x20</td><td>$210 per month</td></tr></table>
+<p>Drive-up access seven days a week.</p>
+""" + _LEAD_FORM,
+        (_BASE_GAPS - {"price_opaque"}) | {"no_crm_signals"}),
+    _labelled(
+        "Fen Lane Physiotherapy", """
+<h1>Fen Lane Physiotherapy</h1>
+<h2>Treatments</h2><ul><li>Manual therapy</li><li>Post-surgical rehabilitation</li></ul>
+<h2>Fees</h2><p>Initial assessment $110. Follow-up visits are thirty minutes.</p>
+""" + _LEAD_FORM,
+        (_BASE_GAPS - {"price_opaque"}) | {"no_crm_signals", "no_online_booking"}),
+    _labelled(
+        "Stonebridge Cabinetry", """
+<h1>Stonebridge Cabinetry</h1>
+<h2>What we do</h2><ul><li>Bespoke kitchen cabinetry</li><li>Fitted wardrobes</li>
+<li>Solid surface worktops</li></ul>
+<p>Kitchens start from &pound;12,000.</p>
+""" + _LEAD_FORM,
+        (_BASE_GAPS - {"price_opaque"}) | {"no_crm_signals"}),
+    # Three money matches and not a price among them: the page is advertising
+    # what it takes off, which is the shape the old threshold could not tell
+    # apart from a rate card.
+    _labelled(
+        "Argyle Auto Detailing", """
+<h1>Argyle Auto Detailing</h1>
+<h2>Detailing packages</h2>
+<p>Save $50 on your first service, $25 off referrals and $0 down on the monthly plan.</p>
+<ul><li>Interior detailing</li><li>Paint correction</li><li>Ceramic coating</li></ul>
+""" + _LEAD_FORM,
+        _BASE_GAPS | {"no_crm_signals", "no_online_booking"}),
+    # And a page that talks about price without publishing one. "our prices" was
+    # read as a price list, so the finding that is true here never fired.
+    _labelled(
+        "Halden Chartered Accountants", """
+<h1>Halden Chartered Accountants</h1>
+<h2>Accounting services</h2><ul><li>Year end accounts</li><li>Payroll</li>
+<li>VAT returns</li></ul>
+<p>Our prices are competitive and every engagement is quoted individually.</p>
+""" + _LEAD_FORM,
+        _BASE_GAPS | {"no_crm_signals"}),
+    _labelled(
+        "Marchmont Wine Merchants", """
+<h1>Marchmont Wine Merchants</h1>
+<div id="my-store-12345678"></div>
+<h2>This month</h2>
+<ul><li>Barbera d'Asti &pound;14.50</li><li>Muscadet &pound;11.00</li></ul>
+""" + _LEAD_FORM,
+        (_BASE_GAPS - {"price_opaque"}) | {"ecommerce_manual", "no_crm_signals"},
+        head='<script src="https://app.ecwid.com/script.js?12345678"></script>\n'),
+
+    # ── A chat box the seven-vendor list could not see ──
+    _labelled(
+        "Ellesmere Windows", """
+<h1>Ellesmere Windows</h1>
+<h2>Services</h2><ul><li>Double glazing replacement</li><li>Conservatory repairs</li>
+<li>Door installation</li></ul>
+""" + _LEAD_FORM,
+        (_BASE_GAPS - {"no_live_chat"}) | {"no_crm_signals", "no_online_booking"},
+        head='<script id="ze-snippet" src="https://static.zdassets.com/ekr/snippet.js?key=ab12">'
+             "</script>\n"),
+    _labelled(
+        "Copperfield Clinic", """
+<h1>Copperfield Clinic</h1>
+<h2>Treatments</h2><ul><li>Physiotherapy</li><li>Sports massage</li>
+<li>Acupuncture</li></ul>
+""" + _LEAD_FORM,
+        (_BASE_GAPS - {"no_live_chat"}) | {"no_crm_signals", "no_online_booking"},
+        head='<script src="//fw-cdn.com/1234567/2345678.js" chat="true"></script>\n'),
+    _labelled(
+        "Rowan and Hale Solicitors", """
+<h1>Rowan and Hale Solicitors</h1>
+<h2>Our services</h2><ul><li>Conveyancing</li><li>Family law</li>
+<li>Wills and probate</li></ul>
+<p>Telephone the office or send the form and a partner will come back to you.</p>
+""" + _LEAD_FORM,
+        (_BASE_GAPS - {"no_live_chat"}) | {"no_crm_signals"},
+        head='<script async src="https://static.olark.com/jsclient/loader0.js"></script>\n'),
+    _labelled(
+        "Nordvik Interiors", """
+<h1>Nordvik Interiors</h1>
+<h2>What we do</h2><ul><li>Curtains and blinds</li><li>Upholstery</li>
+<li>Colour schemes</li></ul>
+<p>Visit the showroom on the Mill Road any weekday.</p>
+""" + _LEAD_FORM,
+        (_BASE_GAPS - {"no_live_chat"}) | {"no_crm_signals"},
+        head='<script src="https://www.smartsuppchat.com/loader.js?"></script>\n'),
+    _labelled(
+        "Sandpiper Marine", """
+<h1>Sandpiper Marine</h1>
+<h2>Services</h2><ul><li>Engine servicing</li><li>Hull cleaning</li>
+<li>Winter storage</li></ul>
+""" + _LEAD_FORM,
+        (_BASE_GAPS - {"no_live_chat"}) | {"no_crm_signals", "no_online_booking"},
+        head='<script src="//code.jivosite.com/widget/ab12cd34" async></script>\n'),
+    # One script, three facts: HubSpot's loader is the chat box, the CRM behind
+    # the form and the thing counting last month's visits, and the tables held
+    # it as a CRM only.
+    _labelled(
+        "Kingsway Orthodontics", """
+<h1>Kingsway Orthodontics</h1>
+<h2>Treatments</h2><ul><li>Clear aligners</li><li>Fixed braces</li><li>Retainers</li></ul>
+<p>Your first appointment takes about an hour.</p>
+""" + _LEAD_FORM,
+        (_BASE_GAPS - {"no_live_chat", "no_analytics"}) | {"no_online_booking"},
+        head='<script id="hs-script-loader" async defer src="//js.hs-scripts.com/7654321.js">'
+             "</script>\n"),
+    # The lookalike: the word in a sentence, and nothing on the page to click.
+    _labelled(
+        "Ivybridge Consulting", """
+<h1>Ivybridge Consulting</h1>
+<p>Get in touch and let’s have a chat about your project.</p>
+<h2>What we do</h2><ul><li>Operations reviews</li><li>Process mapping</li>
+<li>Interim management</li></ul>
+""" + _LEAD_FORM,
+        _BASE_GAPS | {"no_crm_signals"}),
+
+    # ── A booking system the link rule could not read ──
+    # "/online-booking/" and "Book Appointment" are the two plainest ways a site
+    # writes it, and the rule wanted the segment to be exactly "/booking".
+    _labelled(
+        "Wren Street Dental", """
+<h1>Wren Street Dental</h1>
+<p><a href="/online-booking/">Book Appointment</a></p>
+<h2>Treatments</h2><ul><li>Dental check-ups</li><li>Hygienist visits</li>
+<li>Teeth whitening</li></ul>
+""" + _LEAD_FORM,
+        _BASE_GAPS | {"no_crm_signals"}),
+    _labelled(
+        "Halcyon Day Spa", """
+<h1>Halcyon Day Spa</h1>
+<iframe src="https://halcyon.janeapp.com/" title="Book"></iframe>
+<h2>Treatments</h2><ul><li>Swedish massage</li><li>Facial and skin care</li></ul>
+""" + _LEAD_FORM,
+        _BASE_GAPS | {"no_crm_signals"}),
+    _labelled(
+        "Nether Green Veterinary", """
+<h1>Nether Green Veterinary</h1>
+<p><a href="https://booksy.com/en-gb/12345_nether-green-veterinary">Make a booking</a></p>
+<h2>Our Services</h2><ul><li>Vaccinations</li><li>Wellness exams</li>
+<li>Dental cleaning</li></ul>
+""" + _LEAD_FORM,
+        _BASE_GAPS | {"no_crm_signals"}),
+    _labelled(
+        "Whitfield Osteopathy", """
+<h1>Whitfield Osteopathy</h1>
+<p><a href="https://calendar.app.google/aBcD1234">Choose a time</a></p>
+<h2>Treatments</h2><ul><li>Osteopathic treatment</li><li>Sports massage</li></ul>
+""" + _LEAD_FORM,
+        _BASE_GAPS | {"no_crm_signals"}),
+    # The trade says it books times and the page never uses the word.
+    _labelled(
+        "Larkspur Tattoo Studio", """
+<h1>Larkspur Tattoo Studio</h1>
+<h2>What we do</h2><ul><li>Custom tattoo design</li><li>Cover-up work</li>
+<li>Fine line and script</li></ul>
+<p>Send us your idea and we will find you a chair.</p>
+""" + _LEAD_FORM,
+        _BASE_GAPS | {"no_crm_signals", "no_online_booking"}),
+    # The page says it books nothing, in the wording most shops use for it.
+    # Without the comma and the hyphens the phrase list had never seen it.
+    _labelled(
+        "Pinewood Barbers", """
+<h1>Pinewood Barbers</h1>
+<p>Walk ins welcome &mdash; first come first served, six days a week.</p>
+<h2>Services</h2><ul><li>Haircut</li><li>Beard trim</li><li>Hot towel shave</li></ul>
+""" + _LEAD_FORM,
+        _BASE_GAPS | {"no_crm_signals"}),
+    # And a booking word that is not a booking system: the small print.
+    _labelled(
+        "Kilbride Print", """
+<nav><a href="/">Home</a> <a href="/booking-terms/">Booking terms</a></nav>
+<h1>Kilbride Print</h1>
+<h2>Services</h2><ul><li>Litho printing</li><li>Digital printing</li>
+<li>Finishing and binding</li></ul>
+<p>Booking terms and cancellation policy apply to every order.</p>
+""" + _LEAD_FORM,
+        _BASE_GAPS | {"no_crm_signals"}),
+
+    # ── Something is measuring the site, and something is filing the lead ──
+    _labelled(
+        "Auchen Timber", """
+<h1>Auchen Timber</h1>
+<h2>What we do</h2><ul><li>Sawn timber and sheet materials</li><li>Fencing supplies</li>
+<li>Decking kits</li></ul>
+""" + _LEAD_FORM,
+        (_BASE_GAPS - {"no_analytics"}) | {"no_crm_signals"},
+        head='<script>window.uetq = window.uetq || [];</script>\n'
+             '<script src="//bat.bing.com/bat.js"></script>\n'),
+    _labelled(
+        "Crawford and Sons Ironmongers", """
+<h1>Crawford and Sons Ironmongers</h1>
+<h2>What we do</h2><ul><li>Key cutting</li><li>Tool hire</li><li>Paint mixing</li></ul>
+<p>Key cutting from &pound;4.50.</p>
+""" + _LEAD_FORM,
+        (_BASE_GAPS - {"no_analytics", "price_opaque"}) | {"no_crm_signals"},
+        head='<script src="https://cdn.segment.com/analytics.js/v1/ab12/analytics.min.js">'
+             "</script>\n"),
+    _labelled(
+        "Bellevue Aesthetics", """
+<h1>Bellevue Aesthetics</h1>
+<h2>Treatments</h2><ul><li>Anti-wrinkle injections</li><li>Dermal fillers</li>
+<li>Skin consultation</li></ul>
+""" + _LEAD_FORM,
+        _BASE_GAPS | {"no_online_booking"},
+        head='<script src="https://bellevue.infusionsoft.com/app/webTracking/getTrackingCode">'
+             "</script>\n"),
+    # A mailing list a visitor can join, rendered by the tool rather than by a
+    # <form>: nothing on this site is a contact form, and something on it does
+    # ask for an email.
+    _labelled(
+        "Ravenscroft Legal", """
+<h1>Ravenscroft Legal</h1>
+<h2>Our services</h2><ul><li>Conveyancing</li><li>Wills and probate</li>
+<li>Employment law</li></ul>
+<h2>Newsletter</h2>
+<div class="ctct-inline-form" data-form-id="ab12cd34"></div>
+""",
+        _BASE_GAPS,
+        head='<script src="https://static.ctctcdn.com/js/signup-form-widget/current/'
+             'signup-form-widget.min.js"></script>\n'),
+    _labelled(
+        "Foxglove Florists", """
+<h1>Foxglove Florists</h1>
+<div class="sqs-add-to-cart-button" data-item-id="ab12cd34">Add to Cart</div>
+<h2>Bouquets</h2>
+<ul><li>Seasonal hand-tied &pound;35.00</li><li>Letterbox flowers &pound;22.00</li></ul>
+""" + _LEAD_FORM,
+        (_BASE_GAPS - {"price_opaque"}) | {"ecommerce_manual", "no_crm_signals"},
+        head='<script src="https://static1.squarespace.com/static/commerce/scripts/shop.js">'
+             "</script>\n"),
+
+    # ── A quote is handled by hand when the site hands you the control ──
+    _labelled(
+        "Tamar Glazing", """
+<h1>Tamar Glazing</h1>
+<p><a href="/quote/">Request a quote</a></p>
+<h2>Services</h2><ul><li>Double glazing installation</li><li>Window repair</li>
+<li>Misted unit replacement</li></ul>
+""" + _LEAD_FORM,
+        _BASE_GAPS | {"no_crm_signals", "quote_by_form", "no_online_booking"}),
+    # The same words in a paragraph, on a site whose whole pitch is that you do
+    # not have to ask anybody for a price.
+    _labelled(
+        "Fairfield Insurance Brokers", """
+<h1>Fairfield Insurance Brokers</h1>
+<h2>Instant quotes</h2>
+<p>Compare policies online and see your premium instantly &mdash; no need to
+request a quote by email and wait.</p>
+<h2>Cover we arrange</h2><ul><li>Commercial combined</li><li>Fleet insurance</li>
+<li>Professional indemnity</li></ul>
+""" + _LEAD_FORM,
+        _BASE_GAPS | {"no_crm_signals"}),
+
+    # ── A social profile the host list did not hold, and a vacancy typeset
+    #    with the apostrophe a word processor produces ──
+    _labelled(
+        "Quayside Framing", """
+<h1>Quayside Framing</h1>
+<p><a href="https://www.pinterest.com/quaysideframing/">Pinterest</a></p>
+<h2>What we do</h2><ul><li>Bespoke frames</li><li>Glass cutting</li>
+<li>Mount cutting</li></ul>
+""" + _LEAD_FORM,
+        (_BASE_GAPS - {"no_social_presence"}) | {"no_crm_signals"}),
+    _labelled(
+        "Bramhall Motors", """
+<h1>Bramhall Motors</h1>
+<p>We’re hiring a qualified technician — bring your CV to the workshop.</p>
+<h2>Services</h2><ul><li>MOT testing</li><li>Servicing and repairs</li>
+<li>Diagnostics</li></ul>
+""" + _LEAD_FORM,
+        _BASE_GAPS | {"no_crm_signals", "careers_manual", "no_online_booking"}),
+)
+
+
+def _corpus_rates(corpus) -> dict:
+    """Per-rule (true positives, false positives, false negatives) over `corpus`."""
     rates = {code: [0, 0, 0] for code in A.GAP_CATALOGUE}
-    for name, html, expected in CORPUS:
+    for name, html, expected in corpus:
         url = "https://%s.test/" % re.sub(r"[^a-z]+", "-", name.lower())
         fired = set(_codes(A.audit_from_html({url: html}, url)))
         for code in A.GAP_CATALOGUE:
@@ -1549,6 +1881,10 @@ def test_no_rule_stands_a_substring_in_for_the_fact_it_claims():
     exist only to be caught (a physiotherapist whose page never says
     "appointment", a section headed Careers with no link under it, a new
     patient form, a jotform embed) are what stops that being the fix.
+
+    One label here has since been corrected rather than one rule: the page
+    running HubSpot was labelled as having no chat box and nothing measuring it,
+    and the script it loads is both. See the comment above it.
     """
     wrong = {}
     for name, html, expected in CORPUS:
@@ -1561,13 +1897,266 @@ def test_no_rule_stands_a_substring_in_for_the_fact_it_claims():
 
     # The corpus only means something if every rule it grades is exercised by
     # it, positives and negatives both.
-    rates = _corpus_rates()
+    rates = _corpus_rates(CORPUS)
     for code in ("no_online_booking", "no_crm_signals", "no_lead_capture",
                  "careers_manual", "pdf_forms", "no_social_presence"):
         true_positives = rates[code][0]
         assert true_positives >= 2, (code, rates[code])
         assert true_positives < len(CORPUS), (code, rates[code])
     print("no rule stands a substring in for the fact it claims: OK")
+
+
+def test_a_price_on_the_page_is_not_no_pricing_anywhere():
+    """"not a rate, a range or a starting figure on any page", to a page with one.
+
+    The rule was `pricing_link or money_hits >= 3 or "our prices" in text`, and a
+    threshold across the whole crawl is not a fact about anything. Two prices
+    read as none, so a groomer with a price list under its own Grooming heading
+    was told it publishes nothing; three discounts read as a rate card, so a
+    detailer advertising $50 off was credited with prices it does not print; and
+    "our prices are competitive" — a sentence that publishes no figure at all —
+    silenced the finding that was true.
+
+    What replaces it is the figure's own surroundings: a table cell, a list
+    item, a "from", a "per hour", a section headed Fees. The old three-match arm
+    survives underneath, on distinct figures, so nothing that used to read as a
+    price list stops reading as one.
+    """
+    published = (
+        "<ul><li>Full groom &mdash; $65</li><li>Nail trim &mdash; $15</li></ul>",
+        "<table><tr><td>5x10</td><td>$89 per month</td></tr></table>",
+        "<p>Kitchens start from &pound;12,000.</p>",
+        "<p>Lessons are $60 per hour.</p>",
+        "<h2>Fees</h2><p>Initial assessment $110.</p>",
+        # The arm that was already there, on the shape it was already right about.
+        "<p>Check-up $95.00, cleaning $140.00, whitening $350.00.</p>",
+    )
+    silent = (
+        "<p>Save $50 on your first service, $25 off referrals and $0 down.</p>",
+        "<p>Our prices are competitive and every engagement is quoted individually.</p>",
+        "<p>Ask us for a figure and we will come back the same day.</p>",
+        # "fee" is inside "coffee", so the heading arm reads whole words.
+        "<h2>Coffee and cake</h2><p>Save $20 on a bean subscription.</p>",
+    )
+    for body in published:
+        result = _built(body + _LEAD_FORM)
+        assert result["signals"]["has_pricing"] is True, body
+        assert "price_opaque" not in _codes(result), (body, _codes(result))
+    for body in silent:
+        result = _built(body + _LEAD_FORM)
+        assert result["signals"]["has_pricing"] is False, body
+        assert "price_opaque" in _codes(result), (body, _codes(result))
+    print("a price on the page is not no pricing anywhere: OK")
+
+
+def test_a_chat_box_is_a_chat_box_whoever_sells_it():
+    """`_CHAT_MARKERS` held seven vendors and the sentence claims there are none.
+
+    "no chat box on the site" is checkable in one second by the person reading
+    it, which makes it the cheapest sentence in the catalogue to be caught out
+    on — and eleven products that draw a box in the corner of the page were not
+    in the table. HubSpot is the shape of the whole problem: one script is the
+    chat widget, the CRM behind the form and the page-view counter, and it was
+    filed under CRM alone, so two of the three sentences it disproves went out.
+    """
+    vendors = {
+        "zendesk": '<script id="ze-snippet" src="https://static.zdassets.com/ekr/snippet.js">'
+                   "</script>",
+        "freshchat": '<script src="//fw-cdn.com/12345/67890.js" chat="true"></script>',
+        "olark": '<script src="https://static.olark.com/jsclient/loader0.js"></script>',
+        "smartsupp": '<script src="https://www.smartsuppchat.com/loader.js?"></script>',
+        "zoho_salesiq": '<script src="https://salesiq.zoho.com/widget"></script>',
+        "userlike": '<script src="https://userlike-cdn-widgets.s3.amazonaws.com/ab.js"></script>',
+        "chatra": "<script>ChatraID='ab12';</script>"
+                  '<script src="//call.chatra.io/chatra.js"></script>',
+        "jivosite": '<script src="//code.jivosite.com/widget/ab12"></script>',
+        "purechat": '<script src="https://app.purechat.com/VisitorWidget/WidgetScript">'
+                    "</script>",
+        "helpcrunch": '<script src="https://widget.helpcrunch.com/"></script>',
+        "salesforce_chat": '<script src="https://x.my.site.com/embeddedservice_bootstrap.js">'
+                           "</script>",
+        "hubspot": '<script id="hs-script-loader" src="//js.hs-scripts.com/7654321.js">'
+                   "</script>",
+    }
+    for expected, snippet in vendors.items():
+        result = _built(_LEAD_FORM, head=snippet + "\n")
+        assert result["tech"]["chat"] == expected, (expected, result["tech"]["chat"])
+        assert result["signals"]["has_live_chat"] is True, expected
+        assert "no_live_chat" not in _codes(result), (expected, _codes(result))
+
+    # One script, three facts. The CRM and the analytics claims are the other two
+    # the table was making wrongly about the same page.
+    hub = _built(_LEAD_FORM,
+                 head='<script src="//js.hs-scripts.com/7654321.js"></script>\n')
+    assert hub["tech"]["crm"] == "hubspot", hub["tech"]
+    assert hub["tech"]["analytics"] == ["hubspot"], hub["tech"]
+    for absent in ("no_live_chat", "no_crm_signals", "no_analytics"):
+        assert absent not in _codes(hub), (absent, _codes(hub))
+
+    # And the word in a sentence is still not a chat box.
+    prose = _built("<p>Get in touch and let’s have a chat about your project.</p>" + _LEAD_FORM)
+    assert prose["signals"]["has_live_chat"] is False, prose["signals"]
+    assert "no_live_chat" in _codes(prose), _codes(prose)
+    print("a chat box is a chat box whoever sells it: OK")
+
+
+def test_a_booking_page_is_read_as_words_and_not_as_spellings():
+    """`/online-booking/` was not a booking system, and `/booking-terms/` was.
+
+    The path rule was a list of twenty-two whole segments, so it wanted exactly
+    `/booking` and the two plainest ways a site writes it — `/online-booking/`
+    and `/book-a-table/` — fell straight through, putting the catalogue's
+    highest-severity gap on businesses with a Book button on the home page. The
+    label rule had the same shape: it knew "book an appointment" and not "Book
+    Appointment".
+
+    Reading the segment as the words in it fixes both directions at once, which
+    is the point — "booking-terms" and "booking" differ by a noun, and only one
+    of them is a calendar.
+    """
+    books = ('<a href="/online-booking/">Book Appointment</a>',
+             '<a href="/book-a-table/">Reserve</a>',
+             '<a href="/request-appointment/">Enquire</a>',
+             '<a href="/x/">Make a booking</a>',
+             '<a href="/x/">Schedule your visit</a>',
+             '<a href="/termin-online-buchen/">Jetzt buchen</a>')
+    small_print = ('<a href="/booking-terms/">Booking terms</a>',
+                   '<a href="/cancellation-policy/">Booking and cancellation fees</a>',
+                   '<a href="/blog/booking-tips/">Ten booking tips for tradespeople</a>')
+    bookable = "<h2>Treatments</h2><ul><li>Sports massage</li><li>Manual therapy</li></ul>"
+    for markup in books:
+        result = _built(bookable + markup + _LEAD_FORM)
+        assert result["signals"]["has_online_booking"] is True, markup
+        assert "no_online_booking" not in _codes(result), (markup, _codes(result))
+    for markup in small_print:
+        result = _built(bookable + markup + _LEAD_FORM)
+        assert result["signals"]["has_online_booking"] is False, markup
+        assert "no_online_booking" in _codes(result), (markup, _codes(result))
+
+    # A vendor that renders its calendar in an iframe and prints no label at all.
+    for snippet in ('<iframe src="https://x.janeapp.com/"></iframe>',
+                    '<iframe src="https://booking.vagaro.com/x"></iframe>',
+                    '<a href="https://booksy.com/en-gb/12345_x">Online</a>',
+                    '<a href="https://calendar.app.google/aBcD1234">Choose a time</a>',
+                    '<a href="https://outlook.office365.com/owa/calendar/x/bookings/">Times</a>'):
+        result = _built(bookable + snippet + _LEAD_FORM)
+        assert result["signals"]["has_online_booking"] is True, snippet
+        assert "no_online_booking" not in _codes(result), (snippet, _codes(result))
+    print("a booking page is read as words and not as spellings: OK")
+
+
+def test_a_trade_books_times_whether_or_not_it_says_so():
+    """The other half of the same gap: the businesses it was silent about.
+
+    `_bookable` reads `services`, which is capped at twelve labels and filtered
+    down to what fits a brief, so a trade whose words never made that cut — a
+    driving school heading its page "Driving lessons", a tattoo studio listing
+    "Custom tattoo design" — looked like a business that arranges no times.
+    Precision is cheap to buy by firing less, and these are the pages that stop
+    that being the fix.
+    """
+    trades = ("<h2>Driving lessons</h2><p>We will meet you at your door.</p>",
+              "<h2>What we do</h2><ul><li>Custom tattoo design</li><li>Cover-up work</li></ul>",
+              "<h2>What we do</h2><ul><li>Osteopathic treatment</li></ul>",
+              "<h2>Services</h2><ul><li>Sports massage</li><li>Acupuncture</li></ul>")
+    for body in trades:
+        codes = _codes(_built(body + _LEAD_FORM))
+        assert "no_online_booking" in codes, (body, codes)
+
+    # And the businesses it must stay silent about, which is why the list of
+    # bookable work is a list and not "sells anything".
+    counters = ("<h2>What we do</h2><ul><li>Litho printing</li><li>Finishing and binding</li>"
+                "</ul>",
+                "<h2>What we do</h2><ul><li>Key cutting</li><li>Tool hire</li></ul>",
+                "<h2>What we do</h2><ul><li>Next day delivery</li><li>Bulk paper supply</li>"
+                "</ul>")
+    for body in counters:
+        codes = _codes(_built(body + _LEAD_FORM))
+        assert "no_online_booking" not in codes, (body, codes)
+    print("a trade books times whether or not it says so: OK")
+
+
+def test_a_phrase_is_matched_on_its_words_and_not_on_its_punctuation():
+    """A word processor's apostrophe made a site stop advertising its own job.
+
+    `_HIRING_PHRASES` holds "we're hiring" with a typewriter apostrophe, and the
+    page ships U+2019 because that is what every editor produces. Same shape one
+    rule over: a barber writing "walk-ins welcome — first-come, first-served"
+    matched the phrase list, and one writing it flat did not, so the second shop
+    was told to buy a booking system on a page that says it takes none.
+    """
+    for markup in ("<p>We’re hiring a qualified technician.</p>",
+                   "<p>We're hiring a qualified technician.</p>",
+                   "<p>Nous recrutons un collaborateur.</p>"):
+        codes = _codes(_built(markup + _LEAD_FORM))
+        assert "careers_manual" in codes, (markup, codes)
+
+    haircuts = "<h2>Services</h2><ul><li>Haircut</li><li>Beard trim</li></ul>"
+    for markup in ("<p>Walk-ins only. We do not take appointments.</p>",
+                   "<p>Walk ins welcome &mdash; first come first served.</p>",
+                   "<p>Walk‑ins welcome, first‑come, first‑served.</p>"):
+        codes = _codes(_built(markup + haircuts + _LEAD_FORM))
+        assert "no_online_booking" not in codes, (markup, codes)
+    # The same shop with nothing said either way still books haircuts.
+    assert "no_online_booking" in _codes(_built(haircuts + _LEAD_FORM))
+    print("a phrase is matched on its words and not on its punctuation: OK")
+
+
+def test_a_threshold_and_a_vendor_list_are_not_the_fact_they_stand_in_for():
+    """The second corpus, rule by rule, for the same reason as the first.
+
+    Thirty-one pages, every label written down before a rule was touched. What
+    they measure is the two shapes the first corpus does not: a threshold
+    counting matches instead of asking what a figure is attached to, and a
+    vendor table that answers "there is no such thing on this site" whenever the
+    site runs the eighth product rather than one of its seven.
+
+    Over these thirty-one pages, before -> after:
+
+        rule                 precision            recall
+        no_online_booking    0.625 -> 1.000       0.833 -> 1.000
+        price_opaque         0.750 -> 1.000       0.913 -> 1.000
+        no_live_chat         0.806 -> 1.000       1.000 -> 1.000
+        no_analytics         0.903 -> 1.000       1.000 -> 1.000
+        no_crm_signals       0.966 -> 1.000       1.000 -> 1.000
+        no_social_presence   0.968 -> 1.000       1.000 -> 1.000
+        quote_by_form        0.500 -> 1.000       1.000 -> 1.000
+        no_lead_capture      0.000 -> 1.000          --
+        careers_manual          --   -> 1.000       0.000 -> 1.000
+        ecommerce_manual        --   -> 1.000       0.000 -> 1.000
+        no_schema            1.000 -> 1.000       1.000 -> 1.000
+        every rule together  0.870 -> 1.000       0.961 -> 1.000
+
+    A dash is a rate with no denominator: nothing fired for `careers_manual` or
+    `ecommerce_manual` on any of these pages before, so there was no precision
+    to have, and no page here is labelled `no_lead_capture`, so there is no
+    recall to have. Both are measured over the corpus above instead.
+
+    And over both corpora, sixty pages: 0.926 -> 1.000 precision, 0.981 ->
+    1.000 recall. Nothing above was bought by firing less — six of the eleven
+    rules gained recall in the same pass, and the pages that hold that honest
+    are the driving school, the tattoo studio, the Ecwid wine merchant and the
+    Constant Contact newsletter with no <form> anywhere on the page.
+    """
+    wrong = {}
+    for name, html, expected in PRICE_AND_VENDOR_CORPUS:
+        url = "https://%s.test/" % re.sub(r"[^a-z]+", "-", name.lower())
+        fired = set(_codes(A.audit_from_html({url: html}, url)))
+        if fired != expected:
+            wrong[name] = {"claimed but false": sorted(fired - expected),
+                           "true but missed": sorted(expected - fired)}
+    assert not wrong, wrong
+
+    assert len(PRICE_AND_VENDOR_CORPUS) >= 25, len(PRICE_AND_VENDOR_CORPUS)
+    # Every rule the corpus grades has to be exercised both ways by it, or the
+    # rate it reports is a rate over one answer.
+    rates = _corpus_rates(PRICE_AND_VENDOR_CORPUS)
+    for code in ("price_opaque", "no_live_chat", "no_online_booking", "no_analytics",
+                 "no_crm_signals", "ecommerce_manual"):
+        true_positives = rates[code][0]
+        assert true_positives >= 1, (code, rates[code])
+        assert true_positives < len(PRICE_AND_VENDOR_CORPUS), (code, rates[code])
+    print("a threshold and a vendor list are not the fact they stand in for: OK")
 
 
 if __name__ == "__main__":
@@ -1603,4 +2192,10 @@ if __name__ == "__main__":
     test_careers_has_to_head_a_job_listing()
     test_a_marker_stops_where_the_word_stops()
     test_no_rule_stands_a_substring_in_for_the_fact_it_claims()
+    test_a_price_on_the_page_is_not_no_pricing_anywhere()
+    test_a_chat_box_is_a_chat_box_whoever_sells_it()
+    test_a_booking_page_is_read_as_words_and_not_as_spellings()
+    test_a_trade_books_times_whether_or_not_it_says_so()
+    test_a_phrase_is_matched_on_its_words_and_not_on_its_punctuation()
+    test_a_threshold_and_a_vendor_list_are_not_the_fact_they_stand_in_for()
     print("\nALL AUDIT TESTS PASSED")

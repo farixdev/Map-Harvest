@@ -5,7 +5,7 @@ Everything this module used to say about how the app *looks* now lives in
 which screen is showing, one bar that says so, and which background threads
 have to be stopped before the window can go away.
 
-Two measurements shaped the rest of this file.
+Four measurements shaped the rest of this file.
 
 The first: the window used to construct all four screens in `__init__` — the
 2747-line settings screen included — before the user had asked for any of them.
@@ -32,25 +32,58 @@ chrome and repolishes the tree: the chrome has to be rebuilt rather than
 repolished because `ui/components.py` resolves its colours in Python at build
 time, so a repolish alone leaves every component wearing the palette it was
 constructed in. A theme toggle that needs a restart is not a theme toggle.
+
+The third measurement is what that change *cost*. With all four screens built,
+picking a density on the home screen took 5,328ms of CPU — CPU and not wall
+clock, because wall clock on the machine this was measured on swings five to
+one — and almost all of it belonged to the three screens the user was not
+looking at. They were told the stylesheet had changed and re-measured every
+label they hold; then `SettingsScreen.restyle()` rebuilt four tab pages behind a
+window nobody could see; then a polish walk covered all 827 widgets in the
+process. `AppShell.asleep` keeps the broadcast off them, `restyle_screens` pays
+for the screen on show and records what the others owe, `go` settles that debt
+in the instant before a screen is put on top, and `_repolish` walks
+`AppShell.onstage()`. The same change is 1,000ms, and arriving on a screen that
+owes one costs 203ms.
+
+The fourth is that none of this was reachable from a keyboard. The audit found
+no shortcuts, no mnemonics, no menu bar, and Escape and Return doing nothing
+anywhere in the app. The layer that fixes it belongs here rather than on any
+screen, because a shortcut that only works on Outreach is not a shortcut: the
+menu bar names every destination and the key that reaches it, `keyPressEvent`
+gives Escape and Return one meaning each, and `ui/command_palette.py` puts
+every action in the app one Ctrl+K away. The shell owns the command registry
+and hands it to the palette, so a screen contributes its own entries — a
+`commands()` method, or simply a row of sub-tabs it has already handed over —
+without the palette knowing that screens exist.
 """
 
+import contextlib
 import signal
 import sys
 import traceback
 
-from PyQt5.QtCore import QSize, QThread, QTimer, Qt, pyqtSignal
+from PyQt5.QtCore import QEvent, QObject, QSize, QThread, QTimer, Qt, pyqtSignal
+from PyQt5.QtGui import QKeySequence
 from PyQt5.QtWidgets import (
-    QApplication, QHBoxLayout, QMainWindow, QStackedWidget, QVBoxLayout,
-    QWidget,
+    QAbstractButton, QAbstractItemView, QAbstractSpinBox, QAction, QApplication,
+    QComboBox, QHBoxLayout, QLineEdit, QMainWindow, QPlainTextEdit, QPushButton,
+    QStackedWidget, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from core import outreach_db
 from core.settings import load_settings, save_settings
 from ui import components
 from ui import theme as theme_module
+from ui.command_palette import Command, CommandPalette
 
 # The stack keys, and the order the destinations appear in the bar.
 INPUT, RESULTS, OUTREACH, SETTINGS = "input", "results", "outreach", "settings"
+
+# How many steps back Escape can walk. Deep enough that Settings opened from a
+# half-built campaign returns to it, shallow enough that Escape is a way out of
+# where you are rather than a rewind of the whole session.
+HISTORY = 8
 
 
 def current_theme():
@@ -116,6 +149,43 @@ def _stop_thread(worker) -> None:
     worker.wait(2000)
 
 
+# ── Appearance ───────────────────────────────────────────────────────────────
+
+
+# The five events Qt broadcasts to every widget alive when the application's
+# font, palette or stylesheet is replaced.
+_APPEARANCE = frozenset((
+    QEvent.StyleChange, QEvent.FontChange, QEvent.PaletteChange,
+    QEvent.ApplicationFontChange, QEvent.ApplicationPaletteChange))
+
+
+class _Unbothered(QObject):
+    """Keeps those five off a screen that is about to be built again anyway.
+
+    `app.setStyleSheet` is the single most expensive thing an appearance change
+    does, and almost all of it belongs to widgets nobody can see. Measured with
+    all four screens built: 2,937ms of CPU for one swap over 769 widgets, of
+    which 630 belong to the three screens off show — against 145ms for the same
+    swap with only the home screen built.
+
+    The cost is not Qt matching selectors. It is what this app's own widgets do
+    when they are told: `_MeasuredLabel`, `_MeasuredEdit` and the settings
+    screen's fields all re-measure their text on a style change, which one swap
+    turns into 30,807 calls to `QFontMetrics.horizontalAdvance` and the layout
+    invalidations that follow. Swallowing the five events for a screen the shell
+    has already decided will rebuild itself before it is next shown takes the
+    same swap to 1,695ms — the re-measure is not skipped, it happens once, in
+    the rebuild, instead of twice.
+
+    Which is the whole of the invariant, and why this is installed from
+    `AppShell.asleep` and nowhere else: a screen is silenced only while it is in
+    `_owes`, and every key in `_owes` is restyled by `go` before it can be seen.
+    """
+
+    def eventFilter(self, _watched, event) -> bool:
+        return event.type() in _APPEARANCE
+
+
 # ── The shell ────────────────────────────────────────────────────────────────
 
 
@@ -152,6 +222,18 @@ class AppShell(QWidget):
         self._context_label = None
         self._context_state = None
         self.current_key = ""
+        # Where Escape goes, most recent last, and how much of it is worth
+        # keeping: enough that backing out of a detour returns to the work, not
+        # so much that Escape becomes a walk through the whole session.
+        self._history: list = []
+        # Something to ask for commands whenever the palette opens, rather than
+        # a list of them captured once: half of what the palette offers is only
+        # true for an instant.
+        self._sources: list = []
+        self._palette = None
+        # The screens that owe a restyle because the theme changed while they
+        # were behind another one.
+        self._owes: set = set()
 
         self._root = QVBoxLayout(self)
         self._root.setContentsMargins(0, 0, 0, 0)
@@ -179,14 +261,48 @@ class AppShell(QWidget):
             self._rebuild_bar()
 
     def go(self, key: str, **kw) -> None:
-        """Show `key`, building it on first visit and opening it with `kw`."""
+        """Show `key`, building it on first visit and opening it with `kw`.
+
+        The restyle debt is settled first, before the opener and long before
+        the switch, so a screen that missed a theme change is never painted for
+        even one frame in the palette it was built in.
+        """
         screen = self.screen(key)
+        self._settle(key)
         opener = self._openers.get(key)
         if opener is not None:
             opener(screen, **kw)
+        if self.current_key and self.current_key != key:
+            self._history.append(self.current_key)
+            del self._history[:-HISTORY]
         self._stack.setCurrentWidget(screen)
         self.current_key = key
         self._sync()
+
+    def back(self) -> bool:
+        """Return to the screen this one was reached from, if there was one."""
+        for key in reversed(self._history):
+            if key != self.current_key:
+                self.retreat(key)
+                return True
+        del self._history[:]
+        return False
+
+    def retreat(self, key: str) -> None:
+        """Go to `key` as a way *back*: the trail is cut at it, not extended.
+
+        The distinction is the whole of what makes Escape work twice. Leaving
+        Settings is a navigation like any other as far as `go` is concerned, so
+        without this it pushed Settings onto the trail — and the next Escape
+        dutifully walked forward into the screen the first one had just left.
+        """
+        keep = list(self._history)
+        while keep and keep[-1] != key:
+            keep.pop()
+        if keep:
+            keep.pop()
+        self.go(key)
+        self._history = keep
 
     def screen(self, key: str):
         """The screen for `key`, built now if this is its first visit."""
@@ -204,6 +320,87 @@ class AppShell(QWidget):
 
     def screens(self) -> list:
         return list(self._screens.values())
+
+    def destinations(self) -> tuple:
+        """The primary keys, in the order the bar draws them."""
+        return tuple(self._destinations)
+
+    def label(self, key: str) -> str:
+        return self._labels.get(key, key)
+
+    def can_go_back(self) -> bool:
+        return any(key != self.current_key for key in self._history)
+
+    def go_subtab(self, key: str, label: str) -> bool:
+        """Show `key` with its sub-tab called `label` selected.
+
+        Through the callback the screen itself handed over with the row, so
+        this reaches a tab page without knowing what a tab page is or which
+        screen has any. False when no screen has published a row by that name,
+        which is what makes it safe to offer from a palette.
+        """
+        labels, on_change, _current = self._subtabs.get(key, ((), None, 0))
+        if label not in labels:
+            return False
+        self.go(key)
+        self._on_subtab(list(labels).index(label))
+        return True
+
+    # ── Commands ─────────────────────────────────────────────────────────
+
+    def add_commands(self, source) -> None:
+        """Register something that answers with commands when it is asked.
+
+        A source and not a list, because half of what a palette offers is only
+        true for an instant: Stop sending can be run only while a campaign is
+        running, the theme command is named after the palette it is *not*
+        wearing, and a command captured at registration would go on claiming
+        both long after they stopped being so.
+        """
+        self._sources.append(source)
+
+    def commands(self) -> list:
+        """Everything the app can be asked to do, as of right now.
+
+        Three contributors, none of which the palette knows about. The window
+        registers what the shell itself owns. Every screen that has handed over
+        a row of sub-tabs gets one command per tab for free, because publishing
+        that row is already a statement about where a user might want to go. And
+        a screen with a `commands()` method of its own contributes it — the same
+        idiom `_chrome` uses for routes, so a screen that has not grown one yet
+        is not a crash.
+        """
+        found = []
+        for source in self._sources:
+            found.extend(source())
+        for key, (labels, _on_change, _current) in sorted(self._subtabs.items()):
+            for label in labels:
+                found.append(Command(
+                    key="%s.%s" % (key, label),
+                    title="%s — %s" % (self._labels.get(key, key), label),
+                    run=(lambda at=key, name=label: self.go_subtab(at, name)),
+                    where="Section"))
+        for key in self.built():
+            contribute = getattr(self._screens[key], "commands", None)
+            if callable(contribute):
+                found.extend(contribute())
+        return found
+
+    def palette(self) -> CommandPalette:
+        """The palette, built on first use like every screen in the stack."""
+        if self._palette is None:
+            self._palette = CommandPalette(self)
+        return self._palette
+
+    def open_palette(self) -> None:
+        self.palette().open_with(self.commands())
+
+    def dismiss_palette(self) -> bool:
+        """Close the palette if it is open. False when there was nothing open."""
+        if self._palette is None or not self._palette.isVisible():
+            return False
+        self._palette.dismiss()
+        return True
 
     # ── What the bar says ────────────────────────────────────────────────
 
@@ -242,6 +439,87 @@ class AppShell(QWidget):
         self._theme = t
         self._replace(1, "_sub", self._make_sub())
         self._rebuild_bar()
+        if self._palette is not None:
+            self._palette.restyle(t)
+
+    @contextlib.contextmanager
+    def asleep(self):
+        """Every screen owes a restyle, and the ones off show are not disturbed.
+
+        Opened around the whole of an appearance change. `_owes` is written
+        first because the sheet swap inside is what the screens off show are
+        being spared, and `_Unbothered` explains what that is worth.
+        """
+        self._owes = set(self.built())
+        guard = _Unbothered(self)
+        watched = []
+        for key in self._owes:
+            if key == self.current_key:
+                continue
+            screen = self._screens[key]
+            watched.append(screen)
+            watched.extend(screen.findChildren(QWidget))
+        for widget in watched:
+            widget.installEventFilter(guard)
+        try:
+            yield
+        finally:
+            for widget in watched:
+                widget.removeEventFilter(guard)
+            guard.deleteLater()
+
+    def restyle_screens(self) -> None:
+        """Repaint the screen on show. The others keep owing until they are.
+
+        The measurement this exists for: with all four screens built, one
+        density change broke down as 1,887ms of sheet swap, 677ms of screens
+        the user could not see rebuilding themselves inside the click — 626ms
+        of `SettingsScreen.restyle()` laying out four tab pages behind a window
+        nobody was looking at and 50ms of the results screen — a 140ms polish
+        walk over all 827 widgets, and 178ms for the one screen on show.
+        Nothing is skipped, only deferred: `go` settles the debt in the instant
+        before a screen is put on top, so the first frame anyone sees is
+        already in the new palette.
+
+        Deferred rather than discarded because a screen is not only a look. The
+        home screen holds a half-typed scrape, the results screen a running
+        worker, the outreach screen a campaign set up in memory and a send loop,
+        and the settings screen edits that are not on disk. Rebuilding from the
+        factory would be faster still and would throw every one of them away.
+        """
+        self._settle(self.current_key)
+
+    def _settle(self, key: str) -> None:
+        if key not in self._owes:
+            return
+        self._owes.discard(key)
+        restyle = getattr(self._screens.get(key), "restyle", None)
+        if callable(restyle):
+            restyle()
+
+    def owes(self) -> tuple:
+        """The screens still wearing the theme the app has stopped using."""
+        return tuple(sorted(self._owes))
+
+    def onstage(self) -> list:
+        """Every widget the user can actually see: the chrome and one screen.
+
+        What `MainWindow._repolish` walks. The walk used to cover every widget
+        in the process — 827 of them at 140ms — 630 of which belong to screens
+        that are behind this one and are going to rebuild themselves the moment
+        they are next shown.
+        """
+        tree = [self, self._bar, self._sub]
+        tree.extend(self._bar.findChildren(QWidget))
+        tree.extend(self._sub.findChildren(QWidget))
+        screen = self._screens.get(self.current_key)
+        if screen is not None:
+            tree.append(screen)
+            tree.extend(screen.findChildren(QWidget))
+        if self._palette is not None:
+            tree.append(self._palette)
+            tree.extend(self._palette.findChildren(QWidget))
+        return tree
 
     def _rebuild_bar(self) -> None:
         self._replace(0, "_bar", self._make_bar())
@@ -446,10 +724,12 @@ class MainWindow(QMainWindow):
         self.shell.set_dry_run(self.settings.get("dry_run", True))
         self.shell.theme_toggled.connect(self.toggle_theme)
         self.shell.settings_requested.connect(self.on_settings)
+        self.shell.add_commands(self._commands)
 
         # Where Back returns to, so settings opened from outreach does not dump
         # the user on the home screen with their campaign half set up.
         self._settings_return = INPUT
+        self._build_menus()
         self.shell.go(INPUT)
 
     # ── Screens ──────────────────────────────────────────────────────────
@@ -549,7 +829,9 @@ class MainWindow(QMainWindow):
         self.shell.go(SETTINGS)
 
     def on_settings_closed(self):
-        self.shell.go(self._settings_return)
+        # `retreat` and not `go`, because this is the way out of a detour: a
+        # trail that recorded it would answer the next Escape with Settings.
+        self.shell.retreat(self._settings_return)
 
     def on_settings_saved(self, settings):
         # Both screens cache their own copy of the file; hand them the new one
@@ -562,19 +844,363 @@ class MainWindow(QMainWindow):
         if outreach is not None:
             outreach.refresh()
         self.shell.set_dry_run(settings.get("dry_run", True))
+        self._sync_dry_run()
         self.apply_appearance(settings)
+
+    # ── The menu bar ─────────────────────────────────────────────────────
+
+    def _build_menus(self) -> None:
+        """Where a keyboard user finds out that any of this exists.
+
+        The bar is worth more read than clicked. Qt writes an action's shortcut
+        in a second column beside its name, so a menu is the one surface that
+        answers "what can I press" without anybody having to be told to press
+        something first, and the mnemonics come with it: Alt+G, Alt+V, Alt+H.
+
+        Every shortcut here carries a modifier, and that is the rule rather than
+        the taste. A shortcut is matched before the key reaches whatever has the
+        focus, so an unmodified one is a character a text field never receives —
+        which is how a search box stops accepting the letter you gave to a
+        command. The two unmodified keys the app does answer, Escape and Return,
+        are handled in `keyPressEvent` instead, where they arrive only if the
+        focused widget did not want them, and F1 asks `_typing` before it acts.
+        Back and Submit therefore spell their keys in their own text: they are
+        real, and they are deliberately not shortcuts.
+        """
+        bar = self.menuBar()
+        bar.clear()
+
+        go = bar.addMenu("&Go")
+        self._action(go, "Command &palette…", "Ctrl+K", self.open_palette)
+        go.addSeparator()
+        for at, key in enumerate(self.shell.destinations(), start=1):
+            self._action(go, "&%d  %s" % (at, self.shell.label(key)),
+                         "Ctrl+%d" % at, lambda k=key: self.shell.go(k))
+        go.addSeparator()
+        self._action(go, "&Settings", "Ctrl+,", self.on_settings)
+        self._action(go, "&Back\tEsc", "", self.on_escape)
+
+        view = bar.addMenu("&View")
+        self._theme_action = self._action(view, "", "Ctrl+Shift+T",
+                                          self.toggle_theme)
+        self._density_action = self._action(view, "", "Ctrl+Shift+D",
+                                            self.toggle_density)
+        view.addSeparator()
+        self._dry_action = self._action(view, "D&ry run", "",
+                                        self.toggle_dry_run)
+        self._dry_action.setCheckable(True)
+        self._sync_menu()
+
+        help_menu = bar.addMenu("&Help")
+        self._action(help_menu, "&Keyboard shortcuts and commands", "F1",
+                     self.on_help)
+        self._action(help_menu, "&Submit the form in front of you\tEnter", "",
+                     self.on_submit)
+
+    def _action(self, menu, text: str, keys: str, slot) -> QAction:
+        action = QAction(text, self)
+        if keys:
+            action.setShortcut(QKeySequence(keys))
+        action.triggered.connect(lambda _checked=False: slot())
+        menu.addAction(action)
+        return action
+
+    def _sync_menu(self) -> None:
+        """Name what each toggle would do next, not the state it is already in.
+
+        A menu item reading "Theme" says nothing anybody can act on. "Switch to
+        the light theme" is the same item telling them which way it goes, and it
+        is the sentence the palette already uses for the same command. The
+        mnemonic stays on the noun so Alt+V,T and Alt+V,D do not move under the
+        user every time the answer changes.
+        """
+        if getattr(self, "_theme_action", None) is None:
+            return
+        other = "light" if self.theme.name == "dark" else "dark"
+        self._theme_action.setText("Switch to the %s &theme" % other)
+        density = ("compact" if self.theme.density == "comfortable"
+                   else "comfortable")
+        self._density_action.setText("Switch to the %s &density" % density)
+        self._sync_dry_run()
+
+    def on_help(self) -> None:
+        """F1: the list of what exists, which is the palette itself.
+
+        One list rather than two. A second window enumerating shortcuts is a
+        second thing to keep in step with the first, and it is strictly worse
+        than the palette at the only job either of them has: the palette names
+        every command, shows the key beside the ones that have one, and will
+        run the command while it is being read.
+        """
+        if self._typing():
+            return
+        self.open_palette()
+
+    def open_palette(self) -> None:
+        """Ctrl+K again closes it: the key that opened it is also the way out."""
+        if self.shell.dismiss_palette():
+            return
+        self.shell.open_palette()
+
+    # ── Commands ─────────────────────────────────────────────────────────
+    # Every action a screen owns is offered as the button that already does it,
+    # never as a copy of the slot behind it. The button carries its own label,
+    # its own enabled state and whatever confirmation the screen wraps it in, so
+    # a command cannot drift from the control beside it and cannot become a
+    # second, unconfirmed way to mail two hundred strangers.
+
+    _ACTIONS = (
+        (OUTREACH, "audit_btn", "Audit the leads"),
+        (OUTREACH, "prepare_btn", "Prepare a campaign"),
+        (OUTREACH, "start_btn", "Start sending"),
+        (OUTREACH, "pause_btn", "Pause sending"),
+        (OUTREACH, "stop_btn", "Stop sending"),
+        (OUTREACH, "copy_btn", "Copy the selected addresses"),
+        (OUTREACH, "suppress_btn", "Suppress the selected leads"),
+        (RESULTS, "action_btn", "Stop the scrape"),
+        (RESULTS, "pause_btn", "Pause the scrape"),
+        (RESULTS, "export_btn", "Export the results to CSV"),
+        (RESULTS, "outreach_btn", "Take these leads to Outreach"),
+        (INPUT, "start_btn", "Start scraping"),
+        (SETTINGS, "save_btn", "Save the settings"),
+        (SETTINGS, "discard_btn", "Discard the unsaved settings"),
+    )
+
+    def _commands(self) -> list:
+        """What the shell itself can be asked to do, named as of this instant."""
+        found = []
+        for at, key in enumerate(self.shell.destinations(), start=1):
+            found.append(Command(
+                key="go.%s" % key, title="Go to %s" % self.shell.label(key),
+                run=(lambda k=key: self.shell.go(k)),
+                where="Destination", shortcut="Ctrl+%d" % at))
+        found.append(Command(
+            key="go.settings", title="Go to Settings", run=self.on_settings,
+            where="Destination", shortcut="Ctrl+,"))
+        found.append(Command(
+            key="go.back", title="Go back", run=self.on_escape,
+            where="Destination", shortcut="Esc",
+            available=self.shell.can_go_back))
+
+        other = "light" if self.theme.name == "dark" else "dark"
+        found.append(Command(
+            key="view.theme", title="Switch to the %s theme" % other,
+            run=self.toggle_theme, where="Appearance", shortcut="Ctrl+Shift+T"))
+        density = ("compact" if self.theme.density == "comfortable"
+                   else "comfortable")
+        found.append(Command(
+            key="view.density", title="Switch to the %s density" % density,
+            run=self.toggle_density, where="Appearance",
+            shortcut="Ctrl+Shift+D"))
+        live = not self.settings.get("dry_run", True)
+        found.append(Command(
+            key="view.dry_run",
+            title=("Turn dry run back on" if live
+                   else "Turn dry run off and send for real"),
+            run=self.toggle_dry_run, where="Sending"))
+
+        for key, attribute, title in self._ACTIONS:
+            button = self._action_button(key, attribute)
+            if button is None:
+                continue
+            found.append(Command(
+                key="%s.%s" % (key, attribute),
+                title="%s — %s" % (self.shell.label(key), title),
+                run=(lambda k=key, a=attribute: self._press(k, a)),
+                # What the control itself currently says, which is not always
+                # what it does: Start reads "Start rehearsal" while dry run is
+                # on, and Audit counts what it would audit.
+                where=button.text(),
+                available=(lambda b=button: b.isEnabled())))
+        return found
+
+    def _action_button(self, key: str, attribute: str):
+        """A screen's own control, if that screen has been built and has one.
+
+        Built, because asking an unbuilt screen for its buttons would construct
+        every screen in the app the first time anybody pressed Ctrl+K — which is
+        the whole of what `register` was written to avoid. A command that is not
+        offered until its screen exists is also the honest answer: what a lead
+        table can do depends on what is selected in it.
+        """
+        screen = self.shell.built(key)
+        button = getattr(screen, attribute, None) if screen is not None else None
+        return button if isinstance(button, QAbstractButton) else None
+
+    def _press(self, key: str, attribute: str) -> None:
+        self.shell.go(key)
+        button = self._action_button(key, attribute)
+        if button is not None and button.isEnabled():
+            button.click()
+
+    # ── Keys ─────────────────────────────────────────────────────────────
+
+    def keyPressEvent(self, event) -> None:
+        """Escape and Return, and only when nothing nearer wanted them.
+
+        Handled here rather than as shortcuts because Qt matches a shortcut
+        before the key ever reaches the focused widget, and both of these keys
+        already belong to something else half the time: Escape closes a combo
+        box's popup and rejects a dialog, Return inserts a newline in a text
+        editor. A key event that has travelled all the way up to the window is
+        one that every one of those declined, which makes this the only place
+        where answering it cannot take a keystroke away from anybody.
+        """
+        key = event.key()
+        if key == Qt.Key_Escape and self.on_escape():
+            event.accept()
+            return
+        if key in (Qt.Key_Return, Qt.Key_Enter) and self.on_submit():
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def on_escape(self) -> bool:
+        """Back out of one thing: the palette, then Settings, then the screen."""
+        if self.shell.dismiss_palette():
+            return True
+        if self.shell.current_key == SETTINGS:
+            self.on_settings_closed()
+            return True
+        return self.shell.back()
+
+    def on_submit(self) -> bool:
+        """Return: press the button this form is asking to have pressed.
+
+        The audit's finding was that Enter did nothing anywhere, which on a
+        screen whose whole job is a form is the difference between typing a
+        search and running one. What it presses is scoped rather than global:
+        the search starts at whatever has the focus and walks outwards, so the
+        first enclosing card, page or screen that owns a primary button is the
+        one that answers, and a form nested inside another cannot fire the
+        outer one's action.
+
+        A view or a text editor answers Return itself and is left alone, because
+        a table row and a template body both mean something by it.
+        """
+        focus = QApplication.focusWidget()
+        if isinstance(focus, QAbstractButton):
+            if focus.isEnabled() and focus.isVisible():
+                focus.click()
+                return True
+            return False
+        if self._within(focus, (QAbstractItemView, QTextEdit, QPlainTextEdit)):
+            return False
+        button = self._primary_near(focus)
+        if button is None:
+            return False
+        button.click()
+        return True
+
+    def _primary_near(self, focus):
+        """The nearest primary button to `focus`, searching outwards from it.
+
+        Outwards and not downwards: the first enclosing card, page or screen
+        that owns one answers, so a form nested inside another cannot fire the
+        outer one's action. The screen itself is the last resort, which is also
+        the answer when nothing has the focus at all.
+        """
+        screen = self.shell.built(self.shell.current_key)
+        if screen is None:
+            return None
+        node = focus
+        while node is not None and node is not screen:
+            found = self._primary_in(node)
+            if found is not None:
+                return found
+            node = node.parentWidget()
+        return self._primary_in(screen)
+
+    @staticmethod
+    def _primary_in(node):
+        for button in node.findChildren(QPushButton):
+            if button.property("kind") in ("primary", "danger_primary") \
+                    and button.isVisible() and button.isEnabled():
+                return button
+        return None
+
+    def _within(self, widget, kinds) -> bool:
+        """Whether `widget` is one of `kinds`, or sits inside one on this screen."""
+        screen = self.shell.built(self.shell.current_key)
+        node = widget
+        while node is not None:
+            if isinstance(node, kinds):
+                return True
+            if node is screen or node is self:
+                return False
+            node = node.parentWidget()
+        return False
+
+    @staticmethod
+    def _typing() -> bool:
+        """Whether the focus is somewhere a keystroke is a character.
+
+        The one guard an unmodified shortcut needs. F1 is the only one the app
+        has, and it is guarded rather than exempted so that the next one added
+        inherits the rule instead of rediscovering it.
+        """
+        focus = QApplication.focusWidget()
+        if isinstance(focus, QComboBox):
+            return focus.isEditable()
+        return isinstance(focus, (QLineEdit, QTextEdit, QPlainTextEdit,
+                                  QAbstractSpinBox))
 
     # ── Appearance ───────────────────────────────────────────────────────
 
     def toggle_theme(self):
         """The other palette, live, and remembered."""
         wanted = "light" if self.theme.name == "dark" else "dark"
-        self.settings["theme"] = wanted
+        self._remember("theme", wanted)
+
+    def toggle_density(self):
+        """The other row height, live, and remembered."""
+        wanted = ("compact" if self.theme.density == "comfortable"
+                  else "comfortable")
+        self._remember("density", wanted)
+
+    def _remember(self, name: str, value: str) -> None:
+        self.settings[name] = value
         try:
             save_settings(self.settings)
         except Exception:
             traceback.print_exc()
         self.apply_appearance(self.settings)
+
+    def toggle_dry_run(self):
+        """Throw the safety switch, and ask first in the direction that mails.
+
+        The one setting in the app a wrong guess about costs somebody else
+        something: dry run off means the next campaign reaches real businesses.
+        Turning it back on is a retreat and needs no ceremony; turning it off is
+        `components.confirm` with the same wording the pill in the bar carries,
+        because a command surface that can arm a live send by fuzzy match on
+        three letters must not be able to do it silently.
+        """
+        wanted = not self.settings.get("dry_run", True)
+        if not wanted and not components.confirm(
+                self, title="Send for real?",
+                body="Dry run off means the next campaign mails real "
+                     "businesses. Every message is sent from your own mailbox "
+                     "and cannot be recalled.",
+                confirm_text="Turn dry run off", danger=True):
+            self._sync_dry_run()
+            return
+        self.settings["dry_run"] = wanted
+        try:
+            save_settings(self.settings)
+        except Exception:
+            traceback.print_exc()
+        self.shell.set_dry_run(wanted)
+        self._sync_dry_run()
+        outreach = self.shell.built(OUTREACH)
+        if outreach is not None:
+            outreach.refresh()
+
+    def _sync_dry_run(self) -> None:
+        """Keep the tick in the View menu on the same side as the pill."""
+        action = getattr(self, "_dry_action", None)
+        if action is not None:
+            action.setChecked(bool(self.settings.get("dry_run", True)))
 
     def apply_appearance(self, settings=None) -> None:
         """Wear what the settings ask for, without a restart."""
@@ -588,29 +1214,38 @@ class MainWindow(QMainWindow):
             return
 
         self.theme = wanted
-        if app is not None:
-            theme_module.apply(app, wanted)
-        components.use_theme(wanted)
-        self.shell.restyle(wanted)
-        self._repolish()
+        with self.shell.asleep():
+            if app is not None:
+                theme_module.apply(app, wanted)
+            components.use_theme(wanted)
+            self.shell.restyle(wanted)
+            # Rebuilt before the walk and not after it: a screen that answers
+            # `restyle` by building itself again throws away every widget the
+            # walk would have polished, so the old order paid for the whole of
+            # the screen on show twice and showed the second copy.
+            self.shell.restyle_screens()
+            self._repolish()
+        self._sync_menu()
 
     def _repolish(self) -> None:
-        """Every widget alive re-asks the style what it looks like.
+        """What is on screen re-asks the style what it looks like.
 
-        `setStyleSheet` on the application repolishes what exists, but the
-        style itself is replaced with each theme — `TickStyle` holds the
-        palette it paints check marks with — so the tree is walked once here
-        and every screen that knows how to rebuild its own components is asked
-        to.
+        `setStyleSheet` on the application repolishes what exists, but the style
+        itself carries colours the sheet cannot state — `TickStyle` paints every
+        check mark — so the tree is walked once here as well.
+
+        Walked as far as the user can see and no further. It used to cover every
+        widget in the process, which with four screens built is 827 of them at
+        140ms, and 630 of those belong to screens behind this one that
+        `restyle_screens` has already decided will rebuild themselves before
+        anybody sees them again. Repolishing a widget that is about to be
+        replaced is work paid for twice and shown once.
         """
-        for widget in self.findChildren(QWidget) + [self]:
+        bar = self.menuBar()
+        for widget in self.shell.onstage() + [bar, self]:
             widget.style().unpolish(widget)
             widget.style().polish(widget)
             widget.update()
-        for screen in self.shell.screens():
-            restyle = getattr(screen, "restyle", None)
-            if callable(restyle):
-                restyle()
 
     # ── Shutdown ─────────────────────────────────────────────────────────
 

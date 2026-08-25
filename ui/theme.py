@@ -990,6 +990,34 @@ QHeaderView::section {
 
 /* ── Menus ───────────────────────────────────────────────────────────────── */
 
+/* The bar exists to be read rather than clicked: it is where a keyboard user
+   finds out that Ctrl+K opens the palette and Ctrl+3 goes to Outreach, because
+   Qt writes an action's shortcut beside its name. Unstyled it arrives in the
+   platform's own grey, which on the dark palette is a white strip across the
+   top of the window. */
+QMenuBar {
+    background-color: ${color.surface};
+    color: ${color.text.secondary};
+    border-bottom: 1px solid ${color.border.subtle};
+    font-size: ${font.small.size}px;
+}
+
+QMenuBar::item {
+    padding: ${space.1}px ${space.3}px;
+    border-radius: ${radius.sm}px;
+    background: transparent;
+}
+
+QMenuBar::item:selected {
+    background-color: ${color.surfaceHover};
+    color: ${color.text.primary};
+}
+
+QMenuBar::item:pressed {
+    background-color: ${color.surfaceActive};
+    color: ${color.text.onAccent};
+}
+
 QMenu {
     background-color: ${color.raised};
     border: 1px solid ${color.border.default};
@@ -1016,6 +1044,30 @@ QMenu::separator {
     height: 1px;
     background: ${color.border.subtle};
     margin: ${space.1}px ${space.1}px;
+}
+
+/* ── The command palette ─────────────────────────────────────────────────── */
+
+/* The one place `scrim` is spent. It was defined in both palettes and used by
+   nothing, so the app had no way to say "this is the thing you are answering"
+   — and the palette covers its parent whole, so without a ground it would sit
+   over a live screen with no edge to it. */
+QWidget#command_scrim {
+    background-color: ${color.scrim};
+}
+
+QFrame#command_card {
+    background-color: ${color.raised};
+    border: 1px solid ${color.border.default};
+    border-radius: ${radius.lg}px;
+}
+
+/* The rows are painted by a delegate, so this says only where they sit: no
+   well, no second border inside the card that already has one. */
+QListWidget#command_list {
+    background: transparent;
+    border: none;
+    padding: ${space.0}px;
 }
 
 /* ── Bars and sliders ────────────────────────────────────────────────────── */
@@ -1321,8 +1373,20 @@ def enable_high_dpi() -> None:
     the app renders at 1x on a scaled display. `run()` calls this first;
     `apply()` calls it again so a caller that only has an app still gets the
     pixmap half.
+
+    Which is why the scaling attribute is asked for only while there is no
+    application to ignore it. `apply()` runs on every live theme and density
+    change, long after the QApplication exists, and Qt answers a late attempt
+    with `Attribute Qt::AA_EnableHighDpiScaling must be set before
+    QCoreApplication is created` on stderr — one line per appearance change, 18
+    in a sweep that changed the density fifteen times, and the only warning this
+    app produces that is its own. A log that is all noise is a log nobody reads
+    the one real line in. The ordering in `run()` is already right, so nothing
+    about how the app scales changes here: what goes is a request Qt was
+    throwing away.
     """
-    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    if QApplication.instance() is None:
+        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
 
 

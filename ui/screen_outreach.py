@@ -7,14 +7,14 @@ the shell's tabs now, not this screen's. `ui/app.py` draws one bar at
 `control.header`; this file hands it `("Leads", "Campaign", "Sending", "Stats")`
 through `set_subtabs` and draws no chrome of its own.
 
-Three rules shape the code below.
+Five rules shape the code below.
 
 Nothing slow runs on the GUI thread. Crawling a site, calling a model and
 opening an SMTP session are minutes of network time, so they happen in the
 workers in `core.campaign`; this file starts them and draws what they emit.
 The same rule reaches the drawing, because a redraw that walks the whole lead
-list once per lead is a network wait by another name. Two shapes of that were
-measured and both are closed here.
+list once per lead is a network wait by another name. Five shapes of that were
+measured and all five are closed here.
 
   * every audited lead used to rebuild the screen's whole idea of the table.
     `_on_lead_audited` called `_apply_filters`, which walked every row, and
@@ -31,6 +31,39 @@ measured and both are closed here.
     measured 50µs a call — so reading the leads a filter pass needs cost more
     than everything else on the screen put together. Row `n` is `self._leads[n]`
     by construction, and that is what `_lead_at` answers with.
+  * the table built a cell for every lead in the store. At 5,000 leads that is
+    35,000 `QTableWidgetItem`s, one `insertRow` at a time, for the twenty rows
+    an 800px window can show — 2,379ms of a 2,648ms pass inside
+    `components._Table.add_row`, paid on every reload, on every column-header
+    click and at the end of every audit run. The table still holds a row per
+    lead, so the scrollbar tells the truth about the size of the list, but only
+    the band around the viewport is made of cells; see `_paint_window`.
+  * every button label read the selection through `selectedIndexes()`, which is
+    one `QModelIndex` per *cell*. A Ctrl+A over 5,000 leads therefore built
+    35,000 objects to work out one number, on the keystroke and again for each
+    of five labels. The selection's ranges answer the same question.
+  * a reload emptied every derived cache. Suppressing one lead out of five
+    thousand re-decoded five thousand audit blobs and re-asked `core.templates`
+    five thousand times for an answer none of them had changed. Each lead now
+    carries a stamp of the fields those caches are derived from, plus one for
+    the settings the personalisation call reads, and only what moved is
+    forgotten.
+
+  Measured on one 5,000-lead store, before and after, back to back, as the
+  median of nine runs in milliseconds:
+
+      _fill_table    677 -> 29      a column-header sort    781 ->  32
+      _reload_leads  806 -> 103     the end-of-run reload  1008 -> 104
+      Ctrl+A         196 ->   8     one audited lead landing  0.1 -> 0.3
+
+  The same four at 500 leads: 92 -> 13, 91 -> 15, 115 -> 26, 96 -> 27. What is
+  left of the reload is not this screen's — 49ms of its 103 is
+  `core.outreach_db.list_leads` reading 5,000 rows with their audit blobs.
+  Two things cost a little more than they did, and both are the price of
+  something asked for: a keystroke in the filter box went 15ms -> 21ms because
+  the box parses terms now instead of matching one substring, and a scroll from
+  the top of the list to the bottom went 14ms -> 25ms because rows are built as
+  they arrive rather than all of them beforehand.
 
 Nothing on screen is rebuilt for a screen nobody is looking at. Changing the
 theme or the density asks every built screen to `restyle()`, and this one used
@@ -46,6 +79,16 @@ Nothing here says no without saying how through, and nothing says yes about a
 queue that is not moving. A disabled control carries the sentence that would
 re-enable it, and the Sending tab reports what is actually happening rather
 than what was true when the campaign was prepared.
+
+Nothing the user arranged is thrown away when the window closes. The leads tab
+is a working surface and the work is the arrangement: which columns are worth
+looking at, which filter narrows five thousand rows to the forty worth calling,
+which order they are in. All of it lived for exactly one session. It is kept in
+`lead_views.json` beside `settings.json` — not inside it, because
+`core.settings._merge` keeps only the keys named in `DEFAULT_SETTINGS` and
+drops the rest on the next save — and a named arrangement is a *view*, which
+the user can leave and come back to. Changing anything a view did not say takes
+the name off rather than rewriting it underneath them.
 
 Every value this screen paints comes from `ui/theme.py` through
 `ui/components.py`. It used to keep a parallel dark-only palette of its own —
@@ -70,6 +113,22 @@ audit measured, and what replaced each of it:
   * suppressing a lead was permanent, unconfirmed, and silently acted on one
     row of a multi-row selection. It goes through `components.confirm()`, it
     acts on the whole selection, and the toast that reports it carries Undo.
+  * the seven columns' floors add up to 1,380px, so at the 1,080px default
+    window the lead table scrolled sideways and at the 880px minimum 500px of
+    it was off the right-hand edge — with no way for the user to say which
+    columns they cared about. Switching three off puts the table back inside
+    the viewport exactly; that is what the Columns menu is for, and it is why
+    the spec is handed to `components.table()` already trimmed rather than
+    hidden in place afterwards.
+  * the filter box could not be told where to look, and could not be given two
+    words. `toronto roofing` matched nothing at all — the record says "Toronto"
+    in the city and "Roofing contractor" in the category, and one substring
+    cannot ask for both. Every word is its own needle now, `city:toronto` looks
+    in one field, and a quoted phrase stays whole.
+  * a batch of five hundred could be crawled in one press and then had to be
+    dealt with one right-click at a time. Audit, Suppress, Export and Remove
+    all read the same selection and all say how many rows they are about to
+    touch.
   * the dry-run banner was a full-width 44px QPushButton wearing a dashed
     border — the same component as the 28px header badge, at a different size.
     The shell owns that state now; this screen says what the mode costs in a
@@ -94,7 +153,7 @@ from PyQt5.QtWidgets import (
     QDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QListWidget,
     QListWidgetItem, QMenu, QMessageBox, QProgressBar, QScrollArea,
     QSizePolicy, QStackedWidget, QStyle, QStyleOptionViewItem,
-    QStyledItemDelegate, QTextBrowser, QVBoxLayout, QWidget,
+    QStyledItemDelegate, QTableWidgetItem, QTextBrowser, QVBoxLayout, QWidget,
 )
 
 from core import campaign as _campaign
@@ -161,6 +220,25 @@ _LEAD_COLUMNS = (
 (_COL_NAME, _COL_EMAIL, _COL_CITY, _COL_CATEGORY, _COL_SCORE, _COL_GAP,
  _COL_STATUS) = range(len(_LEAD_COLUMNS))
 
+# The seven names above are *fields*, not table columns, and that is the whole
+# of the column-visibility change. A field is a thing a lead has; a column is a
+# place on screen where one of them happens to be painted today. `_col_of` on
+# the screen maps the first onto the second, and a hidden field simply has no
+# entry — so the table `components.table()` is handed is a spec of exactly the
+# columns the user asked for, and `_take_widths` shares the window between
+# those and not between those plus four it is not painting.
+#
+# Business is not in the toggle list. A row with no business name on it cannot
+# be told apart from the row above it, and a table whose every column can be
+# turned off has a state in which it says nothing at all.
+_FIXED_FIELDS = (_COL_NAME,)
+
+# What each field is called in the file that remembers the choice. Names and
+# not indices: a column added to the spec above must not silently renumber a
+# saved view written last month.
+_FIELD_KEYS = ("name", "email", "city", "category", "score", "gap", "status")
+_FIELD_OF_KEY = {key: index for index, key in enumerate(_FIELD_KEYS)}
+
 # Which lead field each column sorts and searches on. The two badge columns
 # sort on the value behind the badge — an em dash compares greater than any
 # digit as text, so a Score column sorted as written floats every unaudited
@@ -168,9 +246,47 @@ _LEAD_COLUMNS = (
 _COL_KEYS = {_COL_NAME: "name", _COL_EMAIL: "email", _COL_CITY: "city",
              _COL_CATEGORY: "category", _COL_STATUS: "status"}
 
+# What the filter box will accept in front of a colon, and the lead field it
+# then reads. The plain-English words are here because "business:" is what a
+# user types and "name" is what the column is called in the database.
+_SEARCH_FIELDS = {
+    "name": "name", "business": "name", "company": "name",
+    "email": "email", "e-mail": "email", "address": "email",
+    "city": "city", "town": "city", "area": "city",
+    "category": "category", "type": "category", "industry": "category",
+    "phone": "phone", "tel": "phone",
+    "website": "website", "site": "website", "url": "website",
+    "status": "status", "source": "source",
+}
+_SEARCH_TERMS = re.compile(
+    r'(?:(?P<field>[a-z][a-z-]*):)?(?:"(?P<quoted>[^"]*)"|(?P<bare>[^\s"]+))')
+
+_SEARCH_HELP = (
+    "Every word has to land somewhere in the lead, so «toronto roofing» finds "
+    "the roofers in Toronto. Put a field in front of the colon to look in one "
+    "place — city:toronto, category:roofing, status:sent, email:gmail — and "
+    "quote a phrase to keep it whole. Name, email, city, category, phone, "
+    "website, source, headline gap, score band and status are all read.")
+
 # The badge a cell paints, and the value it sorts on. `+ 1` and `+ 2` belong to
 # `components` (the untruncated text and the sort key), so this starts at `+ 3`.
 _BADGE_ROLE = Qt.UserRole + 3
+
+# `components.Column.align` said in Qt's own words. The row writer below builds
+# its own items, so it is the one thing it cannot ask `components` for; see
+# `_paint_row` for why it builds them and where the whole of it belongs.
+_ALIGNMENT = {"left": Qt.AlignLeft, "right": Qt.AlignRight,
+              "center": Qt.AlignHCenter}
+
+# How many rows past the top and bottom of the viewport carry real cells. The
+# table holds a row per lead so the scrollbar tells the truth about the list,
+# but only this band is built out of `QTableWidgetItem`s: a flick of the wheel
+# moves about a screenful, and the pad is what keeps the next screenful ready
+# before it is asked for. Rows further out than `_WINDOW_KEEP` give their cells
+# back, so a scroll from end to end of five thousand leads holds a few dozen
+# rows of widgets rather than accumulating all five thousand.
+_WINDOW_PAD = 24
+_WINDOW_KEEP = 120
 
 # Keys are lead statuses, except the two prefixed "~": those filter on whether
 # the lead's email would say anything about them, which is not a status and is
@@ -181,6 +297,36 @@ _STATUS_FILTERS = (
     ("Queued", "queued"), ("Sent", "sent"), ("Replied", "replied"),
     ("Bounced", "bounced"), ("Suppressed", "suppressed"),
 )
+_STATUS_KEYS = [key for _label, key in _STATUS_FILTERS]
+
+# ── What the leads tab remembers ─────────────────────────────────────────────
+# The filter box, the status picker, the sort and the chosen columns are the
+# user's working set, not the app's configuration, and they are kept in a file
+# of their own beside `settings.json` rather than inside it. Two reasons, and
+# the first is a bug this would otherwise walk into: `core.settings._merge`
+# keeps only the keys named in `DEFAULT_SETTINGS` and drops everything else on
+# the next save, so a saved view written from here would disappear the first
+# time the user pressed Save on the Settings screen. The second is that a
+# named view is worth more than the session it was made in — the brief's whole
+# point — and a value that has to survive a restart has to be on disk.
+#
+# The path is resolved on every call rather than captured at import, for the
+# same reason `core.outreach_db._default_path` is: the test suite repoints
+# `settings.SETTINGS_DIR`, and a module constant would have been read before it
+# could.
+
+_VIEWS_FILENAME = "lead_views.json"
+
+# Past this it is a list nobody reads, and the picker stops being a shortcut.
+_MAX_VIEWS = 24
+_VIEW_NAME_CH = 40
+
+# How long the file waits after a keystroke before it is written. A decision —
+# saving a view, deleting one, choosing a column — goes to disk in the same
+# call, because the user is entitled to see it stick. What is thrown away here
+# is a write-then-rename per character typed in the filter box, measured at
+# 3.6ms of GUI-thread disk on this machine and worse on a slower one.
+_SAVE_AFTER_MS = 500
 
 # Columns a CSV may name in any of the ways people actually name them.
 _CSV_ALIASES = {
@@ -198,6 +344,10 @@ _CSV_ALIASES = {
 
 # A CSV is a hand-made file; past this it is a mistake, not a lead list.
 _CSV_MAX_ROWS = 20000
+
+# How many lead ids one DELETE names. Well under any SQLite's bound-variable
+# limit, so a selection of any size is a loop rather than a refusal.
+_DELETE_BATCH = 500
 
 # Anything that still looks like a merge token after rendering. The preview
 # refuses to draw a body matching this rather than showing the user copy that
@@ -418,6 +568,33 @@ def _names_of(leads, limit: int = _NAMED_IN_SUMMARY) -> str:
     return _named(len(leads), leads, limit)
 
 
+_STAMPED = ("status", "opportunity_score", "audit_json", "ai_json", "name",
+            "email", "city", "category", "phone", "website", "source")
+
+
+def _lead_stamp(lead: dict) -> tuple:
+    """Everything the screen's derived caches read off one record.
+
+    Raw values and no conversion: this is asked once per lead on every reload,
+    and `_text_of` eleven times over five thousand leads costs more than the
+    JSON decode it is there to save.
+    """
+    return tuple(lead.get(field) for field in _STAMPED)
+
+
+def _rules_stamp(settings: dict) -> str:
+    """The settings the personalisation answers depend on, as one comparable value.
+
+    The whole dict rather than the handful of keys `core.templates` happens to
+    read today: guessing at that list is how a cache goes stale the next time
+    that module grows a rule.
+    """
+    try:
+        return json.dumps(settings, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return repr(sorted(settings)) if isinstance(settings, dict) else ""
+
+
 def _clear_layout(layout) -> None:
     while layout.count():
         item = layout.takeAt(0)
@@ -425,6 +602,105 @@ def _clear_layout(layout) -> None:
         if widget is not None:
             widget.setParent(None)
             widget.deleteLater()
+
+
+# ── Saved views on disk ──────────────────────────────────────────────────────
+
+def _views_path() -> str:
+    """Where the leads tab keeps what it remembers. Resolved late, never cached."""
+    return os.path.join(_settings.SETTINGS_DIR, _VIEWS_FILENAME)
+
+
+def _fields_from_keys(keys, fallback) -> tuple:
+    """A stored column list read back as field ids, in the spec's own order.
+
+    Unknown names are dropped rather than refused, so a file written by a build
+    that had a column this one does not still opens. The fixed fields are put
+    back whatever the file says: a view saved before Business was pinned must
+    not be able to produce a table of nameless rows.
+    """
+    wanted = {_FIELD_OF_KEY[key] for key in keys or ()
+              if isinstance(key, str) and key in _FIELD_OF_KEY}
+    if not wanted:
+        return tuple(fallback)
+    wanted.update(_FIXED_FIELDS)
+    return tuple(field for field in range(len(_LEAD_COLUMNS)) if field in wanted)
+
+
+def _keys_of_fields(fields) -> list:
+    return [_FIELD_KEYS[field] for field in fields
+            if 0 <= field < len(_FIELD_KEYS)]
+
+
+def _read_views() -> dict:
+    """Everything the leads tab remembered last time, or sane empties.
+
+    A file this screen cannot read is a file it overwrites on the next save,
+    and that is deliberate: the alternative is a lead table that will not open
+    because a JSON file next to it has a stray comma in it.
+    """
+    try:
+        with open(_views_path(), encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    views = [view for view in (data.get("views") or [])
+             if isinstance(view, dict) and _text_of(view.get("name")).strip()]
+    return {
+        "columns": list(data.get("columns") or []),
+        "views": views[:_MAX_VIEWS],
+        "current": _text_of(data.get("current")),
+        "search": _text_of(data.get("search")),
+        "status": _text_of(data.get("status")),
+        "sort": list(data.get("sort") or []),
+    }
+
+
+def _write_views(state: dict) -> bool:
+    """Write-then-rename, for the same reason `core.settings` does."""
+    path = _views_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(state, handle, indent=1)
+        os.replace(tmp, path)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+# ── Reading the filter box ───────────────────────────────────────────────────
+
+def _parse_query(text: str) -> list:
+    """The filter box as a list of (field, needle) the table can answer.
+
+    Three things a single `needle in haystack` could not do, and all three were
+    asked for. `city:toronto` looks in one field, so a business called Toronto
+    Roofing does not answer a search for the city. A quoted `"roofing
+    contractor"` stays one needle. And two bare words are two needles that must
+    both land, which is what makes `toronto roofing` find the roofers in
+    Toronto — the case the old single-substring match could never match,
+    because the record says "Toronto" in one field and "Roofing contractor" in
+    another and no substring of it says both.
+
+    An unknown prefix is not a field, it is text: `9:30` searches for `9:30`.
+    """
+    terms = []
+    for match in _SEARCH_TERMS.finditer(_text_of(text).strip().lower()):
+        field = match.group("field")
+        quoted, bare = match.group("quoted"), match.group("bare")
+        needle = quoted if quoted is not None else (bare or "")
+        if field and field in _SEARCH_FIELDS:
+            if needle:
+                terms.append((_SEARCH_FIELDS[field], needle))
+        elif field:
+            terms.append(("", match.group(0)))
+        elif needle:
+            terms.append(("", needle))
+    return terms
 
 
 # ── Local layout helpers ─────────────────────────────────────────────────────
@@ -689,6 +965,107 @@ class _DayBars(QWidget):
             painter.setPen(Qt.NoPen)
 
 
+# ── Naming a view ────────────────────────────────────────────────────────────
+
+def _menu_text(name: str) -> str:
+    """A user's own words as a menu entry, clipped and with its ampersands kept.
+
+    Qt reads a single `&` as the mnemonic marker, so a view called "Smith &
+    Sons" arrives on the menu as "Smith _Sons" with no way to press it.
+    """
+    return _clip(name, _VIEW_NAME_CH).replace("&", "&&")
+
+
+def _view_sentence(view: dict) -> str:
+    """What one saved view actually shows, in a line a menu can hold.
+
+    Written out rather than reduced to its name, because a list of five names
+    the user typed in a hurry six weeks ago is a list of five guesses. The
+    tooltip says what pressing it will do.
+    """
+    parts = []
+    search = _text_of(view.get("search")).strip()
+    if search:
+        parts.append("matching “%s”" % search)
+    wanted = _text_of(view.get("status"))
+    label = next((text for text, key in _STATUS_FILTERS if key == wanted), "")
+    if wanted and label:
+        parts.append(label.lower())
+    sort = list(view.get("sort") or [])
+    if sort and sort[0] in _FIELD_OF_KEY:
+        field = _FIELD_OF_KEY[sort[0]]
+        down = not (len(sort) > 1 and sort[1] == "asc")
+        parts.append("by %s%s" % (
+            _LEAD_COLUMNS[field].title.lower(),
+            "" if not down else
+            ", highest first" if field == _COL_SCORE else ", reversed"))
+    columns = [key for key in (view.get("columns") or []) if key in _FIELD_OF_KEY]
+    if columns and len(columns) != len(_LEAD_COLUMNS):
+        parts.append("%d of %d columns" % (len(columns), len(_LEAD_COLUMNS)))
+    return "every lead" if not parts else ", ".join(parts)
+
+
+class _NameViewDialog(QDialog):
+    """Ask for a name for the current filter. One field and two buttons.
+
+    A dialog and not `QInputDialog`, for the same reason `components.confirm`
+    is not `QMessageBox.question`: the box Qt builds wears Qt's palette and its
+    own button labels, and this app has two palettes and says what a button
+    will do rather than "OK".
+    """
+
+    def __init__(self, current: str, parent=None):
+        super().__init__(parent)
+        t = components.active_theme()
+        self.setWindowTitle("Save this view")
+        self.setModal(True)
+        box = _rows(self, margin="4", spacing="3", t=t)
+        box.addWidget(components.heading("Save this view", level="h3"))
+        self.field = components.text_field(
+            placeholder="Toronto roofers worth calling",
+            label="Name",
+            help="The filter, the sort and the columns on screen, kept under "
+                 "this name. Saving over a name replaces it.")
+        self.field.setText(current)
+        box.addWidget(self.field)
+
+        row = _cols(margin="0", spacing="2", t=t)
+        row.addStretch()
+        row.addWidget(components.button("Cancel", kind="secondary",
+                                        on_click=self.reject))
+        self.save_btn = components.button("Save view", kind="primary",
+                                          on_click=self.accept)
+        row.addWidget(self.save_btn)
+        box.addLayout(row)
+        # Return does what the button does, including refusing: a dialog whose
+        # Save is disabled and whose Return saves anyway has two answers to the
+        # same question.
+        self.field.edit.returnPressed.connect(self._on_return)
+        self.field.edit.textChanged.connect(self._on_typed)
+        self._on_typed(current)
+
+    def _on_return(self) -> None:
+        if self.save_btn.isEnabled():
+            self.accept()
+
+    def _on_typed(self, text: str) -> None:
+        self.save_btn.setEnabled(bool(_text_of(text).strip()))
+        self.save_btn.setToolTip("" if _text_of(text).strip()
+                                 else "A view needs a name to be found by")
+
+    def name(self) -> str:
+        return _text_of(self.field.text()).strip()[:_VIEW_NAME_CH]
+
+
+def _ask_name(parent, current: str = "") -> str:
+    """The dialog, run. "" when the user backed out."""
+    dialog = _NameViewDialog(current, parent)
+    try:
+        return dialog.name() if dialog.exec_() == QDialog.Accepted else ""
+    finally:
+        dialog.deleteLater()
+
+
 # ── What was actually sent ───────────────────────────────────────────────────
 
 class _SentMailDialog(QDialog):
@@ -935,6 +1312,12 @@ class OutreachScreen(QWidget):
         # and wholesale when the list is re-read.
         self._gaps: dict[int, tuple] = {}
         self._blobs: dict[int, str] = {}
+        # lead id -> the fields those three are derived from, as they were when
+        # the answers were worked out, and the same for the settings the
+        # personalisation call reads. A reload compares these and forgets only
+        # the leads whose record actually moved.
+        self._stamps: dict[int, tuple] = {}
+        self._rules_stamp = ""
         # lead id -> the row it is painted on. Row `n` holds `self._leads[n]`,
         # so this is also the index of the record, and it is what lets an
         # audited lead find itself without a search.
@@ -945,13 +1328,34 @@ class OutreachScreen(QWidget):
         self._buckets: dict[str, int] = {}
         self._generic_count = 0
         self._visible = 0
-        # (column, value) -> the words the badge in that cell reads.
+        # (field, value) -> the words the badge in that cell reads.
         self._badge_text: dict[tuple, str] = {}
+        # Which rows are currently made of real cells. The table holds a row per
+        # lead so the scrollbar is honest about the size of the list, but only
+        # the band around the viewport is built; see `_paint_window`.
+        self._painted: set = set()
         # Set when a theme change reaches this screen while it is off screen,
         # and spent by `showEvent`.
         self._stale = False
         self._search = ""
+        self._terms: list = []
+        # Sorted by a *field*, not by a column: a sort has to survive the column
+        # it sorts on being switched off, and after that the two are not the
+        # same number.
         self._sort = (_COL_SCORE, Qt.DescendingOrder)
+        # What the leads tab remembered from last time: the chosen columns, the
+        # named views, and the filter that was live when the app last closed.
+        self._stored = _read_views()
+        self._fields = _fields_from_keys(self._stored.get("columns"),
+                                         range(len(_LEAD_COLUMNS)))
+        self._col_of: dict[int, int] = {}
+        self._views: list = list(self._stored.get("views") or [])
+        self._view_name = _text_of(self._stored.get("current"))
+        # True only while this screen is putting a remembered filter back into
+        # its own widgets. Setting the search box fires `textChanged`, which is
+        # how the user says "this is not that view any more" — and a restore
+        # that let that through would delete the name it had just restored.
+        self._restoring = False
         self._campaign_id = 0
         self._plan: dict = {}
         self._sending = False
@@ -976,7 +1380,16 @@ class OutreachScreen(QWidget):
         self._echoing = False
         self._context_line = ""
 
+        # The filter box writes what it is showing on every keystroke, and the
+        # write is disk. Started by `_save_view_state` and never restarted by a
+        # rebuild, because `_restyle_now` reparents this screen's *widgets* and
+        # a QTimer is not one.
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.timeout.connect(self._flush_view_state)
+
         self._build()
+        self._restore_filter()
         self.refresh()
 
         self._tick = QTimer(self)
@@ -1117,17 +1530,15 @@ class OutreachScreen(QWidget):
         bar = _cols(margin="0", spacing="2", t=t)
         bar.addWidget(components.section_label("Leads"))
 
-        self.lead_search = components.search_field("Filter by name, email, city…")
-        self.lead_search.setToolTip(
-            "Matches the business name, the address, the city, the category, "
-            "the headline gap and the status")
+        self.lead_search = components.search_field("Filter, or city:toronto…")
+        self.lead_search.setToolTip(_SEARCH_HELP)
         self.lead_search.textChanged.connect(self._on_search_changed)
         bar.addWidget(self.lead_search)
 
         self.status_filter = _combo(t)
         for label, _key in _STATUS_FILTERS:
             self.status_filter.addItem(label)
-        self.status_filter.currentIndexChanged.connect(lambda _i: self._apply_filters())
+        self.status_filter.currentIndexChanged.connect(self._on_status_filter)
         bar.addWidget(self.status_filter)
 
         bar.addStretch()
@@ -1135,6 +1546,7 @@ class OutreachScreen(QWidget):
         self.lead_counts.setWordWrap(False)
         bar.addWidget(self.lead_counts)
         box.addLayout(bar)
+        box.addLayout(self._build_view_bar(t))
 
         self.lead_stack = QStackedWidget()
         self.lead_table = self._make_table(t)
@@ -1154,9 +1566,48 @@ class OutreachScreen(QWidget):
         box.addLayout(self._build_lead_actions(t))
         box.addWidget(components.hint(
             "Double-click a lead to open its website, right-click one for more, "
-            "click a column header to sort. Auditing is what fills the Score "
+            "click a column header to sort. Columns picks what is on screen and "
+            "Views keeps a filter under a name. Auditing is what fills the Score "
             "and Headline gap columns, and what the email copy is built from."))
         return page
+
+    def _build_view_bar(self, t):
+        """What the table is showing, above it; what to do with it, below.
+
+        A row of its own rather than three more buttons on the filter bar, and
+        the reason is a measurement. At the 880px window minimum the leads tab
+        has 840px of usable width; the filter bar already wants 735 of it for a
+        heading, a search box, a status picker and the count line, and adding
+        Views, Columns and Import took it to 1,136 — so Qt shrank the search
+        box to 34px and cut "Import CSV…" mid-word. Split in two, the filter
+        bar is back to 735 and this row wants 402.
+
+        The split is also the honest grouping. Everything here changes what the
+        table *shows*; everything on the row under the table acts on what is
+        selected. They were never the same kind of control.
+        """
+        bar = _cols(margin="0", spacing="2", t=t)
+
+        self.view_btn = components.button("Views", kind="secondary", size="sm",
+                                          on_click=self._show_views_menu)
+        bar.addWidget(self.view_btn)
+
+        self.columns_btn = components.button("Columns", kind="secondary", size="sm",
+                                             on_click=self._show_columns_menu)
+        self.columns_btn.setToolTip(
+            "Choose which columns the table shows. The choice is remembered.")
+        bar.addWidget(self.columns_btn)
+
+        import_csv = components.button("Import CSV…", kind="secondary", size="sm",
+                                       on_click=self._on_import_csv)
+        import_csv.setToolTip("Load leads from a spreadsheet export")
+        bar.addWidget(import_csv)
+
+        bar.addStretch()
+        self.lead_status = components.body_label("", tone="tertiary")
+        self.lead_status.setWordWrap(False)
+        bar.addWidget(self.lead_status)
+        return bar
 
     def _build_lead_actions(self, t):
         """The bulk row: what a selection of five hundred leads can be told to do.
@@ -1165,25 +1616,33 @@ class OutreachScreen(QWidget):
         hundred could be crawled in a batch and then had to be suppressed,
         copied or reviewed one right-click at a time. Every button here reads
         the selection, and says how many rows it is about to act on.
+
+        Four of them now, which is the brief's list: audit, suppress, export,
+        remove. Suppress and Remove are the two that end a lead and they are
+        deliberately not the same action — suppressing keeps the address on
+        file so it can never be mailed again, which is what an unsubscribe
+        means; removing forgets the row, which is what a bad import means. Both
+        ask first, and both are `kind="danger"` because both are irreversible
+        in the sense that matters: nothing on this screen can put the crawl
+        back.
         """
         actions = _cols(margin="0", spacing="2", t=t)
 
-        import_csv = components.button("Import CSV…", kind="secondary", size="sm",
-                                       on_click=self._on_import_csv)
-        import_csv.setToolTip("Load leads from a spreadsheet export")
-        actions.addWidget(import_csv)
-
-        self.copy_btn = components.button("Copy emails", kind="secondary", size="sm",
+        self.copy_btn = components.button("Copy", kind="secondary", size="sm",
                                           on_click=self._on_copy_emails)
         actions.addWidget(self.copy_btn)
+
+        self.export_btn = components.button("Export…", kind="secondary", size="sm",
+                                            on_click=self._on_export_clicked)
+        actions.addWidget(self.export_btn)
 
         self.suppress_btn = components.button("Suppress…", kind="danger", size="sm",
                                               on_click=self._on_suppress_clicked)
         actions.addWidget(self.suppress_btn)
 
-        self.lead_status = components.body_label("", tone="tertiary")
-        self.lead_status.setWordWrap(False)
-        actions.addWidget(self.lead_status)
+        self.remove_btn = components.button("Remove…", kind="danger", size="sm",
+                                            on_click=self._on_remove_clicked)
+        actions.addWidget(self.remove_btn)
         actions.addStretch()
 
         self.audit_btn = components.button("Audit all", kind="primary", size="lg",
@@ -1199,24 +1658,42 @@ class OutreachScreen(QWidget):
         from its text, and `QTableWidget.sortItems` reorders items under a
         painted row. Sorting the records and rebuilding is one pass over a list
         this screen already holds.
+
+        Built from the fields the user has left switched on, not from the whole
+        spec with the unwanted ones hidden afterwards. `_take_widths` shares
+        the window out between the columns it was handed, so a hidden column
+        that is still in the spec keeps its share and leaves a dead band beside
+        the last one. Measured at 1280 with City, Category and Status off:
+        hidden in place the four remaining columns paint 780px of a 1278px
+        viewport, leaving 498px of empty table; handed `components.table()` as
+        a four-column spec they paint 1276px and leave 2.
         """
-        table = components.table(_LEAD_COLUMNS, density=t.density, sortable=False)
+        self._col_of = {field: index for index, field in enumerate(self._fields)}
+        table = components.table([_LEAD_COLUMNS[field] for field in self._fields],
+                                 density=t.density, sortable=False)
         # New table, new delegates, so the labels cached off the old ones are
         # answers about widgets that no longer exist.
         self._badge_text = {}
+        self._painted = set()
         table.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        table.setItemDelegateForColumn(
-            _COL_SCORE, _BadgeDelegate(components.score_badge, table))
-        table.setItemDelegateForColumn(
-            _COL_STATUS, _BadgeDelegate(components.status_pill, table))
+        for field, build in ((_COL_SCORE, components.score_badge),
+                             (_COL_STATUS, components.status_pill)):
+            column = self._col_of.get(field, -1)
+            if column >= 0:
+                table.setItemDelegateForColumn(column, _BadgeDelegate(build, table))
         table.customContextMenuRequested.connect(self._show_lead_menu)
         table.cellDoubleClicked.connect(self._on_lead_double_clicked)
         table.itemSelectionChanged.connect(self._on_lead_selection_changed)
+        # Both halves of "which rows exist as cells": the scrollbar moving is
+        # the user asking for rows that are not built yet, and the viewport
+        # growing is the same question asked by a drag of the window edge.
+        table.verticalScrollBar().valueChanged.connect(self._on_lead_scrolled)
+        table.viewport().installEventFilter(self)
 
         head = table.horizontalHeader()
         head.setSectionsClickable(True)
         head.setSortIndicatorShown(True)
-        head.setSortIndicator(*self._sort)
+        head.setSortIndicator(self._col_of.get(self._sort[0], 0), self._sort[1])
         head.sectionClicked.connect(self._on_header_clicked)
         return table
 
@@ -1638,6 +2115,7 @@ class OutreachScreen(QWidget):
         view = self.view_group.checkedId()
 
         self.setUpdatesEnabled(False)
+        self._restoring = True
         try:
             holder = QWidget()
             holder.setLayout(self.layout())
@@ -1663,7 +2141,9 @@ class OutreachScreen(QWidget):
                 self.lead_search.setText(search)
             self.pages.setCurrentIndex(max(0, min(len(self.TABS) - 1, tab)))
         finally:
+            self._restoring = False
             self.setUpdatesEnabled(True)
+        self._refresh_view_button()
         self._tell_shell(self.pages.currentIndex())
 
     # ── Public API ───────────────────────────────────────────────────────────
@@ -1823,10 +2303,43 @@ class OutreachScreen(QWidget):
     # ── Leads: table ─────────────────────────────────────────────────────────
 
     def _reload_leads(self) -> None:
+        """Re-read the store, and keep what the store did not change.
+
+        The three derived caches used to be emptied wholesale here, so
+        suppressing one lead out of five thousand re-decoded five thousand
+        audit blobs and re-asked `core.templates` five thousand times: 76ms of
+        the reload, for one row that moved, and it is most of why the end of an
+        audit run still cost 246ms after the table itself stopped being
+        rebuilt. Every lead now carries a stamp of
+        the fields those caches are derived from, and only the leads whose
+        stamp moved are forgotten.
+
+        The stamp includes what the answers depend on beside the record — the
+        sender profile and the settings `core.templates.personalisation` reads
+        — because a user who fills in their company name and comes back has
+        changed what every one of those answers is.
+        """
         self._leads = _db.list_leads(self.conn)
-        self._generic.clear()
-        self._gaps.clear()
-        self._blobs.clear()
+        rules = _rules_stamp(self.settings)
+        stamps = {}
+        if rules != self._rules_stamp:
+            self._generic.clear()
+            self._gaps.clear()
+            self._blobs.clear()
+            self._rules_stamp = rules
+            for lead in self._leads:
+                stamps[_int_of(lead.get("id"))] = _lead_stamp(lead)
+        else:
+            was = self._stamps
+            for lead in self._leads:
+                lead_id = _int_of(lead.get("id"))
+                stamp = _lead_stamp(lead)
+                stamps[lead_id] = stamp
+                if was.get(lead_id) != stamp:
+                    self._forget_lead(lead_id)
+            for gone in self._generic.keys() - stamps.keys():
+                self._forget_lead(gone)
+        self._stamps = stamps
         self._repaint_leads()
 
     def _repaint_leads(self) -> None:
@@ -1842,74 +2355,211 @@ class OutreachScreen(QWidget):
         self._refresh_preview_choices()
 
     def _fill_table(self) -> None:
-        """Rebuild every row, in the order the header says.
+        """Put the table back in the order the header says. One row per lead.
 
         Sorted here rather than by `QTableWidget.sortItems`, because the Score
         and Status columns are painted from data on the item rather than from
         its text and Qt's own sort reorders the items under a painted row. A
-        rebuild is one pass over a list this screen is already holding.
+        re-sort is one pass over a list this screen is already holding.
 
-        One pass, and it leaves behind everything the rest of the screen would
-        otherwise walk the table for: which row each lead is on, how many leads
-        each status holds, and how many would send a form letter. Those three
-        are the difference between a button label costing a table walk and
-        costing a dictionary lookup.
+        What it no longer does is build a cell for every lead, and that is the
+        second performance finding closed. The table has a row per lead so the
+        scrollbar tells the truth about the size of the list, but the cells are
+        built only for the band around the viewport — see `_paint_window`. At
+        5,000 leads the old pass spent 2,379ms of its 2,648ms inside
+        `components._Table.add_row` building 35,000 `QTableWidgetItem`s, one
+        insertRow at a time, for the roughly 20 rows an 800px-high window can
+        show. Measured on the same store, back to back, median of nine runs in
+        milliseconds:
 
-        What is left of the cost is not here: at 5,000 leads this takes 706ms
-        and almost all of it is `components._Table.add_row` building 35,000
-        items one row at a time. Pre-sizing the table and filling it, rather
-        than inserting a row per lead, belongs there beside the spec it reads;
-        see the handover note.
+            _fill_table    677 -> 29      a column-header sort    781 ->  32
+            _reload_leads  806 -> 103     the end-of-run reload  1008 -> 104
+
+        What is left of the reload is not here either: 49ms of its 103 is
+        `core.outreach_db.list_leads` reading 5,000 rows with their audit blobs.
+
+        One pass, and it still leaves behind everything the rest of the screen
+        would otherwise walk the table for: which row each lead is on, how many
+        leads each status holds, and how many would send a form letter. Those
+        three are the difference between a button label costing a table walk
+        and costing a dictionary lookup.
         """
         table = self.lead_table
-        column, order = self._sort
-        self._leads.sort(key=lambda lead: self._sort_key(lead, column),
+        field, order = self._sort
+        self._leads.sort(key=lambda lead: self._sort_key(lead, field),
                          reverse=order == Qt.DescendingOrder)
-        # Held off for the same reason `_restyle_now` holds it off: five
-        # thousand rows is five thousand repaint requests against a visible
-        # viewport that is going to be repainted once at the end anyway.
+        # Held off for the same reason `_restyle_now` holds it off: resizing
+        # the table and re-deciding five thousand rows' visibility is five
+        # thousand repaint requests against a viewport that is going to be
+        # repainted once at the end anyway.
         table.setUpdatesEnabled(False)
         try:
-            table.setRowCount(0)
+            self._release_all()
+            table.setRowCount(len(self._leads))
             rows: dict[int, int] = {}
             buckets: dict[str, int] = {}
             generic = 0
             for index, lead in enumerate(self._leads):
-                status = self._append_lead_row(lead)
+                status = _text_of(lead.get("status")).strip() or "new"
                 buckets[status] = buckets.get(status, 0) + 1
                 lead_id = _int_of(lead.get("id"))
                 rows[lead_id] = index
-                if self._generic.get(lead_id):
+                if self._gap_text(lead)[1]:
                     generic += 1
             self._row_of = rows
             self._buckets = buckets
             self._generic_count = generic
-            table.horizontalHeader().setSortIndicator(column, order)
-            # Retaking the widths is also what clears a horizontal scrollbar
-            # left behind by a hand-dragged column: the width the user set
-            # survives until the next reload, and a reload is when the table
-            # gets its geometry back from the spec.
-            table.relayout()
+            table.horizontalHeader().setSortIndicator(
+                self._col_of.get(field, 0), order)
         finally:
             table.setUpdatesEnabled(True)
         self._apply_filters()
+        # Retaking the widths is also what clears a horizontal scrollbar left
+        # behind by a hand-dragged column: the width the user set survives
+        # until the next reload, and a reload is when the table gets its
+        # geometry back from the spec. After the window is painted, not before
+        # — `relayout` sizes a `fit` column against the rows it can see, and
+        # before the paint there are none.
+        table.relayout()
 
-    def _sort_key(self, lead: dict, column: int):
-        if column == _COL_SCORE:
+    # ── Leads: the painted window ────────────────────────────────────────────
+
+    def eventFilter(self, watched, event) -> bool:
+        """A taller viewport is a request for rows that are not built yet."""
+        if (event.type() == QEvent.Resize and hasattr(self, "lead_table")
+                and watched is self.lead_table.viewport()):
+            self._paint_window()
+        return super().eventFilter(watched, event)
+
+    def _on_lead_scrolled(self, _value: int) -> None:
+        self._paint_window()
+
+    def _band(self) -> tuple:
+        """(first row, last row) of the model the window covers.
+
+        Walked forward from the row Qt says is at the top of the viewport
+        rather than computed from a row height, because rows the filter has
+        hidden take no space and `rowAt` already knows that. The walk starts at
+        the first row on screen, so a filter that leaves four leads out of five
+        thousand does not cost a scan of the 4,996 above them.
+
+        A band is not a list of rows to build: the rows inside it that the
+        filter is hiding are not on screen and are not built. That distinction
+        is the difference between a search that matches nothing costing 5,000
+        `isRowHidden` calls and costing 35,000 items.
+        """
+        table = self.lead_table
+        total = table.rowCount()
+        if total <= 0:
+            return 0, -1
+        first = table.rowAt(0)
+        if first < 0:
+            first = 0
+        wanted = max(1, table.viewport().height()
+                     // max(1, table.verticalHeader().defaultSectionSize())) \
+            + _WINDOW_PAD
+        last, shown = first, 0
+        for row in range(first, total):
+            last = row
+            if not table.isRowHidden(row):
+                shown += 1
+                if shown >= wanted:
+                    break
+        return max(0, first - _WINDOW_PAD), last
+
+    def _paint_window(self) -> None:
+        """Build the cells for the band, and give back the ones far outside it.
+
+        The give-back half is what keeps a scroll from end to end of five
+        thousand leads from quietly costing the same 35,000 items the old
+        rebuild did — it would just have spread them over a minute of wheel.
+        """
+        table = self.lead_table
+        if table.rowCount() <= 0:
+            self._release_all()
+            return
+        top, bottom = self._band()
+        for row in range(top, bottom + 1):
+            if row not in self._painted and not table.isRowHidden(row):
+                self._paint_row(row)
+        far = [row for row in self._painted
+               if row < top - _WINDOW_KEEP or row > bottom + _WINDOW_KEEP]
+        for row in far:
+            self._release_row(row)
+
+    def _paint_row(self, row: int) -> None:
+        """Build one row's cells, from the same `Cell`s `components` would take.
+
+        The items are built here rather than through `components._Table.add_row`
+        for one reason: `add_row` appends, and a window that starts at row 3,900
+        needs to write row 3,900. Everything a cell carries still comes from
+        `components` — `FULL_ROLE` and `SORT_ROLE` are its roles, the alignment
+        is the `Column`'s own, and no colour is set here at all, because the
+        two columns that carry one are painted by `_BadgeDelegate` from
+        `status_pill()` and `score_badge()`. A `set_row(row, cells)` beside
+        `add_row` is where the whole of this belongs; see the handover note.
+        """
+        table = self.lead_table
+        lead = self._leads[row] if 0 <= row < len(self._leads) else None
+        if lead is None:
+            return
+        for column, cell in enumerate(self._lead_cells(lead)):
+            item = QTableWidgetItem(cell.text)
+            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            item.setTextAlignment(
+                _ALIGNMENT.get(_LEAD_COLUMNS[self._fields[column]].align,
+                               Qt.AlignLeft) | Qt.AlignVCenter)
+            item.setData(components.FULL_ROLE, cell.text)
+            if cell.sort is not None:
+                item.setData(components.SORT_ROLE, cell.sort)
+            if cell.tip:
+                item.setToolTip(cell.tip)
+            table.setItem(row, column, item)
+        self._painted.add(row)
+        self._set_badge(row, _COL_SCORE, _int_of(lead.get("opportunity_score")))
+        self._set_badge(row, _COL_STATUS,
+                        _text_of(lead.get("status")).strip() or "new")
+
+    def _release_row(self, row: int) -> None:
+        table = self.lead_table
+        for column in range(table.columnCount()):
+            table.takeItem(row, column)
+        self._painted.discard(row)
+
+    def _release_all(self) -> None:
+        if self._painted:
+            self.lead_table.clearContents()
+            self._painted = set()
+
+    def _repaint_row(self, row: int) -> None:
+        """Rebuild a row that is on screen; forget one that is not.
+
+        A row outside the band has no cells to correct, and it will be built
+        from the record when it is scrolled to — so an audit landing on a lead
+        four thousand rows down costs nothing at all.
+        """
+        if row in self._painted:
+            self._paint_row(row)
+
+    def _sort_key(self, lead: dict, field: int):
+        if field == _COL_SCORE:
             return _int_of(lead.get("opportunity_score"))
-        if column == _COL_GAP:
+        if field == _COL_GAP:
             return self._gap_text(lead)[0].lower()
-        return _text_of(lead.get(_COL_KEYS.get(column, "name"))).strip().lower()
+        return _text_of(lead.get(_COL_KEYS.get(field, "name"))).strip().lower()
 
     def _on_header_clicked(self, column: int) -> None:
+        field = self._fields[column] if 0 <= column < len(self._fields) \
+            else _COL_NAME
         current, order = self._sort
-        if column == current:
+        if field == current:
             order = (Qt.AscendingOrder if order == Qt.DescendingOrder
                      else Qt.DescendingOrder)
         else:
-            order = Qt.DescendingOrder if column == _COL_SCORE else Qt.AscendingOrder
-        self._sort = (column, order)
+            order = Qt.DescendingOrder if field == _COL_SCORE else Qt.AscendingOrder
+        self._sort = (field, order)
         self._fill_table()
+        self._forget_view()
 
     def _gap_text(self, lead: dict, audit=None) -> tuple:
         """(what the Headline gap column says, and whether it is a form letter).
@@ -1945,26 +2595,26 @@ class OutreachScreen(QWidget):
         self._gaps.pop(lead_id, None)
         self._blobs.pop(lead_id, None)
 
-    def _append_lead_row(self, lead: dict) -> str:
-        """Paint one lead onto the end of the table. Returns its status.
+    def _lead_cells(self, lead: dict) -> tuple:
+        """One lead as `components.Cell`s, in the order the columns stand in.
 
-        The status comes back rather than being read again by the caller
-        because `_fill_table` is counting them and this is the one place that
-        has already worked it out.
+        The whole spec is built and then cut down to the shown fields rather
+        than being built per field, because five of the seven cost nothing and
+        the two that do — the Headline gap and the score's gap count — are
+        cached against the lead anyway.
 
         The record is deliberately not attached to the row through
         `Qt.UserRole`. Qt marshals a dict through a QVariant on every read, at
         50µs a call measured, and row `n` is `self._leads[n]` by construction —
         so `_lead_at` can answer from the list instead.
         """
-        table = self.lead_table
         score = _int_of(lead.get("opportunity_score"))
         status = _text_of(lead.get("status")).strip() or "new"
         audit = _loads(lead.get("audit_json"))
         gaps = [g for g in (audit.get("gaps") or []) if isinstance(g, dict)]
         gap, generic = self._gap_text(lead, audit)
 
-        row = table.add_row((
+        every = (
             Cell(text=_text_of(lead.get("name")).strip() or "—",
                  sort=_text_of(lead.get("name")).strip().lower()),
             Cell(text=_text_of(lead.get("email")).strip()),
@@ -1980,38 +2630,41 @@ class OutreachScreen(QWidget):
                      "nothing about it. Filter to Generic email to review or "
                      "exclude these before sending." if generic else ""),
             Cell(text="", sort=status, tip=self._status_tip(status)),
-        ))
+        )
+        return tuple(every[field] for field in self._fields)
 
-        # The two badge columns carry their value rather than their words: the
-        # delegate paints `components.status_pill()` and `score_badge()` from
-        # this, and the item text is the badge's own label so a screen reader
-        # and the filter box are told what the pill says.
-        self._set_badge(row, _COL_SCORE, score)
-        self._set_badge(row, _COL_STATUS, status)
-        return status
+    def _set_badge(self, row: int, field: int, key) -> None:
+        """Put the value a badge column paints onto its cell.
 
-    def _set_badge(self, row: int, column: int, key) -> None:
-        item = self.lead_table.item(row, column)
+        The two badge columns carry their value rather than their words: the
+        delegate paints `components.status_pill()` and `score_badge()` from
+        this, and the item text is the badge's own label so a screen reader and
+        the filter box are told what the pill says. A field the user has
+        switched off has no cell, and nothing to say.
+        """
+        column = self._col_of.get(field, -1)
+        item = self.lead_table.item(row, column) if column >= 0 else None
         if item is None:
             return
         item.setData(_BADGE_ROLE, key)
-        label = self._badge_label(column, key)
+        label = self._badge_label(field, key)
         item.setText(label)
         item.setData(components.FULL_ROLE, label)
 
-    def _badge_label(self, column: int, key) -> str:
-        """What the pill in `column` reads for `key`, asked once per value.
+    def _badge_label(self, field: int, key) -> str:
+        """What the pill in `field`'s column reads for `key`, once per value.
 
         The delegate already keeps one widget per distinct value; this keeps
         the string it renders, so ten thousand cells do not each cross into Qt
         to read back a label that is one of fifteen.
         """
-        cached = self._badge_text.get((column, key))
+        cached = self._badge_text.get((field, key))
         if cached is None:
-            delegate = self.lead_table.itemDelegateForColumn(column)
+            delegate = self.lead_table.itemDelegateForColumn(
+                self._col_of.get(field, -1))
             cached = delegate.badge(key).text() \
                 if isinstance(delegate, _BadgeDelegate) else _text_of(key)
-            self._badge_text[(column, key)] = cached
+            self._badge_text[(field, key)] = cached
         return cached
 
     @staticmethod
@@ -2051,7 +2704,13 @@ class OutreachScreen(QWidget):
 
     def _on_search_changed(self, text: str) -> None:
         self._search = _text_of(text).strip().lower()
+        self._terms = _parse_query(self._search)
         self._apply_filters()
+        self._forget_view()
+
+    def _on_status_filter(self, _index: int) -> None:
+        self._apply_filters()
+        self._forget_view()
 
     def _wanted_status(self) -> str:
         return _STATUS_FILTERS[max(0, self.status_filter.currentIndex())][1]
@@ -2064,10 +2723,18 @@ class OutreachScreen(QWidget):
         else:
             status = _text_of(lead.get("status")).strip() or "new"
             hide = bool(wanted) and status != wanted
-        return bool(hide or (self._search and not self._matches(lead)))
+        return bool(hide or (self._terms and not self._matches(lead)))
 
     def _apply_filters(self) -> None:
         """Re-decide every row's visibility. The whole-table pass.
+
+        Every row, and cheaply: `setRowHidden` on a row that holds no cells is
+        the same call it is on a row that does, so the pass costs what it costs
+        whether twenty rows are built or five thousand. Broken up at 5,000
+        leads it is 17-19ms of `_hidden_by`, 2ms of `setRowHidden` to narrow to
+        a quarter of the list and 16-19ms to widen back out, and under 1ms of
+        window paint. What used to sit on top of it was the rebuild that
+        produced the rows.
 
         For a change that reaches one row — an audit landing — `_refilter_row`
         does the same work for that row and adjusts the count, which is what
@@ -2086,6 +2753,9 @@ class OutreachScreen(QWidget):
             table.setUpdatesEnabled(True)
 
         self._visible = visible
+        # The band moved: rows that were hidden a moment ago are now on screen
+        # and have no cells yet.
+        self._paint_window()
         self._refresh_lead_counts()
         self._refresh_lead_actions()
 
@@ -2101,23 +2771,40 @@ class OutreachScreen(QWidget):
         self._visible += -1 if hide else 1
 
     def _matches(self, lead: dict) -> bool:
-        """Does the filter box's text appear anywhere in this lead?
+        """Does everything in the filter box land somewhere in this lead?
 
-        Read off the record rather than off the painted row, which is what lets
-        the city and the category be searched at all — and what keeps the two
-        badge columns searchable now that what they paint is a pill rather than
-        a word.
+        Every term, not the whole box as one substring, and that is the third
+        half of the search finding. `toronto roofing` used to match nothing at
+        all: the record says "Toronto" in one field and "Roofing contractor" in
+        another, the two are joined by a newline so a needle cannot span them,
+        and a single-substring match therefore had no way to ask for both. Two
+        terms are two needles and each has to land somewhere.
+
+        A term with a field in front of it is asked of that field alone, read
+        off the record — which is also what lets the city and the category be
+        searched at all, and what keeps the two badge columns searchable now
+        that what they paint is a pill rather than a word.
         """
-        return self._search in self._haystack(lead)
+        blob = None
+        for field, needle in self._terms:
+            if field:
+                if needle not in _text_of(lead.get(field)).lower():
+                    return False
+                continue
+            if blob is None:
+                blob = self._haystack(lead)
+            if needle not in blob:
+                return False
+        return True
 
     def _haystack(self, lead: dict) -> str:
         """Everything about one lead the filter box reads, lowercased once.
 
         Kept against the lead's id because the alternative is rebuilding ten
         strings and lowercasing them for every row on every keystroke.
-        Newline-joined rather than space-joined so a needle still has to sit
-        inside one field: "toronto roofing" must not match a Toronto lead in
-        the roofing category that says neither.
+        Newline-joined rather than space-joined so one *term* still has to sit
+        inside one field: `"roofing contractor"` in quotes must not be answered
+        by a business called Roofing whose category is Contractor.
         """
         lead_id = _int_of(lead.get("id"))
         blob = self._blobs.get(lead_id)
@@ -2166,11 +2853,35 @@ class OutreachScreen(QWidget):
         return self._leads[row] if 0 <= row < len(self._leads) else {}
 
     def _selected_rows(self) -> list:
-        """The rows the user has picked that the filters are still showing."""
+        """The rows the user has picked that the filters are still showing.
+
+        `selectedRows()` and not `selectedIndexes()`, which is one index per
+        *cell*: a Ctrl+A over 5,000 leads handed this 35,000 `QModelIndex`
+        objects to build a set of 5,000 numbers out of, once per selection
+        change and again for every button label. Seven times the work for the
+        same answer, and it is asked for on the keystroke.
+        """
         table = self.lead_table
-        return sorted(row for row in {index.row()
-                                      for index in table.selectedIndexes()}
-                      if not table.isRowHidden(row))
+        picked = table.selectionModel()
+        if picked is None:
+            return []
+        return [index.row() for index in picked.selectedRows()
+                if not table.isRowHidden(index.row())]
+
+    def _selected_count(self) -> int:
+        """How many rows are picked, without building a row list for them.
+
+        `selectedRows()` is one object per selected row; a range is two
+        numbers. The button labels want the count far more often than the rows,
+        and at 5,000 selected the two together are the difference between a
+        Ctrl+A costing 196ms and costing 8ms.
+        """
+        table = self.lead_table
+        total = 0
+        for span in table.selectedRanges():
+            for row in range(span.topRow(), span.bottomRow() + 1):
+                total += 0 if table.isRowHidden(row) else 1
+        return total
 
     def _selected_leads(self) -> list[dict]:
         return [self._lead_at(row) for row in self._selected_rows()]
@@ -2198,13 +2909,21 @@ class OutreachScreen(QWidget):
         five thousand rows to write "Audit all (5000)". The count is carried by
         `_apply_filters`; the names stop at three.
         """
-        rows = self._selected_rows()
-        if rows:
-            return len(rows), [self._lead_at(row) for row in rows[:limit]], True
+        table = self.lead_table
+        chosen = self._selected_count()
+        if chosen:
+            head: list = []
+            for span in table.selectedRanges():
+                for row in range(span.topRow(), span.bottomRow() + 1):
+                    if table.isRowHidden(row):
+                        continue
+                    head.append(self._lead_at(row))
+                    if len(head) >= limit:
+                        return chosen, head, True
+            return chosen, head, True
 
-        head: list = []
+        head = []
         if self._visible > 0:
-            table = self.lead_table
             for row in range(table.rowCount()):
                 if table.isRowHidden(row):
                     continue
@@ -2220,9 +2939,17 @@ class OutreachScreen(QWidget):
                                      _named(count, head))
 
     def _on_lead_selection_changed(self) -> None:
+        """One selected lead follows the preview; five thousand do not.
+
+        The list was built to ask its length. A Ctrl+A over 5,000 rows built
+        5,000 records to decide it was not one of them, on the keystroke, and
+        the whole selection change cost 196ms; it costs 8ms.
+        """
         self._refresh_lead_actions()
+        if self._selected_count() != 1:
+            return
         chosen = self._selected_leads()
-        if len(chosen) == 1:
+        if chosen:
             self._select_preview_lead(_int_of(chosen[0].get("id")))
 
     def _refresh_lead_actions(self) -> None:
@@ -2266,13 +2993,29 @@ class OutreachScreen(QWidget):
             % _named(count, head) if count else
             "Select the rows to exclude — this acts on the whole selection")
 
-        self.copy_btn.setText("Copy emails" if count <= 1
-                              else "Copy %d emails" % count)
+        self.remove_btn.setText("Remove…" if count <= 1
+                                else "Remove %d…" % count)
+        self.remove_btn.setEnabled(bool(count))
+        self.remove_btn.setToolTip(
+            "Forget %s entirely — the row, the crawl and the score. You will "
+            "be asked first." % _named(count, head) if count else
+            "Select the rows to forget — this acts on the whole selection")
+
+        self.copy_btn.setText("Copy" if count <= 1 else "Copy %d" % count)
         self.copy_btn.setEnabled(bool(targets))
         self.copy_btn.setToolTip(
             "Copy every address %s to the clipboard, one per line"
             % ("selected" if count else "shown") if targets else
             "There are no addresses on screen to copy")
+
+        self.export_btn.setText("Export…" if count <= 1
+                                else "Export %d…" % count)
+        self.export_btn.setEnabled(bool(targets))
+        self.export_btn.setToolTip(
+            "%s Writes a CSV of every column — the ones switched off included "
+            "— plus the phone, the website and the source."
+            % self._target_sentence("Exports", target) if targets else
+            "There is nothing on screen to export")
 
         if hasattr(self, "plan_targets"):
             self.plan_targets.setText(self._target_sentence("Queues", target))
@@ -2294,10 +3037,12 @@ class OutreachScreen(QWidget):
             return
         # A right-click inside the selection acts on the selection; one outside
         # it acts on the row under the pointer, which is what the pointer said
-        # it would do.
-        chosen = self._selected_leads()
-        if lead not in chosen:
-            chosen = [lead]
+        # it would do. Asked of the selection model rather than of a list of
+        # the selected records: "is this row in it" is a question the model
+        # answers, and the list was five thousand dicts compared by value.
+        picked = self.lead_table.selectionModel()
+        chosen = self._selected_leads() \
+            if picked is not None and picked.isSelected(index) else [lead]
 
         menu = QMenu(self)
         website = _text_of(lead.get("website")).strip()
@@ -2317,6 +3062,8 @@ class OutreachScreen(QWidget):
         menu.addSeparator()
         menu.addAction("Suppress %s (never contact)" % _plural(len(chosen), "lead"),
                        lambda: self._suppress(chosen))
+        menu.addAction("Remove %s from the list" % _plural(len(chosen), "lead"),
+                       lambda: self._remove(chosen))
         menu.exec_(self.lead_table.viewport().mapToGlobal(pos))
 
     def _copy(self, text: str) -> None:
@@ -2411,6 +3158,443 @@ class OutreachScreen(QWidget):
         self._select_preview_lead(_int_of(lead.get("id")))
         self._goto_tab(1)
 
+    # ── Leads: removing ──────────────────────────────────────────────────────
+
+    def _on_remove_clicked(self) -> None:
+        chosen = self._selected_leads()
+        if not chosen:
+            self._toast("Select the leads to forget first — Remove acts on the "
+                        "whole selection.", tone="warning")
+            return
+        self._remove(chosen)
+
+    def _remove(self, leads: list) -> None:
+        """Forget a selection outright, and say what that is not.
+
+        The other half of the pair Suppress opens, and the difference between
+        them is the sentence in the dialog. Suppressing keeps the address on
+        file precisely so it can never be mailed again — it is what an
+        unsubscribe means, and forgetting the row would lose that promise.
+        Removing is for the rows that should never have been imported: a
+        spreadsheet with the wrong column mapped, a scrape of the wrong city.
+        A removed lead can be imported again tomorrow; a suppressed one cannot,
+        and must not.
+
+        Anything already queued for those addresses is left alone on purpose.
+        A message that has been planned has a send time and an account against
+        it, and deleting the lead under a running campaign would leave the send
+        loop holding a row with nothing behind it.
+        """
+        wanted = [lead for lead in leads if _int_of(lead.get("id")) > 0]
+        if not wanted:
+            self._toast("Those rows are not in the store yet.", tone="warning")
+            return
+        if not components.confirm(
+                self,
+                title="Forget %s?" % _plural(len(wanted), "lead"),
+                body="%s will be deleted from the lead list, along with the "
+                     "crawl and the score. This does not stop them being "
+                     "contacted — use Suppress for that — and it does not "
+                     "cancel anything already queued. They can be imported "
+                     "again." % _names_of(wanted),
+                confirm_text="Remove %s" % _plural(len(wanted), "lead"),
+                danger=True):
+            return
+
+        ids = [_int_of(lead.get("id")) for lead in wanted]
+        gone = 0
+        try:
+            # In batches, because `IN (?, ?, …)` is one bound variable per id
+            # and SQLite refuses past its own limit — measured here at 32,766,
+            # but it is a compile-time number and this app ships its own
+            # interpreter. A Ctrl+A over a 40,000-lead store must not come back
+            # as "could not remove those leads".
+            for at in range(0, len(ids), _DELETE_BATCH):
+                batch = ids[at:at + _DELETE_BATCH]
+                cursor = self.conn.execute(
+                    "DELETE FROM leads WHERE id IN (%s)"
+                    % ",".join("?" * len(batch)), batch)
+                gone += _int_of(cursor.rowcount)
+            self.conn.commit()
+        except Exception:
+            self._toast("Could not remove those leads.", tone="danger")
+            return
+        for lead_id in ids:
+            self._forget_lead(lead_id)
+        _db.log_event(self.conn, "leads_removed",
+                      "%d removed from the leads table" % gone)
+        self._reload_leads()
+        self._toast("%s removed. Nothing was unsubscribed and nothing already "
+                    "queued was cancelled." % _plural(gone, "lead"),
+                    tone="warning")
+
+    # ── Leads: export ────────────────────────────────────────────────────────
+
+    def _on_export_clicked(self) -> None:
+        """Write the target out as a CSV the user can open in a spreadsheet.
+
+        The *rows* are the ones on screen and that is the point: a filter
+        narrowed to the audited roofers in Toronto is the list the user built,
+        and an export that quietly widened it back to five thousand would be a
+        different list under the same name.
+
+        The *columns* are all of them, plus the three no column shows — the
+        phone, the website and where the lead came from — and the headline gap
+        whole rather than as the elided cell. Switching a column off is about
+        what is worth reading on screen; it is not an instruction to throw the
+        email addresses away on the way out of the app.
+        """
+        leads = self._target_leads()
+        if not leads:
+            self._toast("There is nothing on screen to export.", tone="warning")
+            return
+        start = self.settings.get("export_dir") or os.path.expanduser("~")
+        suggested = os.path.join(start, "leads-%s.csv"
+                                 % datetime.now().strftime("%Y-%m-%d"))
+        path, _filter = QFileDialog.getSaveFileName(
+            self, "Export leads", suggested, "CSV files (*.csv);;All files (*)")
+        if not path:
+            return
+        if not path.lower().endswith(".csv"):
+            path += ".csv"
+
+        fields = list(range(len(_LEAD_COLUMNS)))
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as handle:
+                writer = csv.writer(handle)
+                writer.writerow([_LEAD_COLUMNS[field].title for field in fields]
+                                + ["Phone", "Website", "Source"])
+                for lead in leads:
+                    writer.writerow(
+                        [self._export_value(lead, field) for field in fields]
+                        + [_text_of(lead.get("phone")).strip(),
+                           _text_of(lead.get("website")).strip(),
+                           _text_of(lead.get("source")).strip()])
+        except OSError as exc:
+            self._toast("Could not write that file: %s" % exc, tone="danger")
+            return
+        self._toast("Exported %s to %s." % (_plural(len(leads), "lead"),
+                                            os.path.basename(path)),
+                    tone="success", action="Open folder",
+                    on_action=lambda: webbrowser.open(os.path.dirname(path)))
+
+    def _export_value(self, lead: dict, field: int) -> str:
+        """One field of one lead as a spreadsheet should read it.
+
+        The score goes out as the number and not as the badge's words, because
+        a column of "88 · strong" cannot be sorted by a spreadsheet, and the
+        headline gap goes out whole rather than as the elided cell.
+        """
+        if field == _COL_SCORE:
+            return str(_int_of(lead.get("opportunity_score")))
+        if field == _COL_GAP:
+            return self._gap_text(lead)[0]
+        if field == _COL_STATUS:
+            return _text_of(lead.get("status")).strip() or "new"
+        return _text_of(lead.get(_COL_KEYS.get(field, "name"))).strip()
+
+    # ── Leads: which columns, and which view ─────────────────────────────────
+
+    def _show_columns_menu(self) -> None:
+        """Switch a column off, and have it stay off next time the app opens.
+
+        Business has no entry. A lead table whose every column can be turned
+        off has a state in which it paints five thousand empty rows, and the
+        one column that says which business a row is cannot be the one the
+        user loses.
+        """
+        menu = QMenu(self)
+        # A QMenu swallows its actions' tooltips unless it is told not to, and
+        # the one entry that cannot be pressed is the one that has to say why.
+        menu.setToolTipsVisible(True)
+        for field in range(len(_LEAD_COLUMNS)):
+            action = menu.addAction(_LEAD_COLUMNS[field].title)
+            action.setCheckable(True)
+            action.setChecked(field in self._fields)
+            if field in _FIXED_FIELDS:
+                action.setEnabled(False)
+                action.setToolTip("A row with no business name on it cannot be "
+                                  "told from the row above it")
+                continue
+            action.triggered.connect(
+                lambda checked, f=field: self._toggle_column(f, checked))
+        menu.addSeparator()
+        every = menu.addAction("Show every column")
+        every.setEnabled(len(self._fields) != len(_LEAD_COLUMNS))
+        every.triggered.connect(
+            lambda: self._set_columns(range(len(_LEAD_COLUMNS))))
+        menu.exec_(self.columns_btn.mapToGlobal(
+            self.columns_btn.rect().bottomLeft()))
+
+    def _toggle_column(self, field: int, shown: bool) -> None:
+        wanted = set(self._fields)
+        if shown:
+            wanted.add(field)
+        else:
+            wanted.discard(field)
+        self._set_columns(wanted)
+
+    def _set_columns(self, fields) -> None:
+        wanted = set(fields) | set(_FIXED_FIELDS)
+        chosen = tuple(field for field in range(len(_LEAD_COLUMNS))
+                       if field in wanted)
+        if chosen == tuple(self._fields):
+            return
+        self._fields = chosen
+        self._rebuild_table()
+        self._forget_view()
+        self._save_view_state(now=True)
+
+    def _rebuild_table(self) -> None:
+        """Swap in a table built from the columns that are wanted now.
+
+        A new table and not a reconfigured one, because the column spec is what
+        `components.table()` takes and the widths come out of it: there is no
+        way to tell an existing `_Table` that it has four columns now that is
+        not a rebuild of everything the spec decided.
+        """
+        if not hasattr(self, "lead_table"):
+            return
+        t = components.active_theme()
+        old = self.lead_table
+        self.lead_table = self._make_table(t)
+        self.lead_stack.insertWidget(0, self.lead_table)
+        self.lead_stack.setCurrentIndex(0 if self._leads else 1)
+        old.setParent(None)
+        old.deleteLater()
+        self._fill_table()
+
+    def _show_views_menu(self) -> None:
+        """The saved views, and what can be done to them.
+
+        A view is a filter, a sort and a set of columns under a name. The
+        filters already survived a tab switch, which is worth exactly one
+        session; this is what makes «Toronto roofers worth calling» a thing the
+        user can come back to on Monday.
+
+        Every entry carries the sentence that says what it actually shows,
+        because a list of five names typed in a hurry six weeks ago is a list
+        of five guesses.
+        """
+        menu = QMenu(self)
+        menu.setToolTipsVisible(True)
+        if self._views:
+            for view in self._views:
+                name = _text_of(view.get("name"))
+                action = menu.addAction(_menu_text(name))
+                action.setCheckable(True)
+                action.setChecked(name == self._view_name)
+                action.setToolTip(_view_sentence(view))
+                action.triggered.connect(lambda _c, n=name: self._apply_view(n))
+            menu.addSeparator()
+        else:
+            empty = menu.addAction("No saved views yet")
+            empty.setEnabled(False)
+            menu.addSeparator()
+
+        menu.addAction("Save this view…", self._on_save_view)
+        if self._view_name:
+            menu.addAction("Update “%s”" % _menu_text(self._view_name),
+                           lambda: self._store_view(self._view_name))
+            menu.addAction("Delete “%s”" % _menu_text(self._view_name),
+                           lambda: self._delete_view(self._view_name))
+        menu.addSeparator()
+        menu.addAction("Clear the filter", self._clear_view)
+        menu.exec_(self.view_btn.mapToGlobal(self.view_btn.rect().bottomLeft()))
+
+    def _current_view(self, name: str) -> dict:
+        return {
+            "name": name,
+            "search": self._search,
+            "status": self._wanted_status(),
+            "sort": [_FIELD_KEYS[self._sort[0]],
+                     "desc" if self._sort[1] == Qt.DescendingOrder else "asc"],
+            "columns": _keys_of_fields(self._fields),
+        }
+
+    def _on_save_view(self) -> None:
+        name = _ask_name(self, self._view_name)
+        if not name:
+            return
+        self._store_view(name)
+
+    def _store_view(self, name: str) -> None:
+        name = _text_of(name).strip()[:_VIEW_NAME_CH]
+        if not name:
+            return
+        entry = self._current_view(name)
+        kept = [view for view in self._views
+                if _text_of(view.get("name")).lower() != name.lower()]
+        replaced = len(kept) != len(self._views)
+        if len(kept) >= _MAX_VIEWS:
+            self._toast("There is room for %d saved views. Delete one first."
+                        % _MAX_VIEWS, tone="warning")
+            return
+        self._views = kept + [entry]
+        self._view_name = name
+        self._save_view_state(now=True)
+        self._refresh_view_button()
+        self._toast("%s “%s” — %s" % ("Updated" if replaced else "Saved",
+                                      name, _view_sentence(entry)),
+                    tone="success")
+
+    def _delete_view(self, name: str) -> None:
+        before = len(self._views)
+        self._views = [view for view in self._views
+                       if _text_of(view.get("name")) != name]
+        if len(self._views) == before:
+            return
+        self._view_name = ""
+        self._save_view_state(now=True)
+        self._refresh_view_button()
+        self._toast("Deleted the view “%s”. The leads are untouched." % name,
+                    tone="info")
+
+    def _apply_view(self, name: str) -> None:
+        view = next((v for v in self._views
+                     if _text_of(v.get("name")) == name), None)
+        if view is None:
+            return
+        self._set_view(view)
+        self._view_name = name
+        self._save_view_state(now=True)
+        self._refresh_view_button()
+        self._toast("Showing “%s” — %s" % (name, _view_sentence(view)))
+
+    def _clear_view(self) -> None:
+        self._set_view({"search": "", "status": "",
+                        "sort": ["score", "desc"],
+                        "columns": _keys_of_fields(self._fields)})
+        self._view_name = ""
+        self._save_view_state(now=True)
+        self._refresh_view_button()
+
+    def _set_view(self, view: dict) -> None:
+        """Put the whole of one view on: columns, sort, status, search.
+
+        Every widget is set with its signals blocked and the state it would
+        have announced is set by hand, so applying a view is one pass over the
+        table rather than three — the status picker, the filter box and the
+        column set each start one on their own. The order matters for the same
+        reason: the sort and the terms are in place before the single
+        `_fill_table` or `_rebuild_table` that reads them.
+        """
+        fields = _fields_from_keys(view.get("columns"), self._fields)
+        sort = list(view.get("sort") or [])
+        field = _FIELD_OF_KEY.get(sort[0] if sort else "", _COL_SCORE)
+        order = Qt.AscendingOrder if len(sort) > 1 and sort[1] == "asc" \
+            else Qt.DescendingOrder
+
+        blocked = self.status_filter.blockSignals(True)
+        try:
+            wanted = _text_of(view.get("status"))
+            self.status_filter.setCurrentIndex(
+                _STATUS_KEYS.index(wanted) if wanted in _STATUS_KEYS else 0)
+        finally:
+            self.status_filter.blockSignals(blocked)
+
+        self._sort = (field, order)
+        search = _text_of(view.get("search"))
+        self._search = search.strip().lower()
+        self._terms = _parse_query(self._search)
+
+        if fields != tuple(self._fields):
+            self._fields = fields
+            self._rebuild_table()
+        else:
+            self._fill_table()
+
+        blocked = self.lead_search.blockSignals(True)
+        try:
+            self.lead_search.setText(search)
+        finally:
+            self.lead_search.blockSignals(blocked)
+
+    def _forget_view(self) -> None:
+        """The user has just changed something the saved view did not say.
+
+        The name comes off rather than the view being rewritten under them: a
+        saved view is only worth anything if it stays what it was saved as.
+        """
+        if self._restoring:
+            return
+        if self._view_name:
+            self._view_name = ""
+            self._refresh_view_button()
+        self._save_view_state()
+
+    def _refresh_view_button(self) -> None:
+        if not hasattr(self, "view_btn"):
+            return
+        self.view_btn.setText("View: %s" % _clip(self._view_name, _VIEW_NAME_CH)
+                              if self._view_name else "Views")
+        self.view_btn.setToolTip(
+            "Showing the saved view “%s”. Change a filter and it becomes an "
+            "unsaved one." % self._view_name if self._view_name else
+            "Save the filter, the sort and the columns under a name, and come "
+            "back to it another day")
+
+    def _restore_filter(self) -> None:
+        """Put back the filter, the sort and the view the app closed on.
+
+        Read once at build time from the file `_read_views` opened. A lead
+        table that opens on «all leads, by score» every morning is a table the
+        user has to re-narrow every morning, and the brief's word for what this
+        makes the existing per-session filters is durable.
+        """
+        stored = self._stored
+        self._restoring = True
+        try:
+            sort = list(stored.get("sort") or [])
+            if sort and sort[0] in _FIELD_OF_KEY:
+                self._sort = (_FIELD_OF_KEY[sort[0]],
+                              Qt.AscendingOrder
+                              if len(sort) > 1 and sort[1] == "asc"
+                              else Qt.DescendingOrder)
+                self.lead_table.horizontalHeader().setSortIndicator(
+                    self._col_of.get(self._sort[0], 0), self._sort[1])
+            wanted = _text_of(stored.get("status"))
+            if wanted in _STATUS_KEYS:
+                self.status_filter.setCurrentIndex(_STATUS_KEYS.index(wanted))
+            search = _text_of(stored.get("search"))
+            if search:
+                self.lead_search.setText(search)
+        finally:
+            self._restoring = False
+        self._refresh_view_button()
+
+    def _save_view_state(self, *, now: bool = False) -> None:
+        """Write what the leads tab is showing, and what it has been told to keep.
+
+        `now` for a decision — a view saved, deleted or chosen, a column
+        switched off — because a user who presses Save is owed the file. Off
+        for the churn: the filter box calls this on every keystroke, and a
+        write-then-rename per character is 3.6ms of GUI-thread disk measured
+        here for a value the next keystroke replaces.
+
+        Failure is silent on purpose and this is the one place it is: a
+        read-only profile directory must cost the user their saved views and
+        not their lead table.
+        """
+        self._stored = {
+            "columns": _keys_of_fields(self._fields),
+            "views": self._views,
+            "current": self._view_name,
+            "search": self._search,
+            "status": self._wanted_status() if hasattr(self, "status_filter") else "",
+            "sort": [_FIELD_KEYS[self._sort[0]],
+                     "desc" if self._sort[1] == Qt.DescendingOrder else "asc"],
+        }
+        if now:
+            self._save_timer.stop()
+            _write_views(self._stored)
+        else:
+            self._save_timer.start(_SAVE_AFTER_MS)
+
+    def _flush_view_state(self) -> None:
+        """The write the last keystroke put off. Whatever `_stored` says now."""
+        _write_views(self._stored)
+
     # ── Leads: auditing ──────────────────────────────────────────────────────
 
     def _on_audit_clicked(self) -> None:
@@ -2478,28 +3662,15 @@ class OutreachScreen(QWidget):
         was_generic = bool(self._generic.get(lead_id))
         self._leads[row] = lead
         self._forget_lead(lead_id)
+        self._stamps[lead_id] = _lead_stamp(lead)
 
-        score = _int_of(lead.get("opportunity_score"))
         status = _text_of(lead.get("status")).strip() or "new"
-        gap, generic = self._gap_text(lead)
-        table = self.lead_table
-        for column, value in ((_COL_NAME, _text_of(lead.get("name")).strip() or "—"),
-                              (_COL_EMAIL, _text_of(lead.get("email")).strip()),
-                              (_COL_CITY, _text_of(lead.get("city")).strip()),
-                              (_COL_CATEGORY, _text_of(lead.get("category")).strip()),
-                              (_COL_GAP, gap)):
-            item = table.item(row, column)
-            if item is not None:
-                item.setText(value)
-                item.setData(components.FULL_ROLE, value)
-        gap_item = table.item(row, _COL_GAP)
-        if gap_item is not None and generic:
-            gap_item.setToolTip(
-                "Nothing is known about this business, so the email says "
-                "nothing about it. Filter to Generic email to review or "
-                "exclude these before sending.")
-        self._set_badge(row, _COL_SCORE, score)
-        self._set_badge(row, _COL_STATUS, status)
+        generic = self._gap_text(lead)[1]
+        # A row inside the painted band is rebuilt from the new record; one
+        # outside it has no cells to correct and will be built from the record
+        # when it is scrolled to, so a lead four thousand rows down costs the
+        # dictionary lookup above and nothing else.
+        self._repaint_row(row)
 
         self._buckets[was_status] = max(0, self._buckets.get(was_status, 0) - 1)
         self._buckets[status] = self._buckets.get(status, 0) + 1

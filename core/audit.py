@@ -230,27 +230,74 @@ _CMS_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
                 'content="drupal')),
 )
 
+# This table is read twice and the second read is the one that bites: a shop is
+# excused from `price_opaque`, because a storefront prints its prices next to
+# the buttons. A missing platform therefore costs two claims at once — the shop
+# is told nobody automates its orders, and told it publishes no prices.
 _ECOMMERCE_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("shopify", ("cdn.shopify.com", "shopify.theme", "myshopify.com", "/cdn/shop/")),
     ("woocommerce", ("woocommerce", "wc-ajax", "/plugins/woocommerce", "wc-add-to-cart")),
     ("bigcommerce", ("cdn11.bigcommerce.com", "bigcommerce.com/stencil", "bigcommerce.js")),
     ("magento", ("/static/version", "mage/cookies", "magento_", "/pub/static/frontend")),
+    ("ecwid", ("app.ecwid.com", "ecwid.com/script.js", "ecwid_script", "ec-store")),
+    ("squarespace_commerce", ("sqs-add-to-cart", "static/commerce/scripts",
+                              "squarespace.com/api/commerce")),
+    ("wix_stores", ("wixstores", "stores.wix", "wix-stores")),
+    ("square_online", ("square.site/shop", "squareup.com/store", "weebly-commerce")),
+    ("prestashop", ("prestashop", "/modules/ps_", "prestashop.com")),
+    ("opencart", ("index.php?route=product", "catalog/view/theme")),
+    ("lightspeed", ("cdn.shoplightspeed.com", "shoplightspeed.com/assets")),
+    ("shopware", ("shopware.com", "/bundles/storefront")),
+    ("volusion", ("volusion.com", "/v/vspfiles/")),
 )
 
+# Every table below ends where its list of vendors ends, and each of these rules
+# says "there is no such thing on this site" when it finds nothing. So a vendor
+# the table has never heard of does not read as an unknown — it reads as an
+# absence, and goes into a live email as a claim about the reader's own website.
+# That is why these lists are long and why a marker is added on sight of the
+# product rather than on evidence that it is popular: the cost of a missing row
+# is a false sentence, and the cost of a spare one is a gap that stays quiet.
 _ANALYTICS_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("ga4", ("googletagmanager.com/gtag/js", "gtag/js?id=g-", "gtag('config'", 'gtag("config"')),
     ("gtm", ("googletagmanager.com/gtm.js", "googletagmanager.com/ns.html", "gtm-")),
     ("universal_analytics", ("google-analytics.com/analytics.js", "ga('create'", 'ga("create"')),
+    ("google_ads", ("googleadservices.com/pagead", "googleads.g.doubleclick.net/pagead",
+                    "gtag('event', 'conversion'")),
     ("meta_pixel", ("connect.facebook.net", "fbevents.js", "fbq('init'", 'fbq("init"')),
+    ("bing_uet", ("bat.bing.com", "uetq")),
     ("hotjar", ("static.hotjar.com", "hotjar.com/c/hotjar", "_hjsettings")),
     ("clarity", ("clarity.ms",)),
     ("linkedin_insight", ("snap.licdn.com", "_linkedin_partner_id")),
     ("tiktok_pixel", ("analytics.tiktok.com",)),
+    ("pinterest_tag", ("s.pinimg.com/ct", "pintrk(")),
+    ("snap_pixel", ("sc-static.net/scevent", "snaptr(")),
+    ("x_pixel", ("static.ads-twitter.com", "twq('config'", 'twq("config"')),
+    ("hubspot", ("js.hs-scripts.com", "hs-analytics.net", "js.hs-analytics.net")),
+    ("segment", ("cdn.segment.com",)),
+    ("mixpanel", ("cdn.mxpnl.com", "mixpanel.init")),
+    ("amplitude", ("cdn.amplitude.com", "api.amplitude.com", "api2.amplitude.com")),
+    ("heap", ("cdn.heapanalytics.com", "heap.load(")),
+    ("adobe_analytics", ("assets.adobedtm.com", "omtrdc.net", "s_code.js")),
+    ("yandex_metrica", ("mc.yandex.ru", "yandex_metrika")),
+    ("statcounter", ("statcounter.com/counter",)),
+    ("crazyegg", ("script.crazyegg.com",)),
+    ("woopra", ("static.woopra.com",)),
     ("plausible", ("plausible.io/js",)),
     ("matomo", ("matomo.js", "piwik.js")),
+    ("piwik_pro", ("containers.piwik.pro",)),
+    ("umami", ("umami.is/script.js", "/umami.js")),
+    ("simple_analytics", ("scripts.simpleanalyticscdn.com",)),
+    ("goatcounter", ("gc.zgo.at/count.js",)),
     ("fathom", ("cdn.usefathom.com",)),
 )
 
+# Eleven vendors were missing here and every one of them draws a box in the
+# bottom-right corner of the page, so `no_live_chat` was telling businesses with
+# a chat box that they have no chat box. HubSpot's loader is the clearest case
+# of what the tables were getting wrong: one script is the chat widget, the CRM
+# behind the form and the page-view counter all at once, and it was held in the
+# CRM table alone — so two of the three sentences it disproves went out anyway.
 _CHAT_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("intercom", ("widget.intercom.io", "intercomsettings", "js.intercomcdn.com")),
     ("tawk", ("embed.tawk.to", "tawk.to/chat", "tawk_api")),
@@ -259,6 +306,21 @@ _CHAT_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("tidio", ("code.tidio.co", "tidiochat")),
     ("livechat", ("cdn.livechatinc.com", "livechatinc.com", "__lc.license")),
     ("messenger", ("fb-customerchat", "customerchat.js", "fb-customer-chat")),
+    ("zendesk", ("static.zdassets.com", "zdassets.com/ekr", "zopim", "ze-snippet",
+                 "zendesk.com/embeddable")),
+    ("freshchat", ("wchat.freshchat.com", "fw-cdn.com", "freshchat.com/js", "fcwidget")),
+    ("olark", ("static.olark.com", "olark.com/jsclient", "olark.identify")),
+    ("smartsupp", ("smartsuppchat.com", "smartsupp.com/loader", "_smartsupp")),
+    ("zoho_salesiq", ("salesiq.zoho", "zsiqchat", "zsiqwidget")),
+    ("hubspot", ("js.hs-scripts.com", "js.usemessages.com", "hubspot-messages-iframe",
+                 "api.hubspot.com/livechat")),
+    ("userlike", ("userlike-cdn", "widget.userlike", "userlike.com/api")),
+    ("chatra", ("call.chatra.io", "chatra.io/widget", "chatraid")),
+    ("jivosite", ("code.jivosite.com", "jivosite.com/widget", "jivo_api")),
+    ("purechat", ("app.purechat.com", "purechat.com/visitorwidget", "purechat-id")),
+    ("helpcrunch", ("widget.helpcrunch.com", "helpcrunch.com/sdk", "helpcrunchsettings")),
+    ("salesforce_chat", ("salesforceliveagent", "service.force.com/embeddedservice",
+                         "liveagent.js", "embeddedservice_bootstrap")),
 )
 
 _BOOKING_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -271,6 +333,30 @@ _BOOKING_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("housecallpro", ("housecallpro.com", "book.housecallpro")),
     ("servicetitan", ("servicetitan.com", "st-booking", "servicetitan.io")),
     ("mindbody", ("mindbodyonline.com", "mindbody.io", "healcode")),
+    ("vagaro", ("vagaro.com",)),
+    ("booksy", ("booksy.com",)),
+    ("fresha", ("fresha.com",)),
+    ("janeapp", ("janeapp.com", "jane.app")),
+    ("cliniko", ("cliniko.com/bookings",)),
+    ("schedulicity", ("schedulicity.com",)),
+    ("simplybook", ("simplybook.me", "simplybook.it")),
+    ("timely", ("gettimely.com", "book.timelyapp")),
+    ("zenoti", ("zenoti.com",)),
+    ("phorest", ("phorest.com/book", "phorestsalonsoftware")),
+    ("jobber", ("getjobber.com", "clienthub.getjobber")),
+    # Not "cal.com/": that string is inside "local.com/", and a link to a local
+    # directory would have read as a calendar.
+    ("calcom", ("//cal.com/", "app.cal.com", "cal.com/book")),
+    ("youcanbookme", ("youcanbook.me",)),
+    ("chilipiper", ("chilipiper.com",)),
+    ("hubspot_meetings", ("meetings.hubspot.com", "meetings-na1.hubspot.com")),
+    ("google_appointments", ("calendar.app.google",
+                             "calendar.google.com/calendar/appointments")),
+    ("microsoft_bookings", ("outlook.office365.com/owa/calendar", "bookings.office.com",
+                            "outlook.office.com/bookwithme")),
+    ("tock", ("exploretock.com",)),
+    ("sevenrooms", ("sevenrooms.com",)),
+    ("thefork", ("thefork.com", "lafourchette.com")),
 )
 
 _CRM_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -284,6 +370,20 @@ _CRM_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("mailchimp", ("chimpstatic.com", "list-manage.com", "mailchi.mp",
                    "mc.us.list-manage")),
     ("klaviyo", ("static.klaviyo.com", "klaviyo.com/onsite", "static-tracking.klaviyo")),
+    # Mailchimp was already here, and these file a name and an address exactly
+    # the way it does. Holding one of them and not the others meant the same
+    # site read as having a CRM or as having nothing depending on which mailing
+    # tool it happened to buy.
+    ("keap", ("infusionsoft.com", "keap.com", "infusionsoft.app")),
+    ("constantcontact", ("ctctcdn.com", "constantcontact.com")),
+    ("brevo", ("sibforms.com", "sendinblue.com", "brevo.com")),
+    ("convertkit", ("convertkit.com", "ck.page", "f.convertkit")),
+    ("mailerlite", ("mailerlite.com", "ml-form", "static.mailerlite")),
+    ("aweber", ("aweber.com", "forms.aweber")),
+    ("gohighlevel", ("msgsndr.com", "leadconnectorhq.com", "gohighlevel.com")),
+    ("marketo", ("munchkin.js", "mktoresp.com", "marketo.net")),
+    ("dynamics", ("crm.dynamics.com", "dynamics.com/uclick")),
+    ("freshworks", ("freshsales.io", "freshworks.com/crm", "fwcrm")),
 )
 
 _FRAMEWORK_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -298,13 +398,20 @@ _FRAMEWORK_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
 
 # Form embeds that render no <form> of their own but are still a lead route.
 _FORM_EMBEDS = ("jotform", "typeform", "formstack", "wufoo", "docs.google.com/forms",
-                "gravityforms", "hsforms.net", "formidable", "cognitoforms")
+                "forms.gle", "gravityforms", "hsforms.net", "formidable", "cognitoforms",
+                "tally.so", "fillout.com", "paperform.co", "123formbuilder",
+                "surveymonkey.com", "airtable.com/emb", "forms.zohopublic",
+                "formspree.io", "getform.io", "involve.me")
 
 # Mailing tools, which put a signup on the page whether or not the markup shows
-# a field: most of them render the box in JavaScript or in a pop-up.
+# a field: most of them render the box in JavaScript or in a pop-up. Constant
+# Contact serves its widget from ctctcdn.com and never spells its own name, so
+# the entry that was meant to hold it never matched a page it was on.
 _MAILING_LIST_MARKERS = ("list-manage.com", "mailchi.mp", "chimpstatic.com", "klaviyo",
-                         "activehosted.com", "constantcontact", "sendinblue",
-                         "brevo.com", "convertkit", "mailerlite", "aweber")
+                         "activehosted.com", "constantcontact", "ctctcdn.com",
+                         "sendinblue", "sibforms.com", "brevo.com", "convertkit",
+                         "ck.page", "mailerlite", "aweber", "omnisend", "getdrip",
+                         "emailoctopus", "campaign-archive.com")
 _EMAIL_FIELD_RE = re.compile(
     r"""(?is)<input\b[^>]*(?:type\s*=\s*["']?email|name\s*=\s*["'][^"']*e?mail)""")
 _URL_ATTR_RE = re.compile(r"""(?is)(?:src|href|action)\s*=\s*["']([^"']{4,300})["']""")
@@ -330,6 +437,25 @@ _UA = (
 # Third-party pages are unbounded; everything past this is boilerplate or data.
 _SCAN_CAP = 600_000
 _READ_CAP = 900_000
+
+# The typography a page is written in, and a phrase list never is. `we’re
+# hiring` off a word processor is a different string from `we're hiring`, and a
+# barber shop that types `walk-ins welcome — first-come, first-served` is saying
+# the same thing as one that types it flat. Matching phrases against raw text
+# made the punctuation part of the claim, so a site advertising a job read as
+# one that was not, and a shop that books nothing was told to buy a calendar.
+#
+# Only the quotes are folded, because an apostrophe is a letter's neighbour
+# and is the one mark kept: `_PUNCT_RE` takes every other one out on its own,
+# and it would otherwise turn "we’re" into "we re" and leave the phrase
+# unfindable in the other direction.
+_TYPOGRAPHY = str.maketrans({"‘": "'", "’": "'", "‚": "'",
+                             "‛": "'", "′": "'", "“": '"', "”": '"'})
+# A word keeps its accents — `réserver` and `verstärkung` are words in the lists
+# below — so this is `\w` and not `[a-z]`, and the underscore is punctuation
+# here rather than a letter, because `/book_now/` is a path and not a word.
+_WORD_RE = re.compile(r"[\w']+")
+_PUNCT_RE = re.compile(r"[^\w' ]+|_+")
 
 _COMMENT_RE = re.compile(r"(?s)<!--.*?-->")
 _SCRIPT_RE = re.compile(r"(?is)<(script|style|noscript|svg|template)\b[^>]*>.*?</\1\s*>")
@@ -380,7 +506,9 @@ _ASSET_RE = re.compile(
 # "simplex.com", so a link to a supplier counted as a social profile and the
 # finding it suppressed was one this business really did have.
 _SOCIAL_HOSTS = ("facebook.com", "fb.com", "instagram.com", "linkedin.com",
-                 "twitter.com", "x.com", "youtube.com", "tiktok.com")
+                 "twitter.com", "x.com", "youtube.com", "tiktok.com",
+                 "pinterest.com", "threads.net", "threads.com", "snapchat.com",
+                 "vimeo.com", "nextdoor.com", "xing.com")
 _SOCIAL_JUNK_RE = re.compile(
     r"(?:/sharer|/share\.php|/intent/|/plugins/|/dialog/|/tr\?|/hashtag/)", re.I)
 # Feed widgets render their profile links in JavaScript, so the markup shows the
@@ -431,6 +559,15 @@ _SERVICE_WORDS = (
     "emergency", "replacement", "removal", "design", "training", "therapy", "grooming",
     "detailing", "renovation", "landscaping", "roofing", "plumbing", "heating",
     "cooling", "electrical", "dental", "legal", "accounting", "tutoring", "catering",
+    # A driving school heads its list "Driving lessons" and sells nothing this
+    # tuple had ever heard of, so nothing about that business reached `services`
+    # — and `_bookable` reads `services`, so the one trade whose whole product
+    # is an hour in a diary looked like a business that books nothing.
+    # Not "session": this tuple is matched against every link label on the site,
+    # and a footer link reading "Session cookies" would have entered the list of
+    # what the business sells and then read as an hour somebody books.
+    "lesson", "tuition", "massage", "tattoo", "photography",
+    "assessment", "valuation", "coaching",
 )
 
 # Language that means a customer arranges a time. Not "emergency", "estimate",
@@ -439,20 +576,33 @@ _SERVICE_WORDS = (
 # different finding, with a different offer behind it. Reading them as booking
 # put the catalogue's highest-severity gap on top of businesses that book
 # nothing, which is the one place a wrong claim is unrecoverable.
+#
+# The bare noun "booking" is gone for that reason. It is the first word of
+# "Booking terms and cancellation policy", which is the small print under an
+# order form and appears on printers, couriers and hire companies that arrange
+# no times at all. Every other entry here is a verb with its object attached, so
+# it can only be somebody arranging one.
 _APPOINTMENT_WORDS = (
-    "appointment", "book a", "book an", "book your", "booking", "schedule a",
-    "schedule an", "schedule your", "consultation", "call us to book", "reservation",
-    "reserve a table", "terminvereinbarung", "termin vereinbaren", "termin buchen",
-    "cita previa", "rendez-vous",
+    "appointment", "appointments", "book a", "book an", "book your", "schedule a",
+    "schedule an", "schedule your", "consultation", "consultations",
+    "call us to book", "call to book", "call to schedule", "arrange a time",
+    "reservation", "reservations", "reserve a table", "terminvereinbarung",
+    "termin vereinbaren", "termin buchen", "cita previa", "rendez vous",
 )
 
 # The page saying outright that it does not book times. "Walk-ins only, no
 # appointments" contains the word the rule was matching on, so the email opened
-# by contradicting the page it was quoting.
+# by contradicting the page it was quoting. Written flat, because `_phrase_text`
+# has already taken the hyphens and the comma out of the page: one entry here
+# now matches "first-come, first-served" and "first come first served" both,
+# which is the pair that got through and put a barber shop on the list.
 _NO_APPOINTMENT_PHRASES = (
-    "walk-ins only", "walk in only", "walk-in only", "walk-ins welcome",
+    "walk ins only", "walk in only", "walk ins welcome", "walk in welcome",
     "no appointment", "no appointments", "without an appointment",
-    "first come, first served", "ohne termin", "sin cita previa",
+    "first come first served", "drop ins welcome",
+    "no booking required", "no bookings required",
+    "no reservation required", "no reservations required",
+    "ohne termin", "sin cita previa",
 )
 
 # Work that is delivered at a time somebody has to agree to. A business whose
@@ -461,12 +611,21 @@ _NO_APPOINTMENT_PHRASES = (
 # day delivery" does not. That distinction is the whole rule: before it, any
 # services list at all was enough, so every fabricator and wholesaler with a
 # contact form was told it was missing a booking system it has no use for.
+#
+# The second block is trades that book a chair, a couch or a slot and never use
+# the word: a tattoo studio, an osteopath, an estate agent showing a house. Not
+# "class", "course" or "tour", which are inside "first class postage", "golf
+# course" and "contour", and would put the headline gap on a courier.
 _BOOKABLE_WORDS = (
     "appointment", "consultation", "consult", "treatment", "therapy", "massage",
     "cleaning", "repair", "install", "inspection", "servicing", "service call",
-    "maintenance", "checkup", "check-up", "exam", "grooming", "detailing",
-    "haircut", "styling", "manicure", "pedicure", "facial", "tune-up",
+    "maintenance", "checkup", "check up", "exam", "grooming", "detailing",
+    "haircut", "styling", "manicure", "pedicure", "facial", "tune up",
     "test drive", "fitting", "lesson", "tutoring", "valuation", "assessment",
+    "tattoo", "piercing", "waxing", "acupuncture", "osteopath", "physiotherapy",
+    "chiropractic", "adjustment", "counselling", "counseling", "coaching",
+    "session", "sitting", "viewing", "survey", "hearing test", "eye test",
+    "sight test", "mot testing", "boarding", "daycare", "dog walking",
 )
 
 # A site that calls itself a dentist in its own JSON-LD books times, and says so
@@ -554,24 +713,52 @@ _DOC_LEAD_RE = re.compile(
     r"(?i)^(?:download|get|view|open|print|complete|fill\s+(?:in|out))\b\s*(?:the|our|your|a)?\s*")
 _DOC_NAME_RE = re.compile(r"[a-z][a-z' ]+[a-z]")
 
-# Only the other languages' *verbs* for booking, never their nouns for an
-# appointment. `/termin-buchen` is a calendar; `/cita` and `/reservas` are as
-# often a page with a phone number on it, and reading one as a booking engine
-# silently deletes the finding those sites exist to produce. The English list
-# already carries that ambiguity in `/appointment` and `/reserve`; there is
-# nothing to gain by importing it into three more languages.
-_BOOKING_LINK_RE = re.compile(
-    r"/(?:book|booking|book-online|book-now|schedule|scheduling|appointment|appointments|"
-    r"reserve|reservations|make-an-appointment|request-appointment|"
-    r"termin-buchen|terminbuchung|terminvereinbarung|termin-vereinbaren|"
-    r"online-buchen|reserver-en-ligne|reservation-en-ligne|"
-    r"cita-online|pedir-cita-online|reservar-online)(?:/|$|\?)", re.I)
-_BOOKING_TEXT = ("book now", "book online", "book an appointment", "schedule an appointment",
-                 "schedule online", "make an appointment", "request an appointment",
-                 "reserve a table", "book a table", "book a service",
-                 "termin buchen", "termin online buchen", "online termin buchen",
-                 "terminvereinbarung", "réserver en ligne", "reserver en ligne",
-                 "pedir cita online", "cita online", "reservar online")
+# A path segment read as the words in it, rather than as one of twenty-two
+# spellings somebody thought of. The old list demanded the segment be exactly
+# `/booking`, so `/online-booking/` and `/book-a-table/` — the two plainest ways
+# a site writes it — were not a booking system, and `no_online_booking` went out
+# to businesses with a Book button on the home page.
+#
+# Only the other languages' *verbs* for booking are here, never their nouns for
+# an appointment: `buchen` is a calendar, and `/cita` and `/reservas` are as
+# often a page with a phone number on it. The English list already carries that
+# ambiguity in `appointment` and `reserve`; nothing is gained by importing it.
+_BOOKING_PATH_WORDS = frozenset({
+    "book", "booking", "bookings", "schedule", "scheduling", "appointment",
+    "appointments", "reserve", "reservation", "reservations",
+    "buchen", "terminbuchung", "terminvereinbarung", "reserver", "reservar",
+})
+# And the words that turn a booking word into the small print about one. This is
+# the whole reason the segment is read as words: "booking-terms" and "booking"
+# differ by a noun, and only one of them is a calendar.
+_BOOKING_PATH_STOP = frozenset({
+    "terms", "term", "policy", "policies", "conditions", "cancellation",
+    "cancel", "fee", "fees", "faq", "faqs", "guide", "guides", "tips",
+    "blog", "news", "article", "articles", "club", "clubs", "review",
+    "reviews", "shop", "store", "keeping", "software", "system", "systems",
+    # "/e-book/" is a lead magnet and its segment is two words, one of which is
+    # "book". A downloadable PDF is not a calendar.
+    "e", "ebook", "free", "download", "downloads", "pdf", "brochure",
+    "catalogue", "catalog", "recipe", "recipes", "sample", "samples",
+})
+# A verb and its object, in the order a button prints them. "Book Appointment",
+# "Book online", "Make a booking" and "Schedule your visit" are one control with
+# four spellings, and the old phrase list held two of them.
+_BOOKING_VERBS = frozenset({
+    "book", "booking", "bookings", "schedule", "reserve", "reservation",
+    "reservations", "buchen", "reserver", "réserver", "reservar",
+})
+_BOOKING_OBJECTS = frozenset({
+    "online", "now", "today", "appointment", "appointments", "table", "visit",
+    "time", "times", "slot", "consultation", "session", "here", "us", "in",
+    "a", "an", "your", "my", "the", "ligne", "termin",
+})
+_BOOKING_LEADS = frozenset({"make", "request", "online", "instant", "easy",
+                            "quick", "click", "to", "termin"})
+# The phrases the verb-and-object rule cannot express, because the verb is not
+# in them at all.
+_BOOKING_LABELS = ("pedir cita online", "cita online", "cita previa online",
+                   "rendez vous en ligne", "prendre rendez vous")
 
 def _phone_present(text: str) -> bool:
     """True when `text` prints something a reader would dial."""
@@ -588,6 +775,40 @@ def _clean_text(fragment: str) -> str:
     out = _TAG_RE.sub(" ", fragment or "")
     out = _html.unescape(out)
     return _WS_RE.sub(" ", out).strip()
+
+
+def _phrase_text(text: str) -> str:
+    """`text` flattened to the shape the phrase lists below are written in.
+
+    Lower case, ASCII quotes, and every dash, comma and stop turned into a
+    space, so a phrase is matched on its words and not on how the page
+    punctuated them. One entry now covers `walk-ins only`, `walk ins only` and
+    `walk‑ins only`, which is three fewer strings to remember and one fewer way
+    to miss the sentence in which a business says outright that it books nothing.
+
+    Letters keep their accents — `réserver` and `verstärkung` are words in the
+    lists — so this strips punctuation rather than everything but ASCII.
+    """
+    flat = str(text or "").lower().translate(_TYPOGRAPHY)
+    return _WS_RE.sub(" ", _PUNCT_RE.sub(" ", flat)).strip()
+
+
+def _says(texts, phrases) -> str:
+    """The first of `phrases` that one of `texts` says as whole words, or "".
+
+    Whole words, because "appointment" sits inside "disappointment" and "quote"
+    inside "quotes" — and this is the last place in the module where a phrase
+    list is matched against a page, so it is the last place the substring
+    mistake can still be made.
+    """
+    if isinstance(texts, str):
+        texts = (texts,)
+    for text in texts:
+        padded = " %s " % text
+        for phrase in phrases:
+            if " %s " % phrase in padded:
+                return phrase
+    return ""
 
 
 def _visible_text(html: str) -> str:
@@ -810,7 +1031,147 @@ def _headings(pages) -> list[str]:
 
 def _bookable(services) -> bool:
     """True when the site's own list of what it sells is work booked for a time."""
-    return any(w in str(name).lower() for name in services for w in _BOOKABLE_WORDS)
+    return any(w in _phrase_text(name) for name in services for w in _BOOKABLE_WORDS)
+
+
+def _controls(pages, headings) -> list[str]:
+    """Every phrase on the site a visitor can click or is led by, and nothing else.
+
+    Headings, link labels and button text, each kept whole so a phrase cannot
+    form across the join between two of them. A rule that reads this is asking
+    what the site *offers*; a rule that reads the visible text is asking what
+    the site happens to mention, and the two answers differ most on the pages
+    where being wrong costs the most — "no need to request a quote by email" is
+    a broker whose whole pitch is that you never have to, read as a business
+    that quotes by hand.
+    """
+    parts: list[str] = list(headings)
+    for page in pages:
+        parts.extend(label for _href, label in page.links)
+        parts.extend(_clean_text(body) for body in _BUTTON_RE.findall(page.html))
+        for tag in _SUBMIT_RE.findall(page.html):
+            parts.append(_attrs(tag).get("value", ""))
+    return [_phrase_text(p) for p in parts if p]
+
+
+def _booking_control(href: str, label: str) -> bool:
+    """A link a visitor clicks to arrange a time, read as words rather than spellings.
+
+    The path is read one segment at a time and the segment is read as the words
+    in it, so `/online-booking/` and `/book-a-table/` are calendars and
+    `/booking-terms/` is the small print under an order form. The label is read
+    as a verb and its object, so "Book Appointment" and "Make a booking" are the
+    same control that "Book online" was — and "Booking terms", which has the
+    verb and no object, is not a control at all.
+    """
+    for segment in _path(href).split("/"):
+        words = set(_WORD_RE.findall(_phrase_text(segment)))
+        if (words & _BOOKING_PATH_WORDS) and not (words & _BOOKING_PATH_STOP):
+            return True
+
+    flat = _phrase_text(label)
+    if _says(flat, _BOOKING_LABELS):
+        return True
+    words = _WORD_RE.findall(flat)
+    for index, word in enumerate(words):
+        if word not in _BOOKING_VERBS:
+            continue
+        if set(words[index + 1:index + 4]) & _BOOKING_OBJECTS:
+            return True
+        if set(words[max(0, index - 2):index]) & _BOOKING_LEADS:
+            return True
+    return False
+
+
+# ── Prices ──
+
+# What a published price looks like when it is one. A figure on its own is not:
+# the same pattern finds "$50 off your first service" and "no deposit, $0 down",
+# and three of those read as a rate card. So a price is a figure the page
+# attaches to something it sells — a table cell, a list item, a "from", a "per
+# hour", a section headed Fees — and a figure inside an offer is not a price at
+# all. The old rule asked only for three matches anywhere in the whole crawl,
+# which is the wrong question twice over: it read a discount sheet as a price
+# list, and it read a page publishing two prices as a page publishing none.
+_PRICE_LEAD_RE = re.compile(
+    r"(?i)\b(?:from|starting|starts|start|as low as|only|just|priced|price[ds]?|"
+    r"fee|fees|rate|rates|cost[s]?|charge[ds]?|ab|desde|[àa] partir de)"
+    r"\b[^.;:!?]{0,20}$")
+_PRICE_TRAIL_RE = re.compile(
+    r"(?i)^\s*(?:\+\s*(?:hst|gst|pst|vat|tax)\b|(?:/|\s+)(?:per\s+|pro\s+|par\s+)?"
+    r"(?:hr|hour|day|night|week|month|year|session|visit|treatment|person|head|"
+    r"adult|child|guest|unit|item|sq\s?ft|m2|each|ea|pp|mo|yr)\b)")
+# Both anchored to the figure, because a discount word merely *near* one is a
+# different sentence: "we accept credit cards. Haircuts $25" has "credit" eleven
+# words away, and reading that as a coupon would delete a published price.
+_DISCOUNT_LEAD_RE = re.compile(
+    r"(?i)\b(?:save|saves|saving|savings|discount|discounted|coupon|voucher|"
+    r"rebate|cashback|win|won|prize|worth|valued|raised|donat\w*|financ\w*|"
+    r"no\s+obligation)\b[^.;:!?]{0,20}$")
+_DISCOUNT_TRAIL_RE = re.compile(
+    r"(?i)^\s*(?:off|back|credit|discount|discounted|rebate|voucher|cashback|"
+    r"down|deposit|value)\b")
+# Whole words, not fragments: "fee" is inside "coffee", and a heading reading
+# "Coffee and cake" would otherwise have counted as a price list.
+_PRICE_HEADING_WORDS = frozenset({
+    "price", "prices", "pricing", "rate", "rates", "fee", "fees", "tariff",
+    "tariffs", "preis", "preise", "preisliste", "tarif", "tarifs", "precios",
+    "prezzi",
+})
+# Everything else a pricing section is called already carries one of the words
+# above; this is the one that does not.
+_PRICE_HEADING_PHRASES = ("how much",)
+_PRICE_CELL_RE = re.compile(r"(?is)<(li|td|dd|h2|h3|h4)\b[^>]*>(.*?)</\1\s*>")
+_BUTTON_RE = re.compile(r"(?is)<button\b[^>]*>(.*?)</button\s*>")
+_SUBMIT_RE = re.compile(r"""(?is)<input\b[^>]*type\s*=\s*["']?submit[^>]*>""")
+
+
+def _offer_shaped(text: str, start: int, end: int) -> bool:
+    """True when the figure is what a page takes off a price rather than the price."""
+    return bool(_DISCOUNT_LEAD_RE.search(text[max(0, start - 40):start])
+                or _DISCOUNT_TRAIL_RE.match(text[end:end + 24]))
+
+
+def _real_prices(text: str) -> list[str]:
+    """Money on the page with the offers taken back out of it."""
+    return [m.group(0) for m in _MONEY_RE.finditer(text)
+            if not _offer_shaped(text, m.start(), m.end())]
+
+
+def _price_heading(headings) -> bool:
+    for heading in headings:
+        flat = _phrase_text(heading)
+        if set(_WORD_RE.findall(flat)) & _PRICE_HEADING_WORDS:
+            return True
+        if _says(flat, _PRICE_HEADING_PHRASES):
+            return True
+    return False
+
+
+def _publishes_prices(text: str, html: str, headings, pricing_link: bool) -> bool:
+    """True when the site puts a figure next to something a customer can buy."""
+    if pricing_link:
+        return True
+    priced = _real_prices(text)
+    if not priced:
+        return False
+    if _price_heading(headings):
+        return True
+    for _tag, body in _PRICE_CELL_RE.findall(html):
+        cell = _clean_text(body)
+        if cell and _real_prices(cell):
+            return True
+    for match in _MONEY_RE.finditer(text):
+        if _offer_shaped(text, match.start(), match.end()):
+            continue
+        if (_PRICE_LEAD_RE.search(text[max(0, match.start() - 40):match.start()])
+                or _PRICE_TRAIL_RE.match(text[match.end():match.end() + 24])):
+            return True
+    # The loose arm the rule started as, kept at its old threshold so nothing
+    # that used to read as a price list stops reading as one: three *different*
+    # figures, none of them an offer. Counting repeats let one price printed
+    # three times in a sticky header stand in for three prices.
+    return len({p.replace(" ", "") for p in priced}) >= 3
 
 
 def _social_links(pages) -> list[str]:
@@ -868,6 +1229,11 @@ def _signals(pages, tech: dict, base_url: str, load_ms: int) -> tuple[dict, dict
     low = "\n".join(p.low for p in pages)
     text = " ".join(p.text for p in pages)
     text_low = text.lower()
+    # The same text with the page's typography flattened out of it, which is what
+    # every phrase list below is matched against. See `_phrase_text`.
+    flat = _phrase_text(text)
+    headings = _headings(pages)
+    controls = _controls(pages, headings)
     facts: dict = {}
 
     hrefs = [(href.lower(), label.lower()) for page in pages for href, label in page.links]
@@ -877,8 +1243,7 @@ def _signals(pages, tech: dict, base_url: str, load_ms: int) -> tuple[dict, dict
     # can read the same form differently.
     contact_form = tech["forms"] > 0 or _embedded_forms(pages)
 
-    booking_link = any(_BOOKING_LINK_RE.search(href) or any(t in label for t in _BOOKING_TEXT)
-                       for href, label in hrefs)
+    booking_link = any(_booking_control(href, label) for href, label in hrefs)
     # A vendor script or a link to a booking page is a booking system. The same
     # words in running prose are not: "Request an appointment" is the heading
     # over the contact form on every site that has no booking at all, and
@@ -899,7 +1264,13 @@ def _signals(pages, tech: dict, base_url: str, load_ms: int) -> tuple[dict, dict
         any(w in text_low for w in ("newsletter", "mailing list", "subscribe to our"))
         and bool(_EMAIL_FIELD_RE.search(html_all)))
 
-    quote_phrase = next((q for q in _QUOTE_PHRASES if q in text_low), "")
+    # A control the visitor clicks or a section headed by one, on the same
+    # reasoning as booking: the phrase in running prose says only that the page
+    # mentions quoting, and a broker whose pitch is "no need to request a quote
+    # by email" was told its quotes are handled by hand. Scoped to a control it
+    # is also better evidence — the sentence quotes something the owner can
+    # point at on their own home page.
+    quote_phrase = _says(controls, _QUOTE_PHRASES)
     has_quote_form = bool(quote_phrase) and contact_form
     if quote_phrase:
         facts["quote_phrase"] = quote_phrase
@@ -927,8 +1298,8 @@ def _signals(pages, tech: dict, base_url: str, load_ms: int) -> tuple[dict, dict
     careers = any(_CAREER_LINK_RE.search(href) for href, _ in hrefs
                   if not href.startswith(("mailto:", "tel:")))
     careers = careers or any(_CAREER_LINK_RE.search(p.path) for p in pages)
-    careers = careers or any(h in _CAREER_HEADINGS for h in _headings(pages))
-    careers = careers or any(w in text_low for w in _HIRING_PHRASES)
+    careers = careers or any(h in _CAREER_HEADINGS for h in headings)
+    careers = careers or bool(_says(flat, _HIRING_PHRASES))
 
     pdf_form = ""
     for href, label in hrefs:
@@ -942,8 +1313,7 @@ def _signals(pages, tech: dict, base_url: str, load_ms: int) -> tuple[dict, dict
     pricing_link = any("/pricing" in href or "/prices" in href or "/rates" in href
                        or label in ("pricing", "prices", "our prices", "rates")
                        for href, label in hrefs)
-    money_hits = len(_MONEY_RE.findall(text))
-    has_pricing = pricing_link or money_hits >= 3 or "our prices" in text_low
+    has_pricing = _publishes_prices(text, html_all, headings, pricing_link)
 
     testimonials = any(w in text_low for w in (
         "testimonial", "what our clients say", "what our customers say", "customer reviews",
@@ -997,8 +1367,13 @@ def _signals(pages, tech: dict, base_url: str, load_ms: int) -> tuple[dict, dict
         "avg_page_kb": avg_kb,
         "slow": load_ms > 3000,
     }
-    facts["appointment_shaped"] = any(w in text_low for w in _APPOINTMENT_WORDS)
-    facts["takes_no_appointments"] = any(p in text_low for p in _NO_APPOINTMENT_PHRASES)
+    facts["appointment_shaped"] = bool(_says(flat, _APPOINTMENT_WORDS))
+    facts["takes_no_appointments"] = bool(_says(flat, _NO_APPOINTMENT_PHRASES))
+    # The site's own list of what it sells, before `_services` filters it down to
+    # twelve labels short enough for a brief. `_bookable` reads that filtered
+    # list, so a trade whose work never made the cut — a driving school, a tattoo
+    # studio — looked like a business that arranges no times at all.
+    facts["service_listing"] = [item for page in pages for item in _listed_services(page)]
     return signals, facts
 
 
@@ -1323,7 +1698,8 @@ def _audit(pages: dict, base_url: str, *, final_url: str = "", status: int = 0,
     title, description, h1, brand = _meta(ordered, home_url)
     services = _services(ordered, title, brand)
     signals, facts = _signals(ordered, tech, home_url, load_ms)
-    facts["bookable_services"] = _bookable(services)
+    facts["bookable_services"] = (_bookable(services)
+                                  or _bookable(facts.pop("service_listing", ())))
     gaps = _gaps(tech, signals, facts)
 
     result.update({

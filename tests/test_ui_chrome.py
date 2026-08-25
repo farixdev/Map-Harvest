@@ -32,6 +32,7 @@ so constructing one can never read or write a developer's real ~/.mapharvest —
 `core.outreach_db` resolves its own path through it on every call, so the
 database goes to the same place.
 """
+import ast
 import contextlib
 import itertools
 import os
@@ -43,7 +44,10 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from PyQt5.QtCore import QEvent, QPoint, QRect, QSize, Qt  # noqa: E402
+from PyQt5.QtCore import (  # noqa: E402
+    QEvent, QObject, QPoint, QRect, QSize, Qt, QtMsgType,
+    qInstallMessageHandler,
+)
 from PyQt5.QtGui import QKeyEvent  # noqa: E402
 from PyQt5.QtTest import QTest  # noqa: E402
 from PyQt5.QtWidgets import (  # noqa: E402
@@ -58,6 +62,7 @@ from core import settings as ST  # noqa: E402
 from core import templates as TPL  # noqa: E402
 from core.campaign import OutreachWorker  # noqa: E402
 from ui import app as APP  # noqa: E402
+from ui import command_palette as CP  # noqa: E402
 from ui import components as CO  # noqa: E402
 from ui import theme as TH  # noqa: E402
 from ui import screen_outreach as SO  # noqa: E402
@@ -3480,3 +3485,754 @@ def test_the_list_dialog_can_be_resized_and_carries_a_floor():
         assert font.pointSizeF() > 0 or font.pixelSize() > 0
     finally:
         dialog.deleteLater()
+
+
+# ── U14: the keyboard, the palette, and what an appearance change costs ──────
+# The audit's finding was that keyboard support was effectively absent: no
+# shortcuts, no mnemonics, no menu bar, Enter did not submit and Escape did
+# nothing, on any of the four screens. Everything below is measured against the
+# shell rather than a screen, because a shortcut that works on one screen and
+# not the next is not a shortcut — the layer has to be somewhere every screen
+# inherits it from, and the shell is the only such place.
+#
+# Nothing here opens a modal. Qt 5.15 offscreen aborts the process on any
+# QMessageBox that is actually shown, so the one command that would ask a
+# question — arming a live send — has `components.confirm` answered as an input.
+
+
+def _menus(window) -> dict:
+    """The menu bar as {title: menu}, with the mnemonic markers left in."""
+    found = {}
+    for action in window.menuBar().actions():
+        menu = action.menu()
+        if menu is not None:
+            found[action.text()] = menu
+    return found
+
+
+def _menu_keys(window) -> dict:
+    """Every menu item in the window as {text: shortcut}."""
+    found = {}
+    for menu in _menus(window).values():
+        for action in menu.actions():
+            if not action.isSeparator():
+                found[action.text()] = action.shortcut().toString()
+    return found
+
+
+@contextlib.contextmanager
+def _captured_messages():
+    """Every warning Qt writes while the block runs, as a list of strings."""
+    seen = []
+
+    def handler(mode, _context, text):
+        if mode in (QtMsgType.QtWarningMsg, QtMsgType.QtCriticalMsg):
+            seen.append(text)
+
+    previous = qInstallMessageHandler(handler)
+    try:
+        yield seen
+    finally:
+        qInstallMessageHandler(previous)
+
+
+def _keyboard_in(window):
+    """Make `window` the active one, so `setFocus` actually moves the focus.
+
+    Same reason `_focused` in U10 does it: `setFocus` inside an inactive window
+    only records where the focus would go if that window ever got it, so
+    without this every assertion about what has the keyboard measures whatever
+    test happened to show a window last. Every screen in this module is shown
+    as its own top-level, so which window is active depends on what ran before.
+    """
+    app = _app()
+    # Drained before the window is activated and not only after. Every screen in
+    # this module is shown as its own top-level, and a `show()` still sitting in
+    # the queue from an earlier test activates whatever it belongs to the moment
+    # it is delivered — which, activated first, is the window it takes back.
+    app.processEvents()
+    app.processEvents()
+    if not window.isVisible():
+        window.show()
+    window.raise_()
+    window.activateWindow()
+    app.setActiveWindow(window)
+    app.processEvents()
+    assert app.activeWindow() is window, \
+        "the active window is %r, so nothing in %r can hold the keyboard" % (
+            app.activeWindow(), window)
+    return window
+
+
+def _focused_on(widget):
+    """The keyboard on `widget`, its window activated in the same breath.
+
+    Activated immediately before rather than at the top of the test: showing a
+    screen and switching the stack both move the active window on the offscreen
+    platform, so an activation that happens a few statements earlier has often
+    been undone by the time the focus is asked for.
+    """
+    app = _app()
+    _keyboard_in(widget.window())
+    widget.setFocus(Qt.OtherFocusReason)
+    app.processEvents()
+    assert widget.hasFocus(), (
+        "the keyboard will not go to %r: visible=%s enabled=%s policy=%s "
+        "window shown=%s active=%r"
+        % (widget, widget.isVisible(), widget.isEnabled(),
+           int(widget.focusPolicy()), widget.window().isVisible(),
+           app.activeWindow()))
+    return widget
+
+
+@contextlib.contextmanager
+def _all_four_built(window):
+    """Every screen constructed and the home screen on top, then home again."""
+    for key in (APP.RESULTS, APP.OUTREACH, APP.SETTINGS):
+        window.shell.screen(key)
+    window.shell.go(APP.INPUT)
+    _app().processEvents()
+    try:
+        yield window.shell
+    finally:
+        window.shell.go(APP.INPUT)
+        _app().processEvents()
+
+
+def test_the_menu_bar_names_every_destination_and_the_key_that_reaches_it():
+    """The app had no menu bar at all, so nothing named a key anywhere.
+
+    Qt writes an action's shortcut in a second column beside its name, which
+    makes the bar the one surface that answers "what can I press" without the
+    user having to be told to press something first. Three menus, each with a
+    mnemonic, and every destination in the bar carrying its own Ctrl+digit.
+    """
+    window = _window()
+    titles = list(_menus(window))
+    assert titles == ["&Go", "&View", "&Help"], "the menus are %s" % titles
+
+    keys = _menu_keys(window)
+    assert keys.get("Command &palette…") == "Ctrl+K"
+    for at, key in enumerate(window.shell.destinations(), start=1):
+        wanted = "&%d  %s" % (at, window.shell.label(key))
+        assert keys.get(wanted) == "Ctrl+%d" % at, \
+            "%r is on %r" % (wanted, keys.get(wanted))
+    assert keys.get("&Settings") == "Ctrl+,"
+    assert keys.get("&Keyboard shortcuts and commands") == "F1"
+
+    # Back and Submit spell their keys in their own text on purpose: a shortcut
+    # is matched before the focused widget sees the key, so Escape and Return
+    # registered here would be taken away from every dialog and every editor
+    # in the app.
+    assert keys.get("&Back\tEsc") == ""
+    assert keys.get("&Submit the form in front of you\tEnter") == ""
+
+
+def test_a_shortcut_reaches_every_destination_from_every_screen():
+    """One layer, owned by the shell, so no screen can be missing it."""
+    window = _window()
+    shell = window.shell
+    keyed = {}
+    for menu in _menus(window).values():
+        for action in menu.actions():
+            keyed[action.shortcut().toString()] = action
+    try:
+        for start in (APP.INPUT, APP.OUTREACH, APP.SETTINGS):
+            shell.go(start)
+            for at, key in enumerate(shell.destinations(), start=1):
+                keyed["Ctrl+%d" % at].trigger()
+                _app().processEvents()
+                assert shell.current_key == key, \
+                    "Ctrl+%d from %s landed on %s" % (at, start,
+                                                      shell.current_key)
+            keyed["Ctrl+,"].trigger()
+            assert shell.current_key == APP.SETTINGS
+    finally:
+        shell.go(APP.INPUT)
+
+
+def test_an_unmodified_shortcut_does_not_fire_while_a_field_is_being_typed_in():
+    """The rule every shortcut in the app is written to obey.
+
+    Qt matches a shortcut before the key reaches whatever has the focus, so an
+    unmodified one is a character a search box never receives. F1 is the only
+    unmodified key the menu registers and it asks first; the modified ones do
+    not have to, which is the reason they carry a modifier.
+    """
+    window = _window()
+    shell = window.shell
+    shell.go(APP.INPUT)
+    field = _focused_on(shell.screen(APP.INPUT).domain_input)
+    try:
+        assert window._typing() is True
+
+        window.on_help()
+        _app().processEvents()
+        assert not shell.palette().isVisible(), \
+            "F1 opened the palette out from under someone typing a search"
+
+        # And with the focus on something that is not text, the same key works.
+        _focused_on(_bar_buttons(window, "tab")[0])
+        assert window._typing() is False
+        window.on_help()
+        _app().processEvents()
+        assert shell.palette().isVisible(), "F1 does nothing anywhere at all"
+    finally:
+        shell.dismiss_palette()
+        field.clear()
+        shell.go(APP.INPUT)
+
+
+def test_escape_backs_out_of_one_thing_at_a_time():
+    """Escape did nothing anywhere. It now undoes exactly one step.
+
+    The palette first, because it is the thing in front; then Settings, which
+    has a way back of its own that has to keep meaning what it meant; then the
+    screen, which returns to wherever it was reached from.
+    """
+    window = _keyboard_in(_window())
+    shell = window.shell
+    try:
+        shell.go(APP.INPUT)
+        shell.go(APP.OUTREACH)
+        window.on_settings()
+        assert shell.current_key == APP.SETTINGS
+        window.open_palette()
+        assert shell.palette().isVisible()
+
+        QTest.keyClick(window, Qt.Key_Escape)
+        _app().processEvents()
+        assert not shell.palette().isVisible(), "Escape left the palette open"
+        assert shell.current_key == APP.SETTINGS, \
+            "one Escape closed the palette and left the screen too"
+
+        QTest.keyClick(window, Qt.Key_Escape)
+        _app().processEvents()
+        assert shell.current_key == APP.OUTREACH, \
+            "Escape out of Settings landed on %s" % shell.current_key
+
+        QTest.keyClick(window, Qt.Key_Escape)
+        _app().processEvents()
+        assert shell.current_key == APP.INPUT, \
+            "Escape did not walk back to where the visit started"
+
+        # And nothing is left to undo: Escape on the home screen is not a way
+        # to keep rewinding through the whole session.
+        while window.on_escape():
+            pass
+        assert window.on_escape() is False
+    finally:
+        shell.go(APP.INPUT)
+
+
+def test_return_presses_the_button_the_form_in_front_of_you_is_asking_for():
+    """Enter did not submit anything, on a product that is mostly forms."""
+    window = _window()
+    shell = window.shell
+    shell.go(APP.INPUT)
+    home = shell.screen(APP.INPUT)
+    results = shell.screen(APP.RESULTS)
+    saved_dir = home.export_dir()
+    started = []
+    with _stubbed(results, "setup", lambda *a, **k: started.append("setup")), \
+            _stubbed(results, "start_worker",
+                     lambda: started.append("start")):
+        try:
+            home.export_dir_input.setText(os.path.join(_TMP, "keyboard-run"))
+            home.domain_input.setText("dentists")
+            home.area_input.setText("Toronto")
+            _focused_on(home.domain_input)
+
+            assert window._primary_near(QApplication.focusWidget()) \
+                is home.start_btn, "Return would press something else"
+            QTest.keyClick(window, Qt.Key_Return)
+            _app().processEvents()
+            assert started == ["setup", "start"], \
+                "Return on a filled form did %s" % (started,)
+            assert shell.current_key == APP.RESULTS
+        finally:
+            home.export_dir_input.setText(saved_dir)
+            home.domain_input.clear()
+            home.area_input.clear()
+            results._set_idle_mode()
+            shell.go(APP.INPUT)
+
+
+def test_return_presses_the_button_that_has_the_focus_and_not_the_form_s():
+    """A focused control answers for itself. Qt only does this inside a dialog."""
+    window = _window()
+    shell = window.shell
+    shell.go(APP.OUTREACH)
+    _app().processEvents()
+    tab = [button for button in _bar_buttons(window, "tab")
+           if button.text() == shell.label(APP.INPUT)][0]
+    try:
+        _focused_on(tab)
+        QTest.keyClick(window, Qt.Key_Return)
+        _app().processEvents()
+        assert shell.current_key == APP.INPUT, \
+            "Return on a focused tab did not press it"
+    finally:
+        shell.go(APP.INPUT)
+
+
+def test_return_is_left_alone_where_it_already_means_something():
+    """A template body and a list row both mean something by Return already.
+
+    Which is why this is `keyPressEvent` on the window and not a shortcut: a
+    shortcut is matched before the focused widget ever sees the key, so Return
+    registered as one would insert no newline anywhere in the app again.
+    """
+    window = _window()
+    shell = window.shell
+    try:
+        # Shown once first: a screen publishes its row of sub-tabs to the shell
+        # from `showEvent`, so there is nothing to reach by name until it has.
+        shell.go(APP.SETTINGS)
+        _app().processEvents()
+        assert shell.go_subtab(APP.SETTINGS, "Templates"), \
+            "the settings screen published no Templates section"
+        _sized(window, DEFAULT_SIZE)
+        screen = shell.screen(APP.SETTINGS)
+
+        _focused_on(screen.template_body_edit)
+        assert window.on_submit() is False, \
+            "Return in the template body fired the screen's primary button"
+
+        _focused_on(screen.template_list)
+        assert window.on_submit() is False, \
+            "Return on a template row fired the screen's primary button"
+    finally:
+        shell.go(APP.INPUT)
+
+
+def test_the_palette_reaches_a_destination_from_the_keyboard_alone():
+    """Ctrl+K, three letters, Return — and the palette is never in the way."""
+    window = _window()
+    shell = window.shell
+    shell.go(APP.INPUT)
+    try:
+        _keyboard_in(window)
+        window.open_palette()
+        _app().processEvents()
+        palette = shell.palette()
+        assert palette.isVisible()
+        assert QApplication.focusWidget() is palette.query, \
+            "the palette opened without the caret in it"
+
+        # The same key closes it. A surface you can only dismiss with a key
+        # other than the one that opened it is one more thing to remember.
+        window.open_palette()
+        _app().processEvents()
+        assert not palette.isVisible(), "Ctrl+K twice left the palette open"
+        _keyboard_in(window)
+        window.open_palette()
+        _app().processEvents()
+
+        QTest.keyClicks(palette.query, "gto")
+        _app().processEvents()
+        titles = [command.title for command in palette.commands()]
+        assert titles[:3] == ["Go to Scrape", "Go to Results",
+                              "Go to Outreach"], \
+            "a three-letter query answered with %s" % titles[:3]
+
+        QTest.keyClick(palette.query, Qt.Key_Down)
+        QTest.keyClick(palette.query, Qt.Key_Down)
+        assert palette.highlighted().title == "Go to Outreach"
+        QTest.keyClick(palette.query, Qt.Key_Return)
+        _app().processEvents()
+        assert not palette.isVisible(), "running a command left the palette up"
+        assert shell.current_key == APP.OUTREACH
+    finally:
+        shell.dismiss_palette()
+        shell.go(APP.INPUT)
+
+
+def test_the_palette_matches_the_letters_of_a_name_and_not_a_substring():
+    """The whole reason it is worth typing into: nobody spells it out."""
+    named = [CP.Command(key=str(at), title=title, run=lambda: None)
+             for at, title in enumerate(
+                 ("Go to Outreach", "Go to Settings",
+                  "Outreach — Prepare a campaign",
+                  "Outreach — Start sending",
+                  "Switch to the light theme"))]
+    assert [c.title for c in CP.rank(named, "prep")] == \
+        ["Outreach — Prepare a campaign"]
+    assert CP.rank(named, "zzz") == []
+    assert [c.title for c in CP.rank(named, "")] == [c.title for c in named], \
+        "an empty query reordered the list instead of leaving it alone"
+
+    # A word start outranks the same letters found scattered, which is what
+    # puts the command being thought of at the top of the list.
+    assert CP.score("out", "Outreach — Start sending") > \
+        CP.score("out", "Go to Outreach")
+    assert CP.score("x", "Outreach") is None
+
+
+def test_the_palette_offers_a_screen_s_own_actions_as_the_controls_they_are():
+    """Every action is the button that already does it, never a copy of it.
+
+    Which is what keeps a command honest: it wears the control's own label —
+    Start reads "Start rehearsal" while dry run is on — it is dimmed exactly
+    when the control is disabled, and it cannot become a second, unconfirmed
+    way to mail two hundred strangers.
+    """
+    window = _window()
+    shell = window.shell
+    shell.go(APP.OUTREACH)
+    _app().processEvents()
+    screen = shell.screen(APP.OUTREACH)
+    try:
+        offered = {command.title: command for command in shell.commands()}
+        start = offered.get("Outreach — Start sending")
+        assert start is not None, "the palette cannot start a send"
+        assert start.where == screen.start_btn.text(), \
+            "the command says %r and the button says %r" % (
+                start.where, screen.start_btn.text())
+        assert start.enabled() == screen.start_btn.isEnabled(), \
+            "the command and its button disagree about whether it can run"
+
+        assert "Outreach — Prepare a campaign" in offered
+        assert "Outreach — Audit the leads" in offered
+        assert "Outreach — Stop sending" in offered
+
+        # And a screen that publishes a row of sub-tabs gets one command per
+        # tab without the shell knowing what a tab page is.
+        for label in screen.TABS:
+            assert "Outreach — %s" % label in offered, \
+                "no way to reach the %s section by typing" % label
+        offered["Outreach — Stats"].run()
+        _app().processEvents()
+        assert screen.pages.currentIndex() == list(screen.TABS).index("Stats")
+    finally:
+        shell.go(APP.INPUT)
+
+
+def _blended(ground: str, scrim: str) -> tuple:
+    """`scrim` composited over `ground`, as Qt will paint it, per channel."""
+    red, green, blue, alpha = [float(part)
+                               for part in re.findall(r"[\d.]+", scrim)]
+    if alpha > 1:
+        alpha /= 255.0
+    under = [int(ground[at:at + 2], 16) for at in (1, 3, 5)]
+    return tuple(round(over * alpha + below * (1 - alpha))
+                 for over, below in zip((red, green, blue), under))
+
+
+def test_the_palette_dims_the_screen_it_is_covering():
+    """Measured as paint, because the first version of this parsed and did not.
+
+    `scrim` was defined in both palettes and spent nowhere, and the rule that
+    finally spent it matched the palette, was parsed, and painted nothing:
+    Qt honours `background-color` on a *subclass* of QWidget only once the
+    widget is told its background is styled. The ground behind the card came
+    out `canvas` exactly, which is what a scrim looks like when it is missing.
+    """
+    window = _window()
+    saved = dict(window.settings)
+    try:
+        for name in ("dark", "light"):
+            theme = TH.theme(name, window.theme.density)
+            # Through `_wearing` as well as `apply_appearance`: every helper in
+            # this module calls `_app()` on its way past, and `_app()` puts the
+            # module's own palette back on the application — so a window styled
+            # by hand is measured in whichever theme `_WEARING` names.
+            with _wearing(theme):
+                window.apply_appearance(dict(saved, theme=name))
+                window.shell.go(APP.INPUT)
+                _sized(window, DEFAULT_SIZE)
+                window.open_palette()
+                _sized(window, DEFAULT_SIZE)
+
+                painted = _histogram(window.shell)
+                ground = max(painted, key=painted.get)
+                channels = tuple(int(ground[at:at + 2], 16)
+                                 for at in (1, 3, 5))
+                wanted = _blended(theme.color["canvas"], theme.color["scrim"])
+                assert ground != theme.color["canvas"].upper(), \
+                    "the %s palette covers the screen and dims nothing" % name
+                assert all(abs(was - want) <= 1
+                           for was, want in zip(channels, wanted)), (
+                    "the ground behind the card is %s and %s over %s is "
+                    "#%02X%02X%02X"
+                    % ((ground, theme.color["scrim"], theme.color["canvas"])
+                       + wanted))
+                window.shell.dismiss_palette()
+                _app().processEvents()
+    finally:
+        window.shell.dismiss_palette()
+        window.settings = dict(saved)
+        ST.save_settings(saved)
+        window.apply_appearance(saved)
+        window.shell.go(APP.INPUT)
+        _app()
+
+
+def test_opening_the_palette_builds_no_screen_that_was_not_already_built():
+    """The palette may not undo what the whole shell was written to do.
+
+    Asking every registered screen for its buttons would construct all four the
+    first time anybody pressed Ctrl+K — 531ms and the 2,747-line settings
+    screen, to fill a list. A command from a screen that does not exist yet is
+    also a claim nobody can check: what a lead table can do depends on what is
+    selected in it.
+    """
+    window = _window()
+    shell = window.shell
+    shell.go(APP.INPUT)
+    before = set(shell.built())
+    try:
+        window.open_palette()
+        _app().processEvents()
+        assert shell.palette().commands(), "the palette opened on nothing"
+        assert set(shell.built()) == before, \
+            "opening the palette built %s" % (set(shell.built()) - before,)
+    finally:
+        shell.dismiss_palette()
+        shell.go(APP.INPUT)
+
+
+def test_arming_a_live_send_from_the_palette_asks_first():
+    """The one command in the list a wrong guess about costs somebody else."""
+    window = _window()
+    saved = dict(window.settings)
+    asked = []
+
+    def refuse(_parent, **kwargs):
+        asked.append(kwargs)
+        return False
+
+    real = APP.components.confirm
+    APP.components.confirm = refuse
+    try:
+        window.settings["dry_run"] = True
+        window.toggle_dry_run()
+        assert len(asked) == 1, "turning dry run off asked nothing"
+        assert asked[0]["danger"] is True
+        assert window.settings["dry_run"] is True, \
+            "the answer was No and dry run went off anyway"
+
+        APP.components.confirm = lambda _parent, **kw: True
+        window.toggle_dry_run()
+        assert window.settings["dry_run"] is False
+        pill = [b for b in _bar_buttons(window)
+                if b.objectName() in ("rehearsal", "live")]
+        assert pill and pill[0].text() == "LIVE", \
+            "the bar did not follow the command"
+
+        # And back is a retreat, so it is not a question.
+        asked[:] = []
+        APP.components.confirm = refuse
+        window.toggle_dry_run()
+        assert asked == [], "putting the safety back on asked permission"
+        assert window.settings["dry_run"] is True
+    finally:
+        APP.components.confirm = real
+        window.settings = dict(saved)
+        ST.save_settings(saved)
+        window.shell.set_dry_run(saved.get("dry_run", True))
+        window.shell.go(APP.INPUT)
+        _app()
+
+
+def test_a_theme_change_is_paid_for_by_the_screen_on_show_and_owed_by_the_rest():
+    """The measurement: 5,328ms of CPU for one density change on the home screen.
+
+    677ms of it was screens the user could not see rebuilding themselves inside
+    the click, `SettingsScreen.restyle()` alone being 626ms of tab pages behind
+    a window nobody was looking at. Nothing is skipped, only deferred: `go`
+    settles the debt in the instant before a screen is put on top, so the first
+    frame anyone sees is already in the new palette. The same change is now
+    1,000ms, and arriving on a screen that owes one costs 203ms.
+    """
+    window = _window()
+    saved = dict(window.settings)
+    with _all_four_built(window) as shell:
+        settings_screen = shell.built(APP.SETTINGS)
+        pages = settings_screen.pages
+        try:
+            window.apply_appearance(dict(saved, density="compact"))
+            _app().processEvents()
+
+            assert set(shell.owes()) == {APP.RESULTS, APP.OUTREACH,
+                                         APP.SETTINGS}, \
+                "the screens off show owe %s" % (shell.owes(),)
+            assert settings_screen.pages is pages, \
+                "a screen nobody is looking at rebuilt itself inside the click"
+
+            shell.go(APP.SETTINGS)
+            _app().processEvents()
+            assert APP.SETTINGS not in shell.owes(), "the debt was never paid"
+            assert settings_screen.pages is not pages, \
+                "arriving on the screen did not put it in the new palette"
+            assert settings_screen.template_subject_edit.height() == \
+                TH.theme(window.theme.name, "compact").control["md"], \
+                "the screen came back at the wrong density"
+        finally:
+            window.apply_appearance(saved)
+            _app().processEvents()
+
+
+class _Counted(QObject):
+    """Counts the appearance events one widget is actually told about."""
+
+    def __init__(self):
+        super().__init__()
+        self.seen = 0
+
+    def eventFilter(self, _watched, event) -> bool:
+        if event.type() in APP._APPEARANCE:
+            self.seen += 1
+        return False
+
+
+def test_a_screen_off_show_is_never_told_the_style_changed():
+    """The other half of the deferral, and the expensive half.
+
+    `app.setStyleSheet` broadcasts to every widget alive, and this app's own
+    widgets answer by re-measuring their text: one swap with four screens built
+    is 30,807 calls to `QFontMetrics.horizontalAdvance`, 2,937ms of CPU over 769
+    widgets against 145ms over the 142 the home screen alone owns. A screen the
+    shell has already decided to rebuild does not need telling, and the work is
+    not skipped — it happens once, in the rebuild, instead of twice.
+    """
+    window = _window()
+    saved = dict(window.settings)
+    # `QApplication.instance()` and not `_app()`: that helper reinstalls this
+    # module's own theme every time it is called, which is a second, unguarded
+    # sheet swap — and one landing inside the measurement counts 50 events.
+    app = QApplication.instance()
+    with _all_four_built(window) as shell:
+        counter = _Counted()
+        watched = shell.built(APP.SETTINGS).template_subject_edit
+        watched.installEventFilter(counter)
+        try:
+            window.apply_appearance(dict(saved, density="compact"))
+            app.processEvents()
+            assert counter.seen == 0, (
+                "a field on a screen nobody can see was told about the style "
+                "change %d times" % counter.seen)
+            watched.removeEventFilter(counter)
+
+            # And the same field on the screen on show is told, so a count of
+            # zero above is a measurement and not an event filter that never ran.
+            shell.go(APP.SETTINGS)
+            app.processEvents()
+            counter.seen = 0
+            watched = shell.built(APP.SETTINGS).template_subject_edit
+            watched.installEventFilter(counter)
+            window.apply_appearance(dict(saved, density="comfortable"))
+            app.processEvents()
+            assert counter.seen > 0, \
+                "the screen on show was not told about the style change either"
+        finally:
+            watched.removeEventFilter(counter)
+            window.apply_appearance(saved)
+            _app().processEvents()
+
+
+def test_the_repolish_walk_stops_at_what_is_actually_on_screen():
+    """140ms over 827 widgets, 630 of them behind the screen on show."""
+    window = _window()
+    with _all_four_built(window) as shell:
+        onstage = shell.onstage()
+        everything = window.findChildren(QWidget)
+        assert len(onstage) < len(everything) // 2, (
+            "the walk still covers %d of the %d widgets alive"
+            % (len(onstage), len(everything)))
+
+        seen = {id(widget) for widget in onstage}
+        assert id(shell.built(APP.INPUT)) in seen, \
+            "the screen on show is not in the walk"
+        for key in (APP.RESULTS, APP.OUTREACH, APP.SETTINGS):
+            hidden = shell.built(key).findChildren(QWidget)
+            assert not (seen & {id(widget) for widget in hidden}), \
+                "the walk reaches into %s, which nobody can see" % key
+        assert id(_bar(window)) in seen, "the walk skips the bar it repaints"
+
+
+def test_an_appearance_change_no_longer_warns_about_a_setting_it_cannot_change():
+    """One identical warning per appearance change, and nothing else it says.
+
+    `theme.apply()` asked for `AA_EnableHighDpiScaling` on every live theme and
+    density change, long after the QApplication existed, and Qt answers a late
+    attempt with a warning and nothing else: 18 lines from a sweep that changed
+    the density fifteen times, and the only warning the app produced that was
+    its own. Startup ordering was already right, so what goes is a request Qt
+    was throwing away — and a log that is all noise is a log nobody reads the
+    one real line in.
+    """
+    window = _window()
+    saved = dict(window.settings)
+    try:
+        with _captured_messages() as seen:
+            window.apply_appearance(dict(saved, density="compact"))
+            window.apply_appearance(dict(saved, density="comfortable"))
+            window.toggle_theme()
+            window.toggle_theme()
+            _app().processEvents()
+        scaling = [line for line in seen if "HighDpiScaling" in line]
+        assert scaling == [], "%d warnings from four appearance changes: %s" % (
+            len(scaling), scaling[:1])
+
+        # The harness can see the warning, so its absence above means something.
+        with _captured_messages() as proof:
+            QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+        assert any("HighDpiScaling" in line for line in proof), \
+            "the message handler never sees the warning this test is about"
+
+        # And the half that can still be set after the app exists still is.
+        TH.enable_high_dpi()
+        assert QApplication.testAttribute(Qt.AA_UseHighDpiPixmaps) is True
+    finally:
+        window.settings = dict(saved)
+        ST.save_settings(saved)
+        window.apply_appearance(saved)
+        _app()
+
+
+def test_the_palette_writes_no_colour_and_no_size_of_its_own():
+    """A new file under `ui/` starts at zero literals and stays there.
+
+    The same three rules `tests/test_components.py` holds the component library
+    to, scanned over the one file this commit adds: no hex, no `px` in any
+    string Qt will parse, and no number reaching a call that fixes a geometry.
+    """
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(here, "ui", "command_palette.py")
+    with open(path, encoding="utf-8") as handle:
+        source = handle.read()
+    tree = ast.parse(source)
+
+    assert re.findall(r"#[0-9A-Fa-f]{6}\b", source) == [], "a colour is written"
+
+    documentation = set()
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.ClassDef)) and body:
+            first = body[0]
+            if isinstance(first, ast.Expr) \
+                    and isinstance(first.value, ast.Constant) \
+                    and isinstance(first.value.value, str):
+                documentation.add(id(first.value))
+    written = [node.value for node in ast.walk(tree)
+               if isinstance(node, ast.Constant) and isinstance(node.value, str)
+               and id(node) not in documentation]
+    assert [text for text in written if re.search(r"\d+\s*px", text)] == []
+
+    geometry = ("setContentsMargins", "setSpacing", "addSpacing",
+                "setFixedHeight", "setFixedWidth", "setFixedSize",
+                "setMinimumHeight", "setMinimumWidth", "setMaximumWidth",
+                "setMinimumSize", "setMaximumSize")
+    offenders = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) \
+                or not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr not in geometry:
+            continue
+        for argument in list(node.args) + [pair.value for pair in node.keywords]:
+            if isinstance(argument, ast.Constant) \
+                    and isinstance(argument.value, (int, float)):
+                offenders.append("%s line %d" % (node.func.attr, node.lineno))
+    assert offenders == [], offenders
