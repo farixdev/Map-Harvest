@@ -1980,6 +1980,11 @@ class SettingsScreen(QWidget):
         self.services_list = QListWidget()
         self.services_list.setObjectName("service_list")
         self.services_list.setMinimumHeight(6 * _t().control["row"])
+        # A list of editable things should answer a double-click. Renaming is
+        # the only edit a service has, and it is refused with a reason on the
+        # shipped ones rather than silently doing nothing.
+        self.services_list.itemDoubleClicked.connect(
+            lambda _item: self._rename_service())
         self._field(grid, 0, "Services you sell", self.services_list)
         services.addLayout(grid)
         services.addWidget(_hint(

@@ -162,7 +162,8 @@ from core import outreach_db as _db
 from core import settings as _settings
 from core import templates as _templates
 from core.ai import AIClient
-from core.campaign import AuditWorker, OutreachWorker, plan_campaign
+from core.campaign import (AuditWorker, OutreachWorker, account_daily_cap,
+                           plan_campaign, release_now)
 from ui import components
 from ui import theme as _theme
 from ui.components import Cell, Column
@@ -1879,6 +1880,13 @@ class OutreachScreen(QWidget):
         self.start_row = pick
         self.start_at = pick.count()
         pick.addWidget(self.start_btn)
+        self.send_now_btn = components.button(
+            "Send now", kind="secondary", size="lg",
+            on_click=self._on_send_now_clicked)
+        self.send_now_btn.setToolTip(
+            "Ignore the sending window and the gap between messages. Daily caps "
+            "still apply.")
+        pick.addWidget(self.send_now_btn)
         self.pause_btn = components.button("Pause", kind="secondary", size="lg",
                                            on_click=self._on_pause_clicked)
         self.pause_btn.setEnabled(False)
@@ -4481,7 +4489,61 @@ class OutreachScreen(QWidget):
         self.send_reason.setText(why)
         self.send_reason.setVisible(bool(why))
 
-    def _on_start_clicked(self) -> None:
+    def _on_send_now_clicked(self) -> None:
+        """Go now: waive the clock, keep the caps.
+
+        The window and the random gap are there to keep a mailbox looking like
+        a person typing, and a user who has decided to send anyway can waive
+        that for themselves. The daily and hourly caps are not the same kind of
+        rule -- they are what keeps Google from shutting the account -- so this
+        cannot lift them, and it says how many it can actually take.
+        """
+        room = self._room_today()
+        if room <= 0:
+            self._toast("Every account has already sent its allowance for today. "
+                        "Raise the daily cap in Settings, or add another account.",
+                        tone="warning")
+            return
+        queued = _int_of(self._stats().get("queued"))
+        going = min(room, queued)
+        if going <= 0:
+            self._toast("This campaign has nothing queued. Prepare one first.",
+                        tone="warning")
+            return
+        dry = bool(self.settings.get("dry_run", True))
+        if not dry and not components.confirm(
+                self,
+                title="Send %s now?" % _plural(going, "message"),
+                body="This ignores your sending window and the gap between "
+                     "messages, so %s leaves as fast as the server accepts it. "
+                     "Daily caps still apply.\n\nThere is no way to recall a "
+                     "message once it has left." % _plural(going, "message"),
+                confirm_text="Send now",
+                danger=True, remember_key=""):
+            return
+        moved = release_now(self.conn, self._campaign_id, going)
+        if moved <= 0:
+            self._toast("Nothing moved forward. The queue may have just emptied.",
+                        tone="warning")
+            return
+        self._toast("Sending %s now." % _plural(moved, "message"), tone="info")
+        self._on_start_clicked(ignore_schedule=True, confirmed=True)
+
+    def _room_today(self) -> int:
+        """How many this campaign could still send today across every account."""
+        total = 0
+        for account in self._accounts():
+            try:
+                cap = account_daily_cap(account, self.settings)
+                used = _db.sent_today(self.conn, _text_of(account.get("email")),
+                                      _campaign._zone(self.settings))
+                total += max(0, _int_of(cap) - _int_of(used))
+            except Exception:
+                continue
+        return total
+
+    def _on_start_clicked(self, ignore_schedule: bool = False,
+                          confirmed: bool = False) -> None:
         if self._sending:
             return
         if not self._retire(self.send_worker):
@@ -4502,7 +4564,7 @@ class OutreachScreen(QWidget):
             return
 
         dry = bool(self.settings.get("dry_run", True))
-        if not dry and not components.confirm(
+        if not dry and not confirmed and not components.confirm(
                 self,
                 title="Mail %s to real businesses?" % _plural(queued, "message"),
                 body="Dry run is off, so this campaign sends for real, from %s, "
@@ -4516,7 +4578,8 @@ class OutreachScreen(QWidget):
 
         self._clear_log()
         self._rehearsed.clear()
-        worker = OutreachWorker(self._campaign_id, self.settings, dry_run=dry)
+        worker = OutreachWorker(self._campaign_id, self.settings, dry_run=dry,
+                                ignore_schedule=bool(ignore_schedule))
         worker.log_signal.connect(self._append_log)
         worker.progress_signal.connect(self._on_send_progress)
         worker.message_sent_signal.connect(self._on_message_sent)

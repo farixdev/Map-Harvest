@@ -746,6 +746,7 @@ COVERED = {
     ("ui/screen_outreach.py", "_show_columns_menu"): "columns_menu",
     ("ui/screen_outreach.py", "_show_views_menu"): "views_menu",
     ("ui/screen_outreach.py", "_on_start_clicked"): "send_for_real",
+    ("ui/screen_outreach.py", "_on_send_now_clicked"): "send_now",
     ("ui/screen_outreach.py", "_open_sent_message"): "sent_message",
     ("ui/screen_outreach.py", "_on_import_csv"): "native file picker, OS-owned",
     ("ui/screen_outreach.py", "_on_export_clicked"): "native file picker, OS-owned",
@@ -841,6 +842,21 @@ def test_a_service_the_user_types_is_added_and_the_process_lives():
     report = result["report"]
     assert report["added"] == ["WhatsApp win-back flows"], report
     assert report["count_after"] == report["count_before"] + 1, report
+
+
+def test_send_now_asks_before_it_waives_the_schedule_and_can_be_refused():
+    """Refused only. Clicking through this one mails real people.
+
+    Send now exists because a shut window looks identical to a broken app: the
+    user pressed Start and nothing happened. It drops the window and the pacing
+    gap, so the gate that asks first is the only thing between the button and a
+    burst of real mail.
+    """
+    report = _driven("send_now", click="Cancel")
+    assert report["seen"]["opened"] is True, report["seen"]
+
+    assert report["worker_started"] is False, "refusing still started a run"
+    assert report["sending"] is False
 
 
 def test_every_modal_call_site_is_covered():
@@ -1644,6 +1660,26 @@ def _case_send_for_real(args: dict) -> dict:
     screen._on_start_clicked()
     return {"seen": seen, "worker_started": screen.send_worker is not None,
             "sending": bool(getattr(screen, "_sending", False))}
+
+
+@case("send_now")
+def _case_send_now(args: dict) -> dict:
+    """Send now waives the clock, so its gate has to be refusable like any other."""
+    screen = _outreach(leads=2, accounts=True, profile=True)
+    _queued_campaign(screen, 2)
+    screen.settings["dry_run"] = False
+    # A window that is shut and a gap that would hold everything: the whole
+    # point of the button is that neither of these decides the answer.
+    screen.settings["send_start_hour"] = 3
+    screen.settings["send_end_hour"] = 4
+    screen.settings["send_min_gap_sec"] = 600
+    screen.settings["send_max_gap_sec"] = 900
+    seen = _drive(click=args.get("click", ""), key=args.get("key", ""))
+    screen._on_send_now_clicked()
+    return {"seen": seen, "worker_started": screen.send_worker is not None,
+            "sending": bool(getattr(screen, "_sending", False)),
+            "ignoring": bool(getattr(screen.send_worker, "ignore_schedule", False))
+            if screen.send_worker is not None else False}
 
 
 @case("sent_message")

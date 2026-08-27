@@ -1103,6 +1103,28 @@ def campaign_start_day(conn, campaign_id: int, settings: dict, now: float = 0.0)
 
 # ── The send worker ──────────────────────────────────────────────────────────
 
+def release_now(conn, campaign_id: int, limit: int = 0) -> int:
+    """Bring queued messages forward so they are due immediately.
+
+    Separate from the worker because "go now" is a decision about the plan, not
+    about the loop: the rows move, the loop then finds them overdue like any
+    other backlog, and a stop half way through leaves the rest exactly where it
+    put them rather than in some third state.
+    """
+    if limit <= 0:
+        return 0
+    rows = _db.rows(
+        conn,
+        "SELECT id FROM messages WHERE campaign_id = ? AND status = 'queued' "
+        "ORDER BY scheduled_at, id LIMIT ?",
+        (_int(campaign_id), int(limit)),
+    )
+    now = time.time()
+    for row in rows:
+        _db.mark_message(conn, _int(row["id"]), "queued", scheduled_at=now)
+    return len(rows)
+
+
 class OutreachWorker(QThread):
     """Sends one campaign's queue, re-deciding everything at send time.
 
@@ -1139,9 +1161,16 @@ class OutreachWorker(QThread):
     IMAP_FIRST_DAYS = 14
     IMAP_DAYS = 2
 
-    def __init__(self, campaign_id: int, settings: dict, dry_run: bool = False):
+    def __init__(self, campaign_id: int, settings: dict, dry_run: bool = False,
+                 ignore_schedule: bool = False):
         super().__init__()
         self.campaign_id = _int(campaign_id)
+        # Send now: the clock stops holding the queue, the caps do not. The
+        # window and the random gap exist to keep a mailbox looking human, and
+        # a user who has decided to go now can waive that for themselves. The
+        # daily and hourly caps protect the account from Google rather than the
+        # recipient from us, so they still apply and nothing here can lift them.
+        self.ignore_schedule = bool(ignore_schedule)
         self._settings = settings if isinstance(settings, dict) else {}
         # Or-ed with the setting, never replaced by the argument: a caller that
         # forgets to pass the flag must not turn a rehearsal into a live send.
@@ -1339,7 +1368,7 @@ class OutreachWorker(QThread):
         run behind it, and every unbound message behind that chaser could have
         gone from the other account at once.
         """
-        if not in_send_window(now, self._settings):
+        if not self.ignore_schedule and not in_send_window(now, self._settings):
             self._replan(conn, due, now, "Outside the sending window")
             return
 
@@ -1405,7 +1434,7 @@ class OutreachWorker(QThread):
             email = _text(account["email"]).strip().lower()
             if not self._has_headroom(conn, account, now):
                 continue
-            ready = self._next_ok.get(email, 0.0)
+            ready = 0.0 if self.ignore_schedule else self._next_ok.get(email, 0.0)
             if ready > now:
                 waits.append(ready - now)
                 continue
