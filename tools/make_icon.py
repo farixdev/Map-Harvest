@@ -16,7 +16,22 @@ import sys
 import zlib
 
 # Brand colours (match the app's dark theme + green Start button)
-BG = (0x22, 0xA5, 0x59)      # green background
+# Read from the theme rather than repeated here: the accent moved once already
+# (#22A559 could not carry white text at 4.5:1) and the icon kept the old colour,
+# so the launcher and the app it launches were different greens.
+def _accent():
+    try:
+        import sys, os
+        sys.path.insert(0, ROOT_DIR)
+        from ui.theme import theme
+        hexv = theme("dark").color["accent.hover"].lstrip("#")
+        return tuple(int(hexv[i:i + 2], 16) for i in (0, 2, 4))
+    except Exception:
+        return (0x1A, 0x85, 0x47)
+
+
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BG = _accent()               # brand green, from ui/theme.py
 FG = (0xFF, 0xFF, 0xFF)      # white pin
 SIZES = (16, 24, 32, 48, 64, 128, 256)
 SS = 4                        # supersampling factor

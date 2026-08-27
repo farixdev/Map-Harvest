@@ -1,12 +1,18 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 
+from PyInstaller.utils.hooks import collect_data_files
+
+# tzdata is data, not code, so nothing imports it and PyInstaller would leave it
+# out -- and without it every IANA zone in the sending-window picker silently
+# resolves to the build machine's clock. lxml and the Qt platform plugins are
+# reached dynamically for the same reason.
 a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[],
-    hiddenimports=[],
+    datas=collect_data_files('tzdata') + [('app_icon.ico', '.')],
+    hiddenimports=['tzdata', 'zoneinfo'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -22,7 +28,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='main',
+    name='MapHarvest',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
