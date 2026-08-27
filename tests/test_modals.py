@@ -750,6 +750,7 @@ COVERED = {
     ("ui/screen_outreach.py", "_on_import_csv"): "native file picker, OS-owned",
     ("ui/screen_outreach.py", "_on_export_clicked"): "native file picker, OS-owned",
     ("ui/screen_results.py", "_show_row_menu"): "results_menu",
+    ("ui/screen_settings.py", "_ask_service"): "add_service",
     ("ui/screen_settings.py", "_offer_to_save"): "template_unsaved",
     ("ui/screen_settings.py", "_offer_to_leave"): "settings_leave",
     ("ui/screen_settings.py", "_store_failed"): "store_failed",
@@ -827,6 +828,19 @@ def _modal_sites() -> list:
             if what:
                 sites.append((rel, where, what, call.lineno))
     return sites
+
+
+def test_a_service_the_user_types_is_added_and_the_process_lives():
+    """Adding a service opens a modal, and modals are where this app has crashed.
+
+    The catalogue ships the wording the gap-to-service mapping is written
+    against, so a user with a service of their own previously had to hand-edit
+    settings.json to offer it. This is that path, driven for real.
+    """
+    result = run_case("add_service", typed="WhatsApp win-back flows", click="OK")
+    report = result["report"]
+    assert report["added"] == ["WhatsApp win-back flows"], report
+    assert report["count_after"] == report["count_before"] + 1, report
 
 
 def test_every_modal_call_site_is_covered():
@@ -1138,7 +1152,7 @@ def _drive(*, click: str = "", key: str = "", tick=None, typed: str = "",
     """
     from PyQt5.QtCore import Qt, QTimer
     from PyQt5.QtTest import QTest
-    from PyQt5.QtWidgets import QCheckBox, QMenu, QTextEdit
+    from PyQt5.QtWidgets import QCheckBox, QLineEdit, QMenu, QTextEdit
 
     seen = {"opened": False, "timed_out": False, "clicked": "", "kind": "",
             "title": "", "text": "", "informative": "", "buttons": [],
@@ -1160,6 +1174,13 @@ def _drive(*, click: str = "", key: str = "", tick=None, typed: str = "",
             wells = widget.findChildren(QTextEdit)
             if wells:
                 wells[0].setPlainText(typed)
+            else:
+                # QInputDialog asks for one line, so it has no QTextEdit at all
+                # and the text was silently dropped -- the dialog opened, the
+                # button was clicked, and the case passed having typed nothing.
+                lines = widget.findChildren(QLineEdit)
+                if lines:
+                    lines[0].setText(typed)
         if tick is not None:
             reader = getattr(widget, "checkBox", None)
             box = reader() if callable(reader) else None
@@ -1837,6 +1858,26 @@ def _case_list_dialog(args: dict) -> dict:
     accepted = dialog.exec_() == ListDialog.Accepted
     return {"seen": seen, "accepted": bool(accepted), "items": dialog.items(),
             **measured}
+
+
+@case("add_service")
+def _case_add_service(args: dict) -> dict:
+    """The service the user types is theirs to keep, rename and remove.
+
+    Runs on the real platform because QInputDialog is a modal like any other:
+    the offscreen plugin takes the process down on it, which is exactly why
+    this file exists.
+    """
+    _child_app()
+    from ui.screen_settings import SettingsScreen
+
+    screen = SettingsScreen()
+    before = list(screen._checked_services())
+    seen = _drive(click=args.get("click", "OK"), typed=args.get("typed", ""))
+    screen._add_service()
+    after = list(screen._checked_services())
+    return {"seen": seen, "added": [s for s in after if s not in before],
+            "count_before": len(before), "count_after": len(after)}
 
 
 # ── Child entry point ────────────────────────────────────────────────────────

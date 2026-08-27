@@ -82,7 +82,8 @@ from PyQt5.QtCore import QDate, QEvent, QSize, Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QFontDatabase, QTextCursor
 from PyQt5.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDateEdit, QFrame, QGridLayout,
-    QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox,
+    QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QMessageBox,
     QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSpinBox, QSplitter,
     QStackedWidget, QTextEdit, QToolTip, QVBoxLayout, QWidget,
 )
@@ -1962,6 +1963,14 @@ class SettingsScreen(QWidget):
         services = self._section(column, "Services you sell")
         head = _row_box()
         head.addStretch()
+        head.addWidget(C.button("Add service", kind="secondary", size="sm",
+                                on_click=self._add_service))
+        self.rename_service_btn = C.button("Rename", kind="secondary", size="sm",
+                                           on_click=self._rename_service)
+        head.addWidget(self.rename_service_btn)
+        self.remove_service_btn = C.button("Remove", kind="danger", size="sm",
+                                           on_click=self._remove_service)
+        head.addWidget(self.remove_service_btn)
         for text, checked in (("All", True), ("None", False)):
             head.addWidget(C.button(
                 text, kind="secondary", size="sm",
@@ -1974,8 +1983,9 @@ class SettingsScreen(QWidget):
         self._field(grid, 0, "Services you sell", self.services_list)
         services.addLayout(grid)
         services.addWidget(_hint(
-            "Only the ticked services are ever offered in an email, and always in "
-            "this exact wording."
+            "Only the ticked services are ever offered in an email, and always "
+            "in this exact wording. Add your own with Add service; the ones you "
+            "add can be renamed and removed. The shipped ones can be unticked."
         ))
 
         proof = self._section(column, "Proof points")
@@ -3466,6 +3476,81 @@ class SettingsScreen(QWidget):
             item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
             item.setCheckState(Qt.Checked)
             self.services_list.addItem(item)
+
+    # ── services the user owns ───────────────────────────────────────────────
+
+    def _custom_service_item(self):
+        """The selected row, when it is one of theirs rather than a shipped one.
+
+        Shipped services are the wording the gap-to-service mapping is written
+        against, so renaming one would silently break that link; they are
+        unticked instead. Anything under Custom is the user's to change.
+        """
+        item = self.services_list.currentItem()
+        if item is None or not item.data(Qt.UserRole):
+            return None
+        name = str(item.data(Qt.UserRole))
+        for names in AUTO_ARMY_SERVICES.values():
+            if any(name.lower() == known.lower() for known in names):
+                return None
+        return item
+
+    def _service_names(self) -> set:
+        out = set()
+        for row in range(self.services_list.count()):
+            name = self.services_list.item(row).data(Qt.UserRole)
+            if name:
+                out.add(str(name).strip().lower())
+        return out
+
+    def _ask_service(self, title: str, preset: str = "") -> str:
+        text, ok = QInputDialog.getText(self, title, "Service, in the wording an "
+                                        "email should use:", QLineEdit.Normal, preset)
+        if not ok:
+            return ""
+        text = " ".join(str(text).split())
+        if not text:
+            return ""
+        if text.lower() in self._service_names() and text.lower() != preset.lower():
+            self.toaster.show("%s is already on the list." % text, tone="warning")
+            return ""
+        return text
+
+    def _add_service(self) -> None:
+        name = self._ask_service("Add a service")
+        if not name:
+            return
+        chosen = self._checked_services() + [name]
+        self._load_services(chosen)
+        self._mark_dirty()
+        self.toaster.show("Added %s. Save to keep it." % name, tone="success")
+
+    def _rename_service(self) -> None:
+        item = self._custom_service_item()
+        if item is None:
+            self.toaster.show("Pick one of your own services to rename. The shipped "
+                              "ones can be unticked but not reworded.", tone="info")
+            return
+        was = str(item.data(Qt.UserRole))
+        name = self._ask_service("Rename service", was)
+        if not name:
+            return
+        chosen = [name if s == was else s for s in self._checked_services()]
+        self._load_services(chosen)
+        self._mark_dirty()
+        self.toaster.show("Renamed to %s. Save to keep it." % name, tone="success")
+
+    def _remove_service(self) -> None:
+        item = self._custom_service_item()
+        if item is None:
+            self.toaster.show("Pick one of your own services to remove. The shipped "
+                              "ones can be unticked instead.", tone="info")
+            return
+        was = str(item.data(Qt.UserRole))
+        chosen = [s for s in self._checked_services() if s != was]
+        self._load_services(chosen)
+        self._mark_dirty()
+        self.toaster.show("Removed %s. Save to keep it." % was, tone="success")
 
     def _set_all_services(self, checked: bool) -> None:
         state = Qt.Checked if checked else Qt.Unchecked
