@@ -182,6 +182,11 @@ class ResultsScreen(QWidget):
     stop_signal = pyqtSignal()
     home_signal = pyqtSignal()
     outreach_signal = pyqtSignal(list)   # the collected records, to outreach
+    # Emitted whenever a scrape settles, so the pool keeps the harvest even
+    # when the user goes Home instead of Start Outreach. Leaving that screen
+    # used to discard the run: nothing on Home returns to Results and
+    # re-entering clears self.results, so the only copy was a CSV on disk.
+    harvested_signal = pyqtSignal(list)
 
     def __init__(self):
         super().__init__()
@@ -783,6 +788,8 @@ class ResultsScreen(QWidget):
 
     def on_done(self):
         n = len(self.results)
+        if n:
+            self.harvested_signal.emit(list(self.results))
         if self._stopped_by_user:
             if n > 0:
                 d, a = self._current_task()

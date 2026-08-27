@@ -750,6 +750,7 @@ class MainWindow(QMainWindow):
         screen = ResultsScreen()
         screen.stop_signal.connect(self.on_stop)
         screen.outreach_signal.connect(self.on_outreach)
+        self._chrome(screen, "harvested_signal", self.on_harvested)
         self._chrome(screen, "home_signal", self.on_home)
         return screen
 
@@ -819,6 +820,17 @@ class MainWindow(QMainWindow):
 
     def on_outreach_direct(self):
         self.shell.go(OUTREACH)
+
+    def on_harvested(self, records):
+        """A finished scrape goes into the pool whether or not it is asked for.
+
+        Built rather than deferred: the outreach screen is lazy, and a harvest
+        that waits for the user to visit it is a harvest lost to the next Home.
+        """
+        try:
+            self.shell.screen("outreach").absorb_scrape(records)
+        except Exception:
+            pass
 
     def on_outreach(self, records):
         self.shell.go(OUTREACH, records=records)

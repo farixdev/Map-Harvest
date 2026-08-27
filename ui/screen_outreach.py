@@ -2165,6 +2165,27 @@ class OutreachScreen(QWidget):
         except Exception:
             self._toast("Could not read those results.", tone="danger")
 
+    def absorb_scrape(self, records: list) -> None:
+        """Keep a finished scrape without stealing the screen.
+
+        `load_from_results` is the hand-off the user asked for and says so in a
+        toast; this is the one nobody asked for, so it saves and stays quiet.
+        Same upsert underneath, so a business scraped twice is still one lead
+        and an audit already done for it survives.
+        """
+        try:
+            leads = [self._lead_from_record(r, "scrape") for r in (records or [])
+                     if isinstance(r, dict)]
+            leads = [lead for lead in leads if _text_of(lead.get("email")).strip()]
+            if not leads:
+                return
+            for lead in leads:
+                _db.upsert_lead(self.conn, lead)
+            if self.isVisible():
+                self._redraw()
+        except Exception:
+            pass
+
     def refresh(self) -> None:
         """Re-read settings and the database and redraw everything."""
         try:
