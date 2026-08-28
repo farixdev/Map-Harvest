@@ -371,6 +371,12 @@ def test_the_second_row_survives_a_context_line_that_only_counts_up():
     `AppShell._sync` rebuilt the whole row on every call, so each message
     deleted and recreated the four sub-tab buttons — under the user's pointer,
     at 2.2ms a time, and 2.2ms again when the line had not changed at all.
+
+    Read through `AppShell._sections()` rather than off `_sub_tabs`, because
+    there are two rows now and the shell picks between them: a screen's sections
+    are indented rows in the navigation rail when it is open and a row under the
+    page header when it is collapsed. The contract is the one it always was —
+    whichever row they are in, a context line may not rebuild them.
     """
     shell = APP.AppShell()
     shell.register("outreach", "Outreach", QWidget)
@@ -378,23 +384,23 @@ def test_the_second_row_survives_a_context_line_that_only_counts_up():
     shell.set_subtabs("outreach", ("Leads", "Campaign", "Sending", "Stats"),
                       lambda _index: None, 0)
 
-    tabs = list(shell._sub_tabs)
+    tabs = list(shell._sections())
     assert [tab.text() for tab in tabs] == ["Leads", "Campaign", "Sending", "Stats"]
 
     for sent in range(1, 6):
         shell.set_context("outreach", "Sending — %d of 200" % sent, tone="warning")
-        assert list(shell._sub_tabs) == tabs, (
+        assert list(shell._sections()) == tabs, (
             "the sub-tab buttons were rebuilt by message %d" % sent)
 
     shell.set_context("outreach", "Sending — 5 of 200", tone="warning")
-    assert list(shell._sub_tabs) == tabs, "an unchanged line rebuilt the row"
+    assert list(shell._sections()) == tabs, "an unchanged line rebuilt the row"
     shell.set_subtabs("outreach", ("Leads", "Campaign", "Sending", "Stats"),
                       lambda _index: None, 2)
-    assert list(shell._sub_tabs) == tabs, "unchanged labels rebuilt the row"
-    assert [tab.text() for tab in shell._sub_tabs if tab.isChecked()] == ["Sending"]
+    assert list(shell._sections()) == tabs, "unchanged labels rebuilt the row"
+    assert [tab.text() for tab in shell._sections() if tab.isChecked()] == ["Sending"]
 
     shell.set_subtabs("outreach", ("One", "Two"), lambda _index: None, 0)
-    assert [tab.text() for tab in shell._sub_tabs] == ["One", "Two"], \
+    assert [tab.text() for tab in shell._sections()] == ["One", "Two"], \
         "labels that did change were not applied"
     print("the second row is left alone when it has not changed: OK")
 
