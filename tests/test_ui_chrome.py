@@ -42,13 +42,27 @@ import tempfile
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+# Named here as well as in `tests/test_modals.py`, and the reason is a whole
+# class of failure this file had without it. Every geometry assertion below is
+# a width in the app's own font, and Qt reads this variable once, when the
+# QApplication is constructed; with no fonts to load the offscreen platform
+# falls back to a face whose metrics are wider, so a table that fits at 1280
+# overflows and a label that elides stops eliding. In a whole-suite run an
+# earlier module builds the QApplication and the metrics are whatever that
+# module got, which is why `pytest tests/test_ui_chrome.py` on its own used to
+# fail five geometry tests that `pytest tests/` passed. Setting it here makes
+# the answer the same either way.
+os.environ.setdefault(
+    "QT_QPA_FONTDIR",
+    os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts"))
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from PyQt5.QtCore import (  # noqa: E402
     QEvent, QObject, QPoint, QRect, QSize, Qt, QtMsgType,
     qInstallMessageHandler,
 )
-from PyQt5.QtGui import QKeyEvent  # noqa: E402
+from PyQt5.QtGui import QFontMetrics, QKeyEvent  # noqa: E402
 from PyQt5.QtTest import QTest  # noqa: E402
 from PyQt5.QtWidgets import (  # noqa: E402
     QApplication, QCheckBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
@@ -688,9 +702,14 @@ def test_the_browse_button_is_wide_enough_for_its_own_label():
         _sized(screen, size)
         button = screen.export_browse_btn
         assert button.text() == "…"
+        # The `+ size` used to sit outside the `%`, so this message was four
+        # placeholders against two arguments plus a tuple concatenated onto a
+        # string: the assertion could only ever fail by raising a TypeError
+        # instead of saying which button was how many pixels short.
         assert button.width() >= button.sizeHint().width(), (
             "the browse button is %dpx wide and needs %d at %dx%d, so it "
-            "renders '..'" % (button.width(), button.sizeHint().width()) + size)
+            "renders '..'" % ((button.width(), button.sizeHint().width())
+                              + tuple(size)))
         assert button.height() == THEME.control["md"] == \
             screen.export_dir_input.height(), (
             "it must line up with the field it sits beside: %dpx against the "
@@ -2226,16 +2245,78 @@ def _stubbed(owner, name: str, replacement):
 
 
 def _bar(window) -> QWidget:
+    """The navigation rail. Still `app_bar`, because it is still the one bar.
+
+    It was a strip across the top and it is a rail down the left, and every
+    assertion here that used to read its height now reads its width. The
+    objectName did not move with it on purpose: the sheet's `QWidget#app_bar`
+    rule is the same rule — the app's one piece of persistent chrome, grounded
+    in `surface` — and a second name for it would be a second rule to keep in
+    step.
+    """
     return window.findChild(QWidget, "app_bar")
 
 
+def _head(window) -> QWidget:
+    """The page header inside the content pane: title, description, state."""
+    return window.findChild(QWidget, "results_header")
+
+
 def _sub(window) -> QWidget:
+    """The section row under the header, which exists only while the rail is
+    collapsed. Open, a screen's sections are indented rows in the rail itself."""
     return window.findChild(QWidget, "sub_bar")
 
 
 def _bar_buttons(window, kind: str = "") -> list:
+    """Every button in the shell's chrome, matched on objectName or on kind.
+
+    Three widgets now rather than one, which is the whole of why this had to
+    change: the destinations are in the rail, the dry-run pill and the theme
+    toggle are in the page header, and a screen's sections are in whichever of
+    the two has room for them.
+    """
+    found = []
+    for part in (_bar(window), _head(window), _sub(window)):
+        if part is None:
+            continue
+        for button in part.findChildren(QPushButton):
+            if (not kind or button.objectName() == kind
+                    or button.property("kind") == kind):
+                found.append(button)
+    return found
+
+
+def _nav_rows(window, depth: int = 0) -> list:
+    """The rail's rows at one depth: destinations at 0, sections at 1."""
     return [button for button in _bar(window).findChildren(QPushButton)
-            if not kind or button.objectName() == kind]
+            if button.property("kind") == "nav"
+            and button.property("depth") == depth]
+
+
+def _sections(window) -> list:
+    """A screen's sections wherever the shell has put them."""
+    if window.shell.collapsed():
+        return [b for b in _sub(window).findChildren(QPushButton)]
+    return _nav_rows(window, depth=1)
+
+
+def _context_lines(window) -> list:
+    """The shell's line of state, which is not the page's own description.
+
+    Width and not only `isVisible`, because those two disagreed and the answer
+    was 0px: an `Ignored` size policy in a row with a stretching item beside it
+    is handed no width at all, so the line was laid out, reported visible, and
+    painted nothing on every screen in the app.
+    """
+    return [label.full_text() for label in _head(window).findChildren(QLabel)
+            if label.property("role") == "context" and label.isVisible()
+            and label.full_text() and label.width() > 0]
+
+
+def _wide(window) -> None:
+    """Wide enough that the rail opens itself, and laid out at that size."""
+    _sized(window, (APP.RAIL_BREAKPOINT, DEFAULT_SIZE[1]))
 
 
 def test_the_window_builds_the_screen_it_shows_and_not_the_other_three():
@@ -2265,29 +2346,46 @@ def test_the_window_builds_the_screen_it_shows_and_not_the_other_three():
     window.shell.go(APP.INPUT)
 
 
-def test_one_bar_at_one_height_over_every_screen():
-    """Four screens carried four top bars — 31px, 70px, 50px, 31px — so where
-    the user was and how to leave was answered differently on each. There is one
-    now, it belongs to the shell, and it is the same object on every screen.
+def test_one_rail_at_one_width_over_every_screen():
+    """Was `test_one_bar_at_one_height_over_every_screen`, inverted twice.
+
+    The finding it was written for has not changed: four screens carried four
+    top bars — 31px, 70px, 50px, 31px — so where the user was and how to leave
+    was answered differently on each. There is still exactly one piece of
+    persistent chrome and it is still the shell's. It is a rail now, so the
+    measurement is `components.rail_width` and not `control.header`.
+
+    The second inversion is Settings. It used to be a button on the right of the
+    bar and deliberately marked nothing, so this asserted that the bar showed no
+    selection at all while the user was on it — which meant the one screen a
+    user can get lost in was the one screen the chrome refused to locate them
+    on. Settings is a row in the rail's footer now, and it is marked like any
+    other row.
     """
     window = _window()
     bar = _bar(window)
-    assert bar is not None, "the window has no bar"
+    assert bar is not None, "the window has no rail"
     for key in (APP.RESULTS, APP.OUTREACH, APP.SETTINGS, APP.INPUT):
         window.shell.go(key)
         _sized(window, DEFAULT_SIZE)
         assert len(window.findChildren(QWidget, "app_bar")) == 1, \
-            "%s brought a second bar with it" % key
-        assert _bar(window) is bar, "the bar was rebuilt on the way to %s" % key
-        assert bar.isVisible() and bar.height() == THEME.control["header"], (
-            "the bar is %dpx on %s and control.header is %d"
-            % (bar.height(), key, THEME.control["header"]))
+            "%s brought a second rail with it" % key
+        # Identity, not just presence: a collapsed rail draws no sections, so
+        # nothing about it changes when the user moves between screens and it
+        # must not be rebuilt for one. `_sync` runs once per message of a
+        # running campaign as well, and this is what says it is cheap.
+        assert _bar(window) is bar, "the rail was rebuilt on the way to %s" % key
+        wanted = CO.rail_width(THEME, collapsed=window.shell.collapsed())
+        assert _bar(window).isVisible() and _bar(window).width() == wanted, (
+            "the rail is %dpx on %s and rail_width says %d"
+            % (_bar(window).width(), key, wanted))
+        assert _bar(window).height() == window.shell.height(), \
+            "the rail does not run the height of the shell on %s" % key
 
-        checked = [button.text() for button in _bar_buttons(window, "tab")
+        checked = [button.accessibleName() for button in _nav_rows(window)
                    if button.isChecked()]
-        wanted = [] if key == APP.SETTINGS else [window.shell._labels[key]]
-        assert checked == wanted, \
-            "the bar says %s and the user is on %s" % (checked, key)
+        assert checked == [window.shell._labels[key]], \
+            "the rail says %s and the user is on %s" % (checked, key)
 
 
 def test_every_navigation_route_still_arrives_where_it_did():
@@ -2349,6 +2447,41 @@ def test_every_navigation_route_still_arrives_where_it_did():
     assert shell.current_key == APP.INPUT
 
 
+def test_a_finished_scrape_reaches_outreach_without_taking_the_user_there():
+    """The ninth route, and the only one of them that is not a navigation.
+
+    `harvested_signal` is how a finished scrape joins the pool whether or not
+    anybody asked for it, and it was the one route in the list above with no
+    test of any kind: the eight that navigate are each covered by the key they
+    land on, and this one is covered by nothing precisely because it lands
+    nowhere. What it has to do is reach the outreach screen — which is lazy, so
+    a harvest that waited for a visit would be a harvest lost to the next Home —
+    and leave the user exactly where they were, because a scrape finishing while
+    its owner reads the results is not a request to be moved off them.
+    """
+    window = _window()
+    shell = window.shell
+    outreach = shell.screen(APP.OUTREACH)
+    records = [{"name": "Zeta Roofing", "email": "zeta@example.com"}]
+
+    shell.go(APP.RESULTS)
+    kept = []
+    with _stubbed(outreach, "absorb_scrape", kept.append):
+        shell.screen(APP.RESULTS).harvested_signal.emit(records)
+    assert kept == [records], "the finished scrape never reached the pool"
+    assert shell.current_key == APP.RESULTS, \
+        "a finished scrape moved the user to %s" % shell.current_key
+
+    # And from anywhere else, because the signal is the screen's and not the
+    # shell's: a user who pressed Home while the scrape ran is the case the
+    # route exists for.
+    shell.go(APP.INPUT)
+    with _stubbed(outreach, "absorb_scrape", kept.append):
+        shell.screen(APP.RESULTS).harvested_signal.emit(records)
+    assert kept == [records, records]
+    assert shell.current_key == APP.INPUT
+
+
 def test_back_out_of_settings_returns_to_the_screen_it_was_opened_from():
     """Opened from a half-built campaign, Back may not answer with Home."""
     window = _window()
@@ -2371,11 +2504,15 @@ def test_back_out_of_settings_returns_to_the_screen_it_was_opened_from():
     shell.go(APP.INPUT)
 
 
-def test_the_bar_says_whether_the_next_campaign_mails_real_people():
+def test_the_chrome_says_whether_the_next_campaign_mails_real_people():
     """Dry run is the one piece of global state a wrong guess about is expensive.
 
-    It lived on one tab of one screen; it is on the bar now, in the two shapes
-    the sheet keeps for it — dashed for a rehearsal, filled red for live.
+    It lived on one tab of one screen, then on the top bar; it is in the page
+    header now, in the two shapes the sheet keeps for it — dashed for a
+    rehearsal, filled red for live. The header is where it belongs and the rail
+    is not: the rail collapses to 56px, and the one control in the app that says
+    whether Start mails real businesses may not be a control that can lose its
+    label.
     """
     window = _window()
     saved = dict(window.settings)
@@ -2398,60 +2535,183 @@ def test_the_bar_says_whether_the_next_campaign_mails_real_people():
 
 
 def test_a_screen_hands_its_sub_tabs_to_the_shell_and_they_stay_with_it():
-    """The second row: one place the user looks to know where they are."""
+    """One place the user looks to know where they are, in both rail states.
+
+    `set_subtabs` is the same call it always was and the screens that make it
+    know nothing about where the row lands. What changed is that there are two
+    answers: indented rows under the destination while the rail is open, which
+    is how Finder and System Settings show a section, and the row under the page
+    header while it is collapsed — because 56px does not hold a word, and a
+    section that cannot be reached with a mouse has been removed.
+
+    The row is published *after* the navigation and not before it, which is the
+    order that makes this test test anything. Arriving on Outreach runs the
+    screen's own opener, and the outreach screen answers it by publishing its
+    real row with its real selected index — so a fixture row installed first is
+    overwritten before the first assertion reads it, and what the assertion then
+    measures is whichever tab the screen happened to be left on by an earlier
+    test in this module. It passed on that leftover and failed the moment it was
+    run on its own.
+    """
     window = _window()
     shell = window.shell
     picked = []
     tabs = ("Leads", "Campaign", "Sending", "Stats")
-    shell.set_subtabs(APP.OUTREACH, tabs, picked.append, current=1)
     shell.go(APP.OUTREACH)
     _sized(window, DEFAULT_SIZE)
+    shell.set_subtabs(APP.OUTREACH, tabs, picked.append, current=1)
+    assert shell.collapsed(), "the default window is wide enough for an open rail"
 
     row = _sub(window)
-    assert row.isVisible(), "the sub-tab row is not on screen"
-    buttons = row.findChildren(QPushButton)
+    assert row.isVisible(), "the section row is not on screen"
+    buttons = _sections(window)
     assert [button.text() for button in buttons] == list(tabs)
     assert [button.text() for button in buttons if button.isChecked()] == \
-        ["Campaign"], "the row does not say which tab is open"
+        ["Campaign"], "the row does not say which section is open"
 
     buttons[2].click()
     _app().processEvents()
-    assert picked == [2], "clicking a sub-tab told the screen %s" % picked
-    assert [b.text() for b in _sub(window).findChildren(QPushButton)
-            if b.isChecked()] == ["Sending"]
+    assert picked == [2], "clicking a section told the screen %s" % picked
+    assert [b.text() for b in _sections(window) if b.isChecked()] == ["Sending"]
 
+    # Open the rail and the same four move into it, indented, still on Sending.
+    _wide(window)
+    assert not shell.collapsed(), "the rail did not open on a wide window"
+    assert not _sub(window).isVisible(), \
+        "the section row is still taking height under an open rail"
+    inside = _nav_rows(window, depth=1)
+    assert [b.accessibleName() for b in inside] == list(tabs), \
+        "the open rail draws %s" % [b.accessibleName() for b in inside]
+    assert [b.accessibleName() for b in inside if b.isChecked()] == ["Sending"]
+    inside[0].click()
+    _app().processEvents()
+    assert picked == [2, 0], "a rail section told the screen %s" % picked
+
+    # And the destination they belong to is not itself filled while they show:
+    # two stacked pills is one block, not two marks.
+    parent = [b for b in _nav_rows(window)
+              if b.accessibleName() == shell.label(APP.OUTREACH)][0]
+    assert not parent.isChecked(), \
+        "the destination and its open section are both filled"
+    assert parent.property("current") is True, \
+        "nothing in the rail says which destination is open"
+
+    _sized(window, DEFAULT_SIZE)
     shell.go(APP.INPUT)
     _sized(window, DEFAULT_SIZE)
-    assert not _sub(window).findChildren(QPushButton), \
-        "one screen's sub-tabs followed the user to another"
+    assert not _sections(window), \
+        "one screen's sections followed the user to another"
     assert not _sub(window).isVisible(), \
-        "an empty second row still takes height from the page"
+        "an empty section row still takes height from the page"
 
     shell.go(APP.OUTREACH)
-    assert [b.text() for b in _sub(window).findChildren(QPushButton)] == list(tabs)
+    assert [b.text() for b in _sections(window)] == list(tabs)
     shell.set_subtabs(APP.OUTREACH, (), None)
     shell.go(APP.INPUT)
 
 
+def test_the_footer_destination_draws_its_sections_like_any_other():
+    """Settings is in the rail's footer, and it has the most sections of all.
+
+    The test above proves the rail draws a *destination's* sections and proves
+    nothing about the footer, which is a different loop in `_make_bar` — and
+    the footer loop drew the row and not the sections under it. What that cost
+    is the whole screen: the section row under the page header is hidden while
+    the rail is open, because open is where sections are supposed to live, so
+    with the rail open on Settings the user saw the AI tab and had no way to
+    reach Sender, Templates, Gmail, Sending, Compliance or Appearance by mouse
+    at all. Six of seven tabs, reachable only from the command palette.
+
+    Driven through the real screen and not a fixture row, because the fixture
+    is what hid it: `set_subtabs` on a key that happens to be a destination
+    exercises the loop that always worked.
+    """
+    window = _window()
+    shell = window.shell
+    window.on_settings()
+    _wide(window)
+    assert not shell.collapsed(), "the rail did not open on a wide window"
+
+    published, _on_change, _current = shell._subtabs.get(
+        APP.SETTINGS, ((), None, 0))
+    assert len(published) > 1, \
+        "the settings screen published %s, so this proves nothing" % (published,)
+
+    inside = _nav_rows(window, depth=1)
+    assert [button.accessibleName() for button in inside] == list(published), (
+        "the open rail draws %s under Settings, which published %s"
+        % ([button.accessibleName() for button in inside], list(published)))
+    assert not _sub(window).isVisible(), \
+        "the section row is taking height under an open rail"
+
+    # And every one of them actually moves the screen, which is the claim that
+    # matters: a row that is drawn and inert is the same bug with a picture.
+    screen = shell.screen(APP.SETTINGS)
+    inside[-1].click()
+    _app().processEvents()
+    assert [b.accessibleName() for b in _nav_rows(window, depth=1)
+            if b.isChecked()] == [published[-1]], \
+        "the last section did not take the selection"
+    assert screen.pages.currentIndex() == len(published) - 1, \
+        "the rail moved its own mark and not the screen"
+
+    inside = _nav_rows(window, depth=1)
+    inside[0].click()
+    _app().processEvents()
+    assert screen.pages.currentIndex() == 0
+
+    footer = [b for b in _nav_rows(window)
+              if b.accessibleName() == shell.label(APP.SETTINGS)][0]
+    assert not footer.isChecked(), \
+        "Settings and its open section are both filled"
+    assert footer.property("current") is True, \
+        "nothing in the rail says Settings is the open destination"
+
+    window.on_settings_closed()
+    _sized(window, DEFAULT_SIZE)
+
+
 def test_the_shell_carries_one_line_of_context_per_screen():
+    """Moved into the page header with the rest of the global state.
+
+    It used to sit at the right-hand end of the sub-tab row, which meant a
+    screen with no sections had to grow a row for one line of text, and a screen
+    with sections had its state competing with its navigation for the same
+    24px. The header carries it now — beside the dry-run pill, where the rest of
+    what is true everywhere already is.
+    """
     window = _window()
     shell = window.shell
     shell.set_context(APP.INPUT, "3 saved searches", tone="info")
     shell.go(APP.INPUT)
     _sized(window, DEFAULT_SIZE)
-    assert [lb.text() for lb in _sub(window).findChildren(QLabel)] == \
-        ["3 saved searches"]
+    assert _context_lines(window) == ["3 saved searches"]
+
+    # Whole, and at every size the window opens at: it competes for the header's
+    # width with the description beside it, and losing that competition is the
+    # 0px failure `_context_lines` measures for.
+    for size in (MINIMUM_SIZE, DEFAULT_SIZE, AUDIT_SIZE):
+        _sized(window, size)
+        line = [lb for lb in _head(window).findChildren(QLabel)
+                if lb.property("role") == "context"][0]
+        assert not line.is_elided(), \
+            "the context line is cut at %dx%d" % size
+        assert line.width() >= line.sizeHint().width(), (
+            "%d: the line is %dpx and its sentence needs %d"
+            % (size[0], line.width(), line.sizeHint().width()))
+    _sized(window, DEFAULT_SIZE)
 
     shell.go(APP.OUTREACH)
     _sized(window, DEFAULT_SIZE)
-    assert not _sub(window).findChildren(QLabel), \
+    assert not [lb for lb in _head(window).findChildren(QLabel)
+                if lb.property("role") == "elided" and lb.isVisible()
+                and lb.full_text() == "3 saved searches"], \
         "the context line followed the user off the screen it belongs to"
 
     shell.go(APP.INPUT)
     shell.set_context(APP.INPUT, "")
     _sized(window, DEFAULT_SIZE)
-    assert not _sub(window).findChildren(QLabel)
-    assert not _sub(window).isVisible()
+    assert _context_lines(window) == [],         "an emptied context line is still showing"
 
 
 def test_the_theme_changes_while_the_app_is_running():
@@ -2500,25 +2760,41 @@ def test_the_theme_changes_while_the_app_is_running():
 
 
 def test_the_compact_density_reaches_the_controls_without_a_restart():
-    """The other half of what the settings file could not ask for."""
+    """The other half of what the settings file could not ask for.
+
+    Measured on the rail rather than on a bar tab, and on both of the two
+    numbers a density owns there: the height of a row, which is `control.lg`,
+    and the width of the rail when it is collapsed, which `rail_width` composes
+    out of `control.md` and the grid. The open width is five 40px steps and is
+    the same in both densities on purpose — a destination name is the same
+    number of characters however tall the row holding it is.
+    """
     window = _window()
     saved = dict(window.settings)
     try:
         window.shell.go(APP.INPUT)
-        assert _bar_buttons(window, "tab")[0].height() == THEME.control["sm"]
+        _sized(window, DEFAULT_SIZE)
+        assert _nav_rows(window)[0].height() == THEME.control["lg"]
+        assert _bar(window).width() == CO.rail_width(THEME, collapsed=True)
 
         window.apply_appearance(dict(saved, density="compact"))
-        _app().processEvents()
+        _sized(window, DEFAULT_SIZE)
         compact = TH.theme(THEME.name, "compact")
         assert window.theme.density == "compact"
-        assert _bar_buttons(window, "tab")[0].height() == compact.control["sm"], (
-            "a compact bar tab is %dpx and control.sm is %d"
-            % (_bar_buttons(window, "tab")[0].height(), compact.control["sm"]))
-        assert _bar(window).height() == compact.control["header"]
+        assert _nav_rows(window)[0].height() == compact.control["lg"], (
+            "a compact rail row is %dpx and control.lg is %d"
+            % (_nav_rows(window)[0].height(), compact.control["lg"]))
+        assert _bar(window).width() == CO.rail_width(compact, collapsed=True), (
+            "a compact collapsed rail is %dpx and rail_width says %d"
+            % (_bar(window).width(), CO.rail_width(compact, collapsed=True)))
+
+        _wide(window)
+        assert _bar(window).width() == CO.rail_width(compact), \
+            "the open rail is not the width the tokens compose"
     finally:
         window.apply_appearance(saved)
-        _app()
-        assert _bar(window).height() == THEME.control["header"]
+        _sized(window, DEFAULT_SIZE)
+        assert _bar(window).width() == CO.rail_width(THEME, collapsed=True)
 
 
 def test_shutting_the_window_stops_only_the_screens_that_exist():
@@ -2780,9 +3056,9 @@ def test_the_scrape_is_still_reachable_after_leaving_the_results_screen():
     try:
         _filled(results, rows)
         assert results.table.rowCount() == len(rows)
-        assert "Results" in [button.text()
-                             for button in _bar_buttons(window, "tab")], \
-            "the bar carries no way back to the scrape"
+        assert "Results" in [button.accessibleName()
+                             for button in _nav_rows(window)], \
+            "the rail carries no way back to the scrape"
 
         shell.go(APP.INPUT)
         shell.go(APP.RESULTS)
@@ -3305,8 +3581,14 @@ def test_taking_a_mailbox_off_the_rota_asks_first_and_can_be_taken_back():
         restored = screen._account_rows[addresses.index("first@example.com")]
         assert restored.app_password() == "abcd efgh ijkl mnop", \
             "Undo put the mailbox back without its app password"
+        # Upper-cased since the accounts became grouped boxes like every other
+        # group on the screen: the ordinal is the box's caption now and a
+        # caption is `components.section_label`, which upper-cases what it is
+        # given. What is asserted here is the renumbering — that Undo puts the
+        # row back and the headings count from one again — and that is unchanged;
+        # the case is the register the caption is drawn in.
         assert [one.title_label.text() for one in screen._account_rows] == \
-            ["Account %d" % (n + 1) for n in range(len(screen._account_rows))], \
+            ["ACCOUNT %d" % (n + 1) for n in range(len(screen._account_rows))], \
             "the rows are numbered %s" % [one.title_label.text()
                                           for one in screen._account_rows]
     finally:
@@ -3672,7 +3954,7 @@ def test_an_unmodified_shortcut_does_not_fire_while_a_field_is_being_typed_in():
             "F1 opened the palette out from under someone typing a search"
 
         # And with the focus on something that is not text, the same key works.
-        _focused_on(_bar_buttons(window, "tab")[0])
+        _focused_on(_nav_rows(window)[0])
         assert window._typing() is False
         window.on_help()
         _app().processEvents()
@@ -3764,14 +4046,14 @@ def test_return_presses_the_button_that_has_the_focus_and_not_the_form_s():
     shell = window.shell
     shell.go(APP.OUTREACH)
     _app().processEvents()
-    tab = [button for button in _bar_buttons(window, "tab")
-           if button.text() == shell.label(APP.INPUT)][0]
+    row = [button for button in _nav_rows(window)
+           if button.accessibleName() == shell.label(APP.INPUT)][0]
     try:
-        _focused_on(tab)
+        _focused_on(row)
         QTest.keyClick(window, Qt.Key_Return)
         _app().processEvents()
         assert shell.current_key == APP.INPUT, \
-            "Return on a focused tab did not press it"
+            "Return on a focused rail row did not press it"
     finally:
         shell.go(APP.INPUT)
 
@@ -4236,3 +4518,507 @@ def test_the_palette_writes_no_colour_and_no_size_of_its_own():
                     and isinstance(argument.value, (int, float)):
                 offenders.append("%s line %d" % (node.func.attr, node.lineno))
     assert offenders == [], offenders
+
+
+# ── U15: the rail, the header, and what the chrome remembers ─────────────────
+# The whole section exists to answer one objection. A left rail was rejected
+# when this shell was built, and the reason given was sound: horizontal space is
+# this app's scarcest resource, the audit found table columns clipped in 20 of
+# 20 rows, and a 200px rail takes width from every one of them. So the first
+# test here is the measurement that objection asked for, and the rail's default
+# state is whatever that measurement says it has to be.
+
+RAIL_ROWS = 20
+
+# How far under `RAIL_BREAKPOINT` the count is still asked to hold. The floor is
+# 25px under it and this is 20, which is inside the margin on purpose: the turn
+# is one pixel wide and asserting on it is asserting on a rounding, so what is
+# checked is that the margin exists and is most of what it claims to be.
+RAIL_HEADROOM = 20
+
+
+def _rail_free(window) -> None:
+    """Put the width rule back in charge, whatever a test chose."""
+    window.shell.restore_rail(None)
+    _sized(window, DEFAULT_SIZE)
+
+
+def _window_results(window, size, count: int = RAIL_ROWS):
+    """The window's own results screen at `size`, holding `count` leads.
+
+    Sized before the rows arrive and again after, because that is the order a
+    scrape happens in: the window is whatever size it is and the table is built
+    and filled inside it. A table filled at one width and measured at another is
+    measuring the resize and not the layout.
+    """
+    window.shell.go(APP.RESULTS)
+    _sized(window, size)
+    screen = window.shell.screen(APP.RESULTS)
+    _filled(screen, _leads(count))
+    _sized(window, size)
+    return screen
+
+
+def _cut_cells(table) -> int:
+    return sum(1 for row in range(table.rowCount())
+               for column in range(table.columnCount())
+               if table.is_elided(row, column))
+
+
+def test_the_collapsed_rail_costs_the_two_tables_nothing():
+    """The measurement the rejected rail was rejected for the want of.
+
+    Read as three numbers at 1280x860 with twenty leads, which is the size and
+    the case the audit measured its clipping at. The table's viewport with no
+    rail at all is 1230px and it cuts 40 of its 160 cells. A collapsed rail is
+    56px, so the honest comparison is this table at 1280 against the same table
+    at 1280 plus the rail's own width — the width it would have had if the rail
+    were not there — and the two counts have to be equal.
+
+    The window at 1280 is also the case that decides the default, and the second
+    half measures why: opened by hand at 1280 the rail leaves 1030px and the
+    count goes to 60, and at `RAIL_BREAKPOINT` it leaves 1150 and the count is
+    40 again. That is where the breakpoint comes from, and the third measurement
+    is that it comes from there with room to spare. The count turns at a 1125px
+    viewport, so the floor is 1375 and the breakpoint sits 25px above it —
+    deliberately, because a threshold set on the exact pixel where a count turns
+    is a threshold that rounding puts on the wrong side. `RAIL_HEADROOM` asserts
+    that margin rather than describing it: a column spec that grew wide enough
+    to lift the floor over the breakpoint would make the rail open itself onto a
+    table it costs a column, which is the whole of what this test exists to
+    prevent, and it would do it while the two assertions above still passed.
+
+    The leads table is measured last and over the same two pane widths, as the
+    column spec that decides them. It cuts 20 of 140 at both.
+    """
+    window = _window()
+    screen = _window_results(window, AUDIT_SIZE)
+    try:
+        assert window.shell.collapsed(), \
+            "the rail opened itself on a window it costs the table to open on"
+        rail = _bar(window).width()
+        assert rail == CO.rail_width(THEME, collapsed=True)
+
+        table = screen.table
+        with_rail = (table.viewport().width(), _cut_cells(table))
+        assert not table.horizontalScrollBar().maximum(), \
+            "the table scrolls sideways beside the rail"
+
+        _sized(window, (AUDIT_SIZE[0] + rail, AUDIT_SIZE[1]))
+        without = (table.viewport().width(), _cut_cells(table))
+        assert without[0] - with_rail[0] == rail, (
+            "the rail costs the table %dpx and is %dpx wide"
+            % (without[0] - with_rail[0], rail))
+        assert with_rail[1] == without[1], (
+            "the rail cuts %d cells where the same table without it cuts %d"
+            % (with_rail[1], without[1]))
+
+        # And what it would have cost open, which is why it is not.
+        window.shell.set_collapsed(False)
+        _sized(window, AUDIT_SIZE)
+        opened = _cut_cells(table)
+        assert _bar(window).width() == CO.rail_width(THEME)
+        assert opened > with_rail[1], (
+            "an open rail at 1280 cuts %d cells and a collapsed one %d, so "
+            "there was nothing to collapse for" % (opened, with_rail[1]))
+
+        _sized(window, (APP.RAIL_BREAKPOINT, AUDIT_SIZE[1]))
+        assert _cut_cells(table) == with_rail[1], (
+            "an open rail at the breakpoint cuts %d cells and the collapsed "
+            "rail cuts %d" % (_cut_cells(table), with_rail[1]))
+
+        # And that the breakpoint is inside the band rather than on its edge.
+        # Asserted 20px under it and not at the 1125px turn itself: reading a
+        # single width on the turn is reading a rounding, and what this is for
+        # is the headroom the comment on `RAIL_BREAKPOINT` claims rather than
+        # the floor that headroom was measured from.
+        _sized(window, (APP.RAIL_BREAKPOINT - RAIL_HEADROOM, AUDIT_SIZE[1]))
+        assert _cut_cells(table) == with_rail[1], (
+            "the breakpoint is on the edge of the band: %dpx under it an open "
+            "rail already cuts %d cells against the collapsed rail's %d"
+            % (RAIL_HEADROOM, _cut_cells(table), with_rail[1]))
+
+        # The other table, over the two pane widths this one just measured.
+        # Its own screen cannot be asked directly — the outreach layout will not
+        # shrink past 1302px, so both halves of a resize land on one layout and
+        # the comparison becomes a number against itself. What decides its
+        # widths is `_LEAD_COLUMNS` through `components.table()`, and that is
+        # measurable on its own in the pane the screen would hand it.
+        leads = _spec_measured(_app(), SO._LEAD_COLUMNS, _lead_rows(),
+                               (without[0], with_rail[0]))
+        wide, narrow = leads[without[0]], leads[with_rail[0]]
+        assert (wide[0], narrow[0]) == (without[0], with_rail[0]), \
+            "the leads spec was not measured at the widths asked for: %s" % leads
+        assert narrow[1] == wide[1], (
+            "the leads spec cuts %d cells in the %dpx the rail leaves and %d "
+            "in the %dpx it would have had"
+            % (narrow[1], narrow[0], wide[1], wide[0]))
+        assert narrow[1] > 0, \
+            "nothing in these rows is long enough to be cut at either width"
+    finally:
+        screen._set_idle_mode()
+        _rail_free(window)
+        # Opening it by hand above wrote an answer down; the tests below measure
+        # what an untouched profile does, so the file goes back to empty.
+        APP.save_state({})
+        window.shell.go(APP.INPUT)
+
+
+def _lead_rows(count: int = RAIL_ROWS) -> list:
+    """`count` rows shaped like the outreach screen's own seven columns.
+
+    The email is `MAIL`, the same 44-character address the results table is
+    measured against above, because the length is the whole point: a spec
+    measured against values that all fit is a spec nothing has been asked of.
+    """
+    return [["Harbourfront Dental Care %d" % index, MAIL % index,
+             "Scarborough", "Roofing contractor", "%d · moderate" % (30 + index),
+             "No mobile layout and a 6.2 second load on a phone", "audited"]
+            for index in range(count)]
+
+
+def _spec_measured(app, columns, rows, viewports) -> dict:
+    """One `components.table()` from `columns`, measured at each viewport width.
+
+    The viewport and not the widget, and resized twice to get there: a table's
+    frame and its scrollbar come out of the width it is given, so a table asked
+    for 1230 lays its columns out in 1228 and the comparison is off by the frame
+    at one end and by the frame plus a scrollbar at the other. Measuring the pane
+    the screen would actually hand it is the only way this stands in for the real
+    table at all.
+    """
+    table = CO.table(list(columns), density=THEME.density, sortable=False)
+    for row in rows:
+        table.add_row(row)
+    table.show()
+    try:
+        measured = {}
+        for want in viewports:
+            for _pass in range(2):
+                pad = table.width() - table.viewport().width()
+                table.resize(QSize(want + pad, AUDIT_SIZE[1]))
+                app.processEvents()
+            measured[want] = (table.viewport().width(), _cut_cells(table))
+        return measured
+    finally:
+        table.hide()
+        table.deleteLater()
+
+
+def test_the_rail_collapses_by_hand_and_the_answer_is_remembered():
+    """Three ways in — the toggle, Ctrl+B, the palette — and one file out.
+
+    Remembered beside `settings.json` and not in it: `core.settings` is a schema
+    that drops every key it does not know on the next save, so chrome state
+    stored there would survive exactly until somebody pressed Save.
+    """
+    window = _window()
+    try:
+        _sized(window, DEFAULT_SIZE)
+        assert window.shell.collapsed()
+        assert window.shell.rail_choice() is None, \
+            "the width rule is not in charge of a rail nobody has touched"
+
+        toggle = [b for b in _bar(window).findChildren(QWidget)
+                  if b.property("role") == "icon"]
+        assert len(toggle) == 1, "the rail carries no way to collapse it"
+        toggle[0].click()
+        _sized(window, DEFAULT_SIZE)
+        assert not window.shell.collapsed(), "the toggle did not open the rail"
+        assert _bar(window).width() == CO.rail_width(THEME)
+        assert window.shell.rail_choice() is False
+
+        written = APP.load_state()
+        assert written.get("sidebar_collapsed") is False, \
+            "the answer was not written down: %s" % written
+
+        # Ctrl+B is the same command, and the menu says so.
+        _keyboard_in(window)
+        QTest.keyClick(window, Qt.Key_B, Qt.ControlModifier)
+        _sized(window, DEFAULT_SIZE)
+        assert window.shell.collapsed(), "Ctrl+B did not close the rail"
+        assert window._rail_action.text() == "&Show the sidebar", \
+            "the menu still offers to do what it has just done"
+        assert APP.load_state().get("sidebar_collapsed") is True
+
+        # And the palette offers it under the name of what it would do next.
+        offered = [c for c in window._commands() if c.key == "view.sidebar"]
+        assert len(offered) == 1 and offered[0].title == "Show the sidebar"
+        assert offered[0].shortcut == "Ctrl+B"
+        offered[0].run()
+        _sized(window, DEFAULT_SIZE)
+        assert not window.shell.collapsed()
+    finally:
+        _rail_free(window)
+        APP.save_state({})
+
+
+def test_a_window_dragged_narrow_does_not_answer_for_the_user():
+    """The width rule may move the rail. It may not claim anybody asked it to.
+
+    The distinction is the whole of what makes the remembered answer worth
+    keeping: a window dragged narrow and wide again must leave the profile
+    exactly as it found it, and a user who opened the rail on a narrow window
+    has to still find it open the next time they are there.
+    """
+    window = _window()
+    try:
+        _rail_free(window)
+        APP.save_state({})
+        _sized(window, (APP.RAIL_BREAKPOINT, DEFAULT_SIZE[1]))
+        assert not window.shell.collapsed(), \
+            "the rail stayed shut on a wide window"
+        _sized(window, DEFAULT_SIZE)
+        assert window.shell.collapsed(), "the rail stayed open on a narrow one"
+        assert "sidebar_collapsed" not in APP.load_state(), \
+            "a resize wrote an answer the user never gave"
+
+        # A choice, on the other hand, outranks the width in both directions.
+        window.shell.set_collapsed(False)
+        _sized(window, DEFAULT_SIZE)
+        assert not window.shell.collapsed(), \
+            "a rail opened by hand closed itself again on the same window"
+        assert APP.load_state().get("sidebar_collapsed") is False
+    finally:
+        _rail_free(window)
+        APP.save_state({})
+
+
+def test_the_window_comes_back_the_size_and_place_it_was_left():
+    """It never did. The audit found it opening at the same spot every launch.
+
+    Driven through the same two calls a launch makes, against a geometry this
+    test puts there, so what is measured is the round trip and not a guess about
+    where a window manager will put a window.
+    """
+    window = _window()
+    saved = QRect(window.geometry())
+    try:
+        wanted = QRect(120, 90, 1180, 700)
+        window.setGeometry(wanted)
+        _app().processEvents()
+        window._remember_geometry()
+
+        box = APP.load_state().get("window")
+        assert box == {"x": wanted.x(), "y": wanted.y(),
+                       "w": wanted.width(), "h": wanted.height()}, \
+            "the window wrote down %s" % (box,)
+
+        window.setGeometry(QRect(0, 0, *MINIMUM_SIZE))
+        _app().processEvents()
+        window.state = APP.load_state()
+        window._restore_geometry()
+        _app().processEvents()
+        assert (window.width(), window.height()) == \
+            (wanted.width(), wanted.height()), \
+            "the window came back at %dx%d and was left at %dx%d" % (
+                window.width(), window.height(),
+                wanted.width(), wanted.height())
+
+        # A position on a monitor that is no longer there is not a position.
+        assert window._on_a_screen(QRect(10, 10, 400, 300)) is True
+        assert window._on_a_screen(QRect(-9000, -9000, 400, 300)) is False
+    finally:
+        window.setGeometry(saved)
+        APP.save_state({})
+        _sized(window, DEFAULT_SIZE)
+
+
+def test_settings_reached_from_the_rail_is_still_a_detour():
+    """The rail is a fourth way into Settings and the only one that could skip.
+
+    Every other route — the menu, the palette, the dry-run pill — goes through
+    `on_settings`, which records the screen it was opened from so that Back
+    returns to it. A footer row wired straight to `go` would have looked
+    identical and quietly answered Back with the home screen, which is exactly
+    the finding `_settings_return` exists for. Footer rows announce themselves
+    instead, and the window routes them.
+    """
+    window = _window()
+    shell = window.shell
+    try:
+        for key in (APP.OUTREACH, APP.RESULTS, APP.INPUT):
+            shell.go(key)
+            _sized(window, DEFAULT_SIZE)
+            row = [b for b in _nav_rows(window)
+                   if b.accessibleName() == shell.label(APP.SETTINGS)]
+            assert len(row) == 1, "the rail has no Settings row"
+            row[0].click()
+            _app().processEvents()
+            assert shell.current_key == APP.SETTINGS, \
+                "the rail's Settings row did not open Settings from %s" % key
+
+            shell.screen(APP.SETTINGS).back_signal.emit()
+            assert shell.current_key == key, (
+                "Settings opened from the rail on %s answered Back with %s"
+                % (key, shell.current_key))
+    finally:
+        shell.go(APP.INPUT)
+        _sized(window, DEFAULT_SIZE)
+
+
+def test_the_page_header_says_what_the_screen_in_front_of_you_is_for():
+    """One title in the h1 tier and one line under it, per destination.
+
+    The audit's complaint about this app's chrome was that nothing in it says
+    what anything does until you press it — four one-word tabs and no other
+    words anywhere. The header is where the words go, and the line is capped by
+    being elided rather than by being short: it may not set a floor on how
+    narrow the window can be dragged.
+    """
+    window = _window()
+    head = _head(window)
+    try:
+        for key in (APP.INPUT, APP.RESULTS, APP.OUTREACH, APP.SETTINGS):
+            window.shell.go(key)
+            _sized(window, DEFAULT_SIZE)
+            assert _head(window) is head, "the header was rebuilt for %s" % key
+            assert head.title_label.text() == window.shell.label(key), (
+                "the header says %r on %s" % (head.title_label.text(), key))
+            described = head.description_label
+            assert described.isVisible() and described.full_text(), \
+                "%s has a title and nothing saying what it is for" % key
+
+        # The description shortens rather than widening what holds it, and only
+        # when it has to: a line that fits claims no tooltip it does not need.
+        short_line = "Audit the leads."
+        head.set_description(short_line)
+        _sized(window, MINIMUM_SIZE)
+        assert not head.description_label.is_elided()
+        assert head.description_label.toolTip() == "", \
+            "a line that fits whole still answers a hover with itself"
+
+        long_line = " ".join(
+            ["A sentence considerably longer than any window this application "
+             "is ever going to be opened at, and then said four more times."]
+            * 4)
+        head.set_description(long_line)
+        _sized(window, MINIMUM_SIZE)
+        assert head.description_label.is_elided(), \
+            "a description this long fitted an 880px window whole"
+        assert head.description_label.toolTip() == long_line, \
+            "the cut line does not answer a hover with the whole of it"
+        assert window.minimumWidth() <= MINIMUM_SIZE[0], \
+            "one sentence in the header raised the window's own minimum"
+    finally:
+        window.shell.go(APP.INPUT)
+        _sized(window, DEFAULT_SIZE)
+
+
+def test_the_activity_console_tells_a_failure_from_a_delivery_by_shape():
+    """The Sending log was 400 proportional lines tinted three ways.
+
+    Colour alone carried which of them was a failure, which is the same finding
+    `status_pill` exists for. The console pairs it with a drawn marker and sets
+    the whole thing in the monospace face, so a timestamp is a ruler down the
+    left instead of a column that moves with every digit.
+    """
+    with _wearing(TH.theme("dark")) as app:
+        CO.use_theme(TH.theme("dark"))
+        console = CO.log_console(title="Activity",
+                                 placeholder="Nothing sent yet.")
+        console.resize(QSize(*MINIMUM_SIZE))
+        console.show()
+        app.processEvents()
+
+        assert console.list.count() == 1, "an empty console is a bare box"
+        assert not console.list.item(0).flags() & Qt.ItemIsEnabled, \
+            "the placeholder is a selectable log line"
+        assert not console.copy_button.isEnabled()
+        assert not console.clear_button.isEnabled()
+
+        console.append("Sent to zeta@example.com", level="done", data=17,
+                       tooltip="Double-click to read what was sent")
+        console.append("SMTP refused the message", level="error")
+        app.processEvents()
+
+        assert console.list.count() == 2
+        marks = [console.list.item(row).icon().isNull() for row in range(2)]
+        assert marks == [False, False], "a log line arrived with no marker"
+        inks = {console.list.item(row).foreground().color().name().upper()
+                for row in range(2)}
+        assert len(inks) == 2, "a failure and a delivery are the same colour"
+
+        # Every line carries the stamp the caller did not have to write.
+        assert re.match(r"^\d\d:\d\d:\d\d  SMTP refused",
+                        console.list.item(0).text()), console.list.item(0).text()
+
+        # Monospace, measured: two runs of different letters, one width.
+        metrics = QFontMetrics(console.list.font())
+        assert metrics.horizontalAdvance("MMMMMMMM") == \
+            metrics.horizontalAdvance("iiiiiiii"), \
+            "the console is set in a proportional face"
+
+        # Copy is oldest first, whatever order it is read in.
+        console.copy()
+        board = QApplication.clipboard().text()
+        assert board.index("Sent to zeta") < board.index("SMTP refused"), \
+            "the copied log is in the order it is shown, not the order it ran"
+
+        opened = []
+        console.activated.connect(opened.append)
+        console._on_activated(console.list.item(1))
+        assert opened == [17], \
+            "a line lost what it was about on its way into the console"
+
+        console.clear()
+        assert console.list.count() == 1 and not console.copy_button.isEnabled()
+        console.hide()
+
+
+def test_the_shell_writes_no_colour_and_no_size_of_its_own():
+    """The rule `tests/test_components.py` holds the library to, on the shell.
+
+    `ui/app.py` grew a rail, a page header and a persisted geometry in this
+    commit, and every one of them is a chance to write a colour down. The two
+    window sizes are the exception and are named constants with the reason on
+    them: a window size is not something a palette or a density has an opinion
+    about, and `MINIMUM_SIZE` and `DEFAULT_SIZE` are the only places either is
+    written.
+    """
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(here, "ui", "app.py"), encoding="utf-8") as handle:
+        source = handle.read()
+    tree = ast.parse(source)
+
+    assert re.findall(r"#[0-9A-Fa-f]{6}\b", source) == [], "a colour is written"
+    assert re.search(r"\brgba?\s*\(", source) is None, "a colour is computed"
+
+    documentation = set()
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.ClassDef)) and body:
+            first = body[0]
+            if isinstance(first, ast.Expr) \
+                    and isinstance(first.value, ast.Constant) \
+                    and isinstance(first.value.value, str):
+                documentation.add(id(first.value))
+    written = [node.value for node in ast.walk(tree)
+               if isinstance(node, ast.Constant) and isinstance(node.value, str)
+               and id(node) not in documentation]
+    assert [text for text in written if re.search(r"\d+\s*px", text)] == [], \
+        "the shell writes a stylesheet of its own"
+
+
+def test_nothing_the_chrome_remembers_reaches_a_real_profile():
+    """The same rule `tests/conftest.py` holds the other five paths to.
+
+    The file is new and it is written on every close and every collapse, so it
+    is exactly the kind of path that quietly resolves at import and lands in a
+    developer's own profile. It resolves through `core.settings.SETTINGS_DIR` on
+    every call instead, which is what makes the redirect above reach it.
+    """
+    real = os.path.join(os.path.expanduser("~"), ".mapharvest")
+    assert os.path.abspath(APP.state_path()).lower().startswith(
+        os.path.abspath(_TMP).lower()), \
+        "the chrome remembers itself at %s" % APP.state_path()
+    assert not os.path.abspath(APP.state_path()).lower().startswith(real.lower())
+    assert os.path.dirname(APP.state_path()) == ST.SETTINGS_DIR, \
+        "the state file does not follow the settings directory"
+
+    saved, ST.SETTINGS_DIR = ST.SETTINGS_DIR, os.path.join(_TMP, "elsewhere")
+    try:
+        assert os.path.dirname(APP.state_path()) == ST.SETTINGS_DIR, \
+            "the path was captured at import and cannot be redirected"
+    finally:
+        ST.SETTINGS_DIR = saved
