@@ -18,8 +18,10 @@ a temp profile by the time this imports, so nothing here can read or write a
 real ~/.mapharvest.
 """
 import itertools
+import json
 import os
 import re
+import subprocess
 import sys
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -557,6 +559,99 @@ def test_both_themes_define_every_key_and_no_others():
             "%s palette differs from the contract's token set" % theme.name
 
 
+# ── Type, which has to be measured in a process that can see a font ──────────
+#
+# The offscreen platform this suite runs on ships no fonts: `QFontDatabase` is
+# empty, `QFontInfo` answers "" for every family, and `drawText` paints nothing
+# at all — measured, and it is why the two tests below are not simply written
+# inline. Qt reads `QT_QPA_FONTDIR` once, before the QApplication exists, and by
+# the time any test runs one has existed for a while, so the probe goes into a
+# child process the way `tests/test_modals.py` puts a modal into one. Setting
+# the variable for the whole run instead would make every other pixel test in
+# the suite start rendering glyphs it has never had to account for.
+
+_TYPE_MARKER = "TYPE-REPORT "
+_FONT_DIR = os.environ.get("QT_QPA_FONTDIR") or r"C:\Windows\Fonts"
+
+_TYPE_PROBE = r'''
+import json, sys
+from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QColor, QFontDatabase, QFontInfo, QImage, QPainter
+from PyQt5.QtWidgets import QApplication, QLabel
+
+app = QApplication([])
+stacks, weights, probes = (json.loads(argument) for argument in sys.argv[1:4])
+
+
+def polished(sheet, text="Outreach Handling"):
+    label = QLabel(text)
+    label.setStyleSheet("QLabel { %s }" % sheet)
+    label.ensurePolished()
+    return label
+
+
+def ink(font):
+    """How much black one string takes at one font, as summed darkness."""
+    image = QImage(320, 48, QImage.Format_RGB32)
+    image.fill(Qt.white)
+    painter = QPainter(image)
+    painter.setFont(font)
+    painter.setPen(QColor("black"))
+    painter.drawText(4, 32, "Outreach Handling")
+    painter.end()
+    total = 0
+    for y in range(image.height()):
+        for x in range(image.width()):
+            value = QColor(image.pixel(x, y)).value()
+            if value < 250:
+                total += 255 - value
+    return total
+
+
+families = sorted(QFontDatabase().families())
+report = {"families": families}
+for kind, stack in stacks.items():
+    label = polished("font-family: %s;" % stack)
+    report[kind] = [label.font().family(), QFontInfo(label.font()).family()]
+report["ink"] = {
+    family: [ink(polished("font-family: '%s'; font-size: 17px; font-weight: %d;"
+                          % (family, weight)).font())
+             for weight in weights]
+    for family in probes if family in families}
+print("TYPE-REPORT " + json.dumps(report))
+'''
+
+_TYPESET: dict = {}
+
+
+def _typeset() -> dict:
+    """The probe's report, run once — families, what Qt wore, and the ink."""
+    import pytest
+
+    if not _TYPESET:
+        if not os.path.isdir(_FONT_DIR):
+            pytest.skip("no font directory to point Qt at: %s" % _FONT_DIR)
+        scale = TH.theme().font
+        weights = [scale[tier][1] for tier in ("body", "bodyMed", "h2")]
+        probes = [TH._SANS.split(",")[0].strip().strip("'\""), "Segoe UI Variable"]
+        environment = dict(os.environ, QT_QPA_PLATFORM="offscreen",
+                           QT_QPA_FONTDIR=_FONT_DIR)
+        done = subprocess.run(
+            [sys.executable, "-c", _TYPE_PROBE,
+             json.dumps({"sans": TH._SANS, "mono": TH._MONO}),
+             json.dumps(weights), json.dumps(probes)],
+            capture_output=True, text=True, errors="replace", timeout=120,
+            env=environment)
+        assert done.returncode == 0, "the type probe exited %s:\n%s\n%s" % (
+            done.returncode, done.stdout, done.stderr)
+        found = [line for line in done.stdout.splitlines()
+                 if line.startswith(_TYPE_MARKER)]
+        assert found, "the type probe printed no report:\n%s" % done.stdout
+        _TYPESET.update(json.loads(found[-1][len(_TYPE_MARKER):]))
+        assert _TYPESET["families"], "the child saw no fonts either"
+    return _TYPESET
+
+
 def test_the_type_scale_has_a_heading_tier_and_steps_rather_than_marches():
     """The audit: five sizes inside an 11-15px band, largest over smallest 1.36.
 
@@ -564,11 +659,19 @@ def test_the_type_scale_has_a_heading_tier_and_steps_rather_than_marches():
     14 is four steps of about 1.2, and the scale as a whole now spans 2.55x. The
     four body tiers keep the +1px steps the contract fixes them at, and are told
     apart by weight and role as well as by size.
+
+    The two middle heading tiers were 20 and 16 and are 22 and 17 — the sizes
+    the platform scale this system takes its register from gives its own two
+    title tiers. Nothing about the shape of the scale moved: the assertions
+    around the list are the ones that say what a scale is, and every one of
+    them is unchanged and still passing at the new sizes. The list itself is a
+    re-measurement, not a relaxation, and it is spelled out rather than derived
+    so that the next change to a size has to be deliberate too.
     """
     scale = TH.theme().font
     tiers = ["display", "h1", "h2", "h3", "body", "small", "caption"]
     sizes = [scale[name][0] for name in tiers]
-    assert sizes == [28, 20, 16, 14, 13, 12, 11]
+    assert sizes == [28, 22, 17, 14, 13, 12, 11]
     assert max(sizes) / min(sizes) >= 2.5
     for bigger, smaller in zip(sizes[:4], sizes[1:4]):
         assert 1.14 <= bigger / smaller <= 1.45, \
@@ -577,6 +680,68 @@ def test_the_type_scale_has_a_heading_tier_and_steps_rather_than_marches():
     assert scale["bodyMed"][1] > scale["body"][1]
     assert all(scale[name][1] >= 600 for name in ("display", "h1", "h2", "h3"))
     assert TH.TRACKING["caption"] == 0.4
+
+
+def test_tracking_tightens_the_large_tiers_and_opens_the_small_one():
+    """A 28px title set at the same tracking as 13px body reads as loose.
+
+    The sign is the whole assertion: every tier above body is negative, the
+    uppercase caption is positive, and nothing that is not named is anything
+    other than absent — a tier missing from the map is at 0 by definition, and
+    a 0 written into it would be a value a reader has to look up to find out
+    means nothing.
+    """
+    assert TH.TRACKING["caption"] > 0
+    for tier in ("display", "h1", "h2"):
+        assert TH.TRACKING[tier] < 0, tier
+        assert TH.theme().font[tier][0] > TH.theme().font["body"][0]
+    assert 0 not in TH.TRACKING.values()
+    assert set(TH.TRACKING) <= set(TH.theme().font)
+
+
+def test_the_sheet_asks_for_a_family_that_is_actually_installed():
+    """The old stack led with 'DM Sans', which is on no machine this ships to.
+
+    Qt 5 hands `font-family` to QFont::setFamily, which takes the first name in
+    the list and then falls back through its own matching rather than through
+    the rest of the list — so the leading name is the only one that is a
+    request and every other name in the stack is decoration. Measured rather
+    than read: a label is polished with the sheet's own declaration and asked
+    what it ended up wearing.
+    """
+    report = _typeset()
+    for kind in ("sans", "mono"):
+        asked, wearing = report[kind]
+        assert wearing == asked, (
+            "the %s stack asks for %r and Qt substitutes %r"
+            % (kind, asked, wearing))
+        assert asked in report["families"], "%r is not installed" % asked
+
+
+def test_the_hierarchy_is_set_in_a_face_that_has_the_weights_it_needs():
+    """Why Segoe UI and not Segoe UI Variable, the newer face and closer match.
+
+    The scale carries its hierarchy on weight as much as on size — 400 body,
+    500 emphasis, 600 headings — and Qt 5.15 registers a single style for the
+    variable face, so two of those three resolve to the one instance it draws
+    the other with. Measured as ink rather than asserted: the same string is
+    drawn at the three QFont weights the sheet's CSS values become and the ink
+    is counted. A face that answers two of them identically cannot set this
+    scale, whatever its metrics look like.
+    """
+    report = _typeset()
+    ink = report["ink"][report["sans"][0]]
+    assert sorted(ink) == ink, "the chosen face is not ordered by weight: %s" % ink
+    assert len(set(ink)) == 3, (
+        "%s draws the scale's three weights as %s, so the hierarchy has fewer "
+        "weights than the scale asks for" % (report["sans"][0], ink)
+    )
+    variable = report["ink"].get("Segoe UI Variable")
+    if variable is not None:
+        assert len(set(variable)) < 3, (
+            "Segoe UI Variable now separates all three weights (%s) — it is the "
+            "closer match on paper and this is the only reason it was not used"
+            % variable)
 
 
 def test_space_radius_control_and_motion_are_the_contract_values():
