@@ -133,6 +133,35 @@ audit measured, and what replaced each of it:
     border — the same component as the 28px header badge, at a different size.
     The shell owns that state now; this screen says what the mode costs in a
     sentence and names the campaign it applies to.
+
+The last pass gave this screen the platform dialect the rest of the app now
+speaks. Every part of it is a component that already existed rather than a
+second copy of one, and each closes something measured here:
+
+  * the four steps are rows in the shell's sidebar, so nothing on the page said
+    which of them was in front of you — a screen that opened on Stats and a
+    screen that opened on Leads differed by their contents alone. Each page
+    starts with `components.page_header()` now: the step's name and one muted
+    line saying what it is for. The two uppercase rules those replace — "Leads"
+    over the toolbar and "Results" over the tiles — are gone, and so is the
+    second row of the leads toolbar: the count line moved into the header,
+    which is what left room for Views, Columns and Import beside the filter
+    box.
+  * the activity log was a bare QListWidget of proportional 13px lines tinted
+    three ways through `setForeground`, with the timestamp in the same ink as
+    the message it stamps. It is `components.log_console()` now — monospace, a
+    drawn marker per level in the semantic families, a copy action and a clear
+    action — with `_LogLineDelegate` holding the stamps in `text.tertiary` so
+    the eye runs down the messages and not down the clock, and a line arriving
+    while the reader has scrolled away no longer yanks them back to the top.
+  * the stat tiles were six boxes sharing one row — a seventh arrives after a
+    rehearsal — and no two of them agreed: measured at 1080px they came out 81,
+    160, 146, 216, 161 and 216px wide, each wrapping the same length of
+    sentence differently. They are one width on a four-column grid that
+    re-flows when a tile has nothing to say.
+  * every control that does something carries the drawing for it from
+    `ui/icons.py` — the leads toolbar, the bulk row, the send controls and the
+    row menu — and not one of them holds a pixmap or a colour of its own.
 """
 
 from __future__ import annotations
@@ -146,13 +175,15 @@ import time
 import webbrowser
 from datetime import datetime
 
-from PyQt5.QtCore import QEvent, QPoint, QSize, Qt, QThread, QTimer, pyqtSignal
-from PyQt5.QtGui import QColor, QFontMetrics, QPainter, QRegion
+from PyQt5.QtCore import (
+    QEvent, QPoint, QRect, QSize, Qt, QThread, QTimer, pyqtSignal,
+)
+from PyQt5.QtGui import QColor, QFontMetrics, QPainter, QPalette, QRegion
 from PyQt5.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox,
-    QDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QListWidget,
-    QListWidgetItem, QMenu, QMessageBox, QProgressBar, QScrollArea,
-    QSizePolicy, QStackedWidget, QStyle, QStyleOptionViewItem,
+    QDialog, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel,
+    QListWidget, QListWidgetItem, QMenu, QMessageBox, QProgressBar,
+    QScrollArea, QSizePolicy, QStackedWidget, QStyle, QStyleOptionViewItem,
     QStyledItemDelegate, QTableWidgetItem, QTextBrowser, QVBoxLayout, QWidget,
 )
 
@@ -165,6 +196,7 @@ from core.ai import AIClient
 from core.campaign import (AuditWorker, OutreachWorker, account_daily_cap,
                            plan_campaign, release_now)
 from ui import components
+from ui import icons as _icons
 from ui import theme as _theme
 from ui.components import Cell, Column
 
@@ -379,6 +411,41 @@ _AI_PROVIDERS = {
     "openrouter": "AI: OpenRouter",
     "off": "AI off — plain templates",
 }
+
+# ── What each of the four steps is for ───────────────────────────────────────
+# The steps are rows in the shell's sidebar, so a page that does not name
+# itself is a page whose only clue to which step it is is what happens to be on
+# it — and the Leads and Stats tabs both open on a table of the same leads.
+# One line each, in the tier the page header reads it in: what the step does,
+# and what it hands to the next one.
+
+_SECTION_NOTES = {
+    "Leads": "Everyone there is an address for, what the crawl found on their "
+             "site, and who is worth writing to.",
+    "Campaign": "The template, who it is signed by, when it goes — and the "
+                "exact message one of these leads would receive.",
+    "Sending": "The queue as it goes out: which account, which message, and "
+               "what is holding it up when nothing is moving.",
+    "Stats": "What the campaign has produced so far, and every message it has "
+             "already put in a stranger's inbox.",
+}
+
+# ── The dashboard ────────────────────────────────────────────────────────────
+# A tile is as wide as its own caption and the sentence under it, and every one
+# of them is the same width: seven tiles sharing a row came out 81, 160, 146,
+# 216, 161 and 216px at 1080, which is six different boxes for six numbers that
+# are read as one set. A character measure and a count, because what decides
+# both is text.
+
+_TILE_CH = 22
+_TILES_PER_ROW = 4
+
+# Which drawn mark each control carries. Named here rather than at the call
+# site so the whole toolbar can be read as a set — two controls that do the
+# same kind of thing to a selection take the same glyph, and Start takes a
+# different one in each of the two modes precisely because it is not the same
+# button in both.
+_START_ICONS = {"primary": "play", "danger_primary": "send"}
 
 
 # ── Small helpers ────────────────────────────────────────────────────────────
@@ -727,6 +794,28 @@ def _grid(box, t, margin, spacing):
     return box
 
 
+def _section_header(title: str, note: str, *, actions=(), t=None) -> QWidget:
+    """The name of the step, and the one muted line saying what it is for.
+
+    `components.page_header()` and not a heading of this screen's own, because
+    the shell draws that same object at the top of the pane and two spellings
+    of one title is how this app came to have four different top bars in the
+    first place. What is set here is the one thing the component leaves to its
+    caller: this is a *section* of a screen rather than the screen, so it sits
+    flush with the page's own margin instead of indenting past it, and it takes
+    the tight end of the spacing grid. That end is measured. The campaign
+    column's four cards need 612px and the pane handed them 720 at the default
+    window size, so 108px is the whole budget a header on that page has before
+    the Schedule card's last line goes off the bottom of a window that fits it
+    today. This one costs 55, and the column still fits at 653.
+    """
+    t = t or components.active_theme()
+    header = components.page_header(title, description=note, actions=actions)
+    header.actions_layout.setContentsMargins(t.space["0"], t.space["0"],
+                                             t.space["0"], t.space["2"])
+    return header
+
+
 def _combo(t) -> QComboBox:
     """A bare dropdown at the toolbar height.
 
@@ -765,7 +854,15 @@ class _ElidedLabel(QLabel):
     that says which account will send. The full text is always the tooltip, so
     what has been dropped is one hover away.
 
-    `components` has no elided single-line label; see the handover note.
+    `components.elided_label()` has since arrived and this is deliberately not
+    it, because the two make opposite promises about the tooltip. That one sets
+    a tooltip only while the line is actually cut, which is right for a page
+    description nobody needs the whole of; this one always carries the whole
+    line, because the line it carries is the sending account and "which address
+    is this going out from" has to be answerable at every window width. The two
+    call sites here — the Campaign From line and the per-account rows — are
+    pinned to that by `tests/test_ui_chrome.py`. Merging them means one label
+    that takes the promise as an argument; see the handover note.
     """
 
     # The floor is a few characters and an ellipsis: below that the line stops
@@ -882,6 +979,131 @@ class _BadgeDelegate(QStyledItemDelegate):
                           option.rect.y()
                           + (option.rect.height() - size.height()) // 2)
         badge.render(painter, QPoint(), QRegion(), QWidget.DrawChildren)
+        painter.restore()
+
+
+# ── One line of the activity console ─────────────────────────────────────────
+
+
+class _LogLineDelegate(QStyledItemDelegate):
+    """A console line: the stamp in a muted gutter, the message in its own ink.
+
+    `components.log_console()` gives every line a marker in its level's family
+    and paints the whole line in that family's ink — the timestamp included, so
+    four hundred lines are four hundred equally loud clocks and every message is
+    read past one to reach it. A log is read down the messages; the stamps are
+    the ruler beside them, and a ruler is quieter than what it measures. One
+    QListWidgetItem carries one colour, so the two tones cannot come from the
+    item: the line is drawn here instead.
+
+    Everything it paints comes from the theme it was built with, and the two
+    colours are the console's own — `text.tertiary` for the stamp, and for the
+    message whatever ink `log_console()` already decided the level takes. It
+    wraps rather than eliding because the panel is 375px at the window's
+    minimum and one business name is wider than that, and a console that hides
+    the end of a failure off the right-hand edge is the one thing worse than no
+    console. This belongs in `ui/components.py` beside `log_console()`; see the
+    handover note.
+    """
+
+    # The stamp `components.STAMP` writes, matched rather than measured off a
+    # separator: a business called "09:00 Plumbing" must not be read as a time.
+    _STAMP = re.compile(r"^(\d{2}:\d{2}:\d{2})\s+")
+
+    def __init__(self, t, parent=None):
+        super().__init__(parent)
+        self._muted = QColor(t.color["text.tertiary"])
+        self._pad = t.space["hair"]
+        self._gap = t.space["2"]
+        self._mark = _icons.pixels("xs")
+
+    # ── What a line is made of ───────────────────────────────────────────
+
+    def _split(self, line: str) -> tuple:
+        """(stamp, message). An unstamped line — the placeholder — is all message."""
+        found = self._STAMP.match(_text_of(line))
+        return (found.group(1), line[found.end():]) if found else ("", line)
+
+    def _gutter(self, metrics: QFontMetrics) -> int:
+        """As wide as a stamp and a gap, whatever the mono face measures at.
+
+        Taken from the digits rather than from the string, because a monospace
+        face is not guaranteed and a proportional fallback would leave every
+        message starting at a different x — which is the whole of what the
+        gutter is for.
+        """
+        return metrics.horizontalAdvance("0" * 8) + self._gap
+
+    def _room(self, option) -> int:
+        """The width to lay a line out in: what the view offered, or its viewport.
+
+        Asked both ways because it is asked both ways: laying out a list, Qt
+        hands `sizeHint` the viewport's rect for some calls and an empty one for
+        others, and a line measured against a zero width claims one line where
+        it needs three.
+        """
+        wide = option.rect.width()
+        if wide <= 0:
+            view = self.parent()
+            wide = view.viewport().width() \
+                if isinstance(view, QAbstractItemView) else 0
+        return max(1, wide)
+
+    def _ink(self, index, option) -> QColor:
+        found = index.data(Qt.ForegroundRole)
+        if hasattr(found, "color"):
+            return found.color()
+        return QColor(found) if found else option.palette.color(QPalette.Text)
+
+    # ── Measuring and painting ───────────────────────────────────────────
+
+    def sizeHint(self, option, index) -> QSize:
+        style_option = QStyleOptionViewItem(option)
+        self.initStyleOption(style_option, index)
+        metrics = QFontMetrics(style_option.font)
+        stamp, message = self._split(style_option.text)
+        room = self._room(option)
+        # Deliberately narrower than the box the paint below is handed: the
+        # stylesheet's own `::item` padding is inside that box and is not
+        # visible from here, so a measure taken at the full width would wrap
+        # one word later than the drawing does and leave the last line cut off.
+        text = room - self._mark - self._gap * 2 \
+            - (self._gutter(metrics) if stamp else 0)
+        height = metrics.boundingRect(QRect(0, 0, max(1, text), 0),
+                                      Qt.TextWordWrap, message).height()
+        return QSize(room, max(height, self._mark) + self._pad * 2)
+
+    def paint(self, painter, option, index) -> None:
+        style_option = QStyleOptionViewItem(option)
+        self.initStyleOption(style_option, index)
+        line = style_option.text
+        widget = style_option.widget
+        style = widget.style() if widget is not None else QApplication.style()
+        # Taken before the text is cleared: with nothing to lay out, the style
+        # answers with a rect of no width, and every line would then be drawn
+        # at the left edge of the row underneath its own marker.
+        box = style.subElementRect(QStyle.SE_ItemViewItemText, style_option,
+                                   widget)
+        style_option.text = ""
+        style.drawControl(QStyle.CE_ItemViewItem, style_option, painter, widget)
+
+        stamp, message = self._split(line)
+        metrics = QFontMetrics(style_option.font)
+        painter.save()
+        painter.setClipRect(option.rect)
+        painter.setFont(style_option.font)
+        left = box.left()
+        if stamp:
+            painter.setPen(self._muted)
+            painter.drawText(QRect(left, box.top(), self._gutter(metrics),
+                                   box.height()),
+                             int(Qt.AlignLeft | Qt.AlignTop), stamp)
+            left += self._gutter(metrics)
+        painter.setPen(self._ink(index, style_option))
+        painter.drawText(QRect(left, box.top(), max(1, box.right() - left + 1),
+                               box.height()),
+                         int(Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap),
+                         message)
         painter.restore()
 
 
@@ -1361,10 +1583,13 @@ class OutreachScreen(QWidget):
         self._plan: dict = {}
         self._sending = False
         self._paused = False
-        # (message, level, message id) for every activity line, so a theme
+        # (stamped line, level, message id) for every activity line, so a theme
         # change can put the log back rather than emptying it mid-run, and a
         # line about a real send can be opened from where it was read.
         self._log_lines: list[tuple[str, str, int]] = []
+        # Which stat tiles the dashboard is currently laid out for. A tile with
+        # nothing to say is not drawn, and the grid re-flows when that changes.
+        self._tiles_shown: tuple = ()
         # Per-account rehearsal tally, keyed by lowercased address. A dry run
         # keeps its sends out of the `sends` table on purpose so a rehearsal
         # cannot spend an account's real quota, which left the Accounts card
@@ -1528,26 +1753,14 @@ class OutreachScreen(QWidget):
         page = QWidget()
         box = _rows(page, margin="0", spacing="3", t=t)
 
-        bar = _cols(margin="0", spacing="2", t=t)
-        bar.addWidget(components.section_label("Leads"))
-
-        self.lead_search = components.search_field("Filter, or city:toronto…")
-        self.lead_search.setToolTip(_SEARCH_HELP)
-        self.lead_search.textChanged.connect(self._on_search_changed)
-        bar.addWidget(self.lead_search)
-
-        self.status_filter = _combo(t)
-        for label, _key in _STATUS_FILTERS:
-            self.status_filter.addItem(label)
-        self.status_filter.currentIndexChanged.connect(self._on_status_filter)
-        bar.addWidget(self.status_filter)
-
-        bar.addStretch()
+        # The count line rides in the header rather than in the toolbar, and
+        # that is what left room for one toolbar where there were two —
+        # `_build_lead_toolbar` carries the measurement.
         self.lead_counts = components.body_label("", tone="tertiary")
         self.lead_counts.setWordWrap(False)
-        bar.addWidget(self.lead_counts)
-        box.addLayout(bar)
-        box.addLayout(self._build_view_bar(t))
+        box.addWidget(_section_header("Leads", _SECTION_NOTES["Leads"],
+                                      actions=(self.lead_counts,), t=t))
+        box.addLayout(self._build_lead_toolbar(t))
 
         self.lead_stack = QStackedWidget()
         self.lead_table = self._make_table(t)
@@ -1572,42 +1785,56 @@ class OutreachScreen(QWidget):
             "and Headline gap columns, and what the email copy is built from."))
         return page
 
-    def _build_view_bar(self, t):
-        """What the table is showing, above it; what to do with it, below.
+    def _build_lead_toolbar(self, t):
+        """One toolbar: what the table shows, and what it is showing it of.
 
-        A row of its own rather than three more buttons on the filter bar, and
-        the reason is a measurement. At the 880px window minimum the leads tab
-        has 840px of usable width; the filter bar already wants 735 of it for a
-        heading, a search box, a status picker and the count line, and adding
-        Views, Columns and Import took it to 1,136 — so Qt shrank the search
-        box to 34px and cut "Import CSV…" mid-word. Split in two, the filter
-        bar is back to 735 and this row wants 402.
+        Two rows once, and for a measured reason. At the 880px window minimum
+        the leads tab has 840px of usable width; the filter bar wanted 735 of
+        it for a heading, a search box, a status picker and the count line, and
+        adding Views, Columns and Import took it to 1,136 — so Qt shrank the
+        search box to 34px and cut "Import CSV…" mid-word. The heading and the
+        count line are the header's now, and with those 283px back the five
+        controls left measure 625 of the 840: nothing is squeezed at the
+        minimum, and the search box keeps the whole 162px its own character cap
+        allows it.
 
-        The split is also the honest grouping. Everything here changes what the
-        table *shows*; everything on the row under the table acts on what is
-        selected. They were never the same kind of control.
+        Everything here changes what the table *shows*; everything on the row
+        under the table acts on what is selected in it. That was the honest
+        half of the old split and it survives — as two rows of controls with a
+        table between them rather than as two rows stacked on top of one.
         """
         bar = _cols(margin="0", spacing="2", t=t)
 
+        self.lead_search = components.search_field("Filter, or city:toronto…")
+        self.lead_search.setToolTip(_SEARCH_HELP)
+        self.lead_search.textChanged.connect(self._on_search_changed)
+        bar.addWidget(self.lead_search)
+
+        self.status_filter = _combo(t)
+        for label, _key in _STATUS_FILTERS:
+            self.status_filter.addItem(label)
+        self.status_filter.currentIndexChanged.connect(self._on_status_filter)
+        bar.addWidget(self.status_filter)
+
         self.view_btn = components.button("Views", kind="secondary", size="sm",
+                                          icon="filter",
                                           on_click=self._show_views_menu)
         bar.addWidget(self.view_btn)
 
-        self.columns_btn = components.button("Columns", kind="secondary", size="sm",
+        self.columns_btn = components.button("Columns", kind="secondary",
+                                             size="sm", icon="columns",
                                              on_click=self._show_columns_menu)
         self.columns_btn.setToolTip(
             "Choose which columns the table shows. The choice is remembered.")
         bar.addWidget(self.columns_btn)
 
-        import_csv = components.button("Import CSV…", kind="secondary", size="sm",
+        import_csv = components.button("Import CSV…", kind="secondary",
+                                       size="sm", icon="document",
                                        on_click=self._on_import_csv)
         import_csv.setToolTip("Load leads from a spreadsheet export")
         bar.addWidget(import_csv)
 
         bar.addStretch()
-        self.lead_status = components.body_label("", tone="tertiary")
-        self.lead_status.setWordWrap(False)
-        bar.addWidget(self.lead_status)
         return bar
 
     def _build_lead_actions(self, t):
@@ -1630,23 +1857,35 @@ class OutreachScreen(QWidget):
         actions = _cols(margin="0", spacing="2", t=t)
 
         self.copy_btn = components.button("Copy", kind="secondary", size="sm",
+                                          icon="copy",
                                           on_click=self._on_copy_emails)
         actions.addWidget(self.copy_btn)
 
-        self.export_btn = components.button("Export…", kind="secondary", size="sm",
+        self.export_btn = components.button("Export…", kind="secondary",
+                                            size="sm", icon="external",
                                             on_click=self._on_export_clicked)
         actions.addWidget(self.export_btn)
 
-        self.suppress_btn = components.button("Suppress…", kind="danger", size="sm",
+        self.suppress_btn = components.button("Suppress…", kind="danger",
+                                              size="sm", icon="minus",
                                               on_click=self._on_suppress_clicked)
         actions.addWidget(self.suppress_btn)
 
         self.remove_btn = components.button("Remove…", kind="danger", size="sm",
+                                            icon="trash",
                                             on_click=self._on_remove_clicked)
         actions.addWidget(self.remove_btn)
         actions.addStretch()
 
-        self.audit_btn = components.button("Audit all", kind="primary", size="lg",
+        # Beside the buttons that write it. "Copied 3 addresses" and "Auditing
+        # 40 sites…" are answers to something that was just pressed here, and
+        # they used to be reported at the far end of a row above the table.
+        self.lead_status = components.body_label("", tone="tertiary")
+        self.lead_status.setWordWrap(False)
+        actions.addWidget(self.lead_status)
+
+        self.audit_btn = components.button("Audit all", kind="primary",
+                                           size="lg", icon="search",
                                            on_click=self._on_audit_clicked)
         actions.addWidget(self.audit_btn)
         return actions
@@ -1677,6 +1916,14 @@ class OutreachScreen(QWidget):
         self._badge_text = {}
         self._painted = set()
         table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        # One ground and a hairline between rows rather than a zebra.
+        # `components.table()` alternates the row colour for every table it
+        # builds, and on this one that lands on top of the bottom border the
+        # sheet already gives `QTableWidget::item` — two separations per row,
+        # and the louder of the two moves the ground under the status pill and
+        # the score badge, which are the two cells on the row that carry a
+        # ground of their own.
+        table.setAlternatingRowColors(False)
         for field, build in ((_COL_SCORE, components.score_badge),
                              (_COL_STATUS, components.status_pill)):
             column = self._col_of.get(field, -1)
@@ -1702,9 +1949,13 @@ class OutreachScreen(QWidget):
 
     def _build_campaign_page(self, t) -> QWidget:
         page = QWidget()
-        columns = _cols(page, margin="0", spacing="4", t=t)
+        box = _rows(page, margin="0", spacing="3", t=t)
+        box.addWidget(_section_header("Campaign", _SECTION_NOTES["Campaign"],
+                                      t=t))
+        columns = _cols(margin="0", spacing="4", t=t)
         columns.addWidget(self._build_campaign_column(t))
         columns.addWidget(self._build_preview_column(t), stretch=1)
+        box.addLayout(columns, stretch=1)
         return page
 
     def _build_campaign_column(self, t) -> QWidget:
@@ -1736,7 +1987,7 @@ class OutreachScreen(QWidget):
         self.profile_problem.hide()
         profile_card.body_layout.addWidget(self.profile_problem)
         self.profile_fix_btn = components.button(
-            "Fix in Settings", kind="danger", size="sm",
+            "Fix in Settings", kind="danger", size="sm", icon="gear",
             on_click=self.settings_signal.emit)
         profile_card.body_layout.addWidget(self.profile_fix_btn,
                                            alignment=Qt.AlignLeft)
@@ -1763,12 +2014,16 @@ class OutreachScreen(QWidget):
         # is wide, so a row clipped the primary button mid-glyph. Full width
         # also stops the label ever deciding the layout — a wider font or a
         # translation cannot squeeze either button again.
+        #
+        # A calendar on it and not a paper plane: preparing a campaign queues
+        # it against a clock and sends nothing, and the one control on this
+        # screen that mails a stranger is the only one allowed to look like it.
         self.prepare_btn = components.button("Prepare campaign", kind="primary",
-                                             size="lg",
+                                             size="lg", icon="calendar",
                                              on_click=self._on_prepare_clicked)
         plan_card.body_layout.addWidget(self.prepare_btn)
         self.goto_sending_btn = components.button(
-            "Open Sending", kind="secondary", size="lg",
+            "Open Sending", kind="secondary", size="lg", icon="chevron-right",
             on_click=lambda: self._goto_tab(2))
         self.goto_sending_btn.hide()
         plan_card.body_layout.addWidget(self.goto_sending_btn)
@@ -1860,6 +2115,8 @@ class OutreachScreen(QWidget):
     def _build_sending_page(self, t) -> QWidget:
         page = QWidget()
         box = _rows(page, margin="0", spacing="3", t=t)
+        box.addWidget(_section_header("Sending", _SECTION_NOTES["Sending"],
+                                      t=t))
 
         pick = _cols(margin="0", spacing="2", t=t)
         pick.addWidget(components.section_label("Campaign"))
@@ -1876,22 +2133,27 @@ class OutreachScreen(QWidget):
         # and in a dry run it is not that control at all.
         self.start_btn = components.button("Start sending", kind="primary",
                                            size="lg",
+                                           icon=_START_ICONS["primary"],
                                            on_click=self._on_start_clicked)
         self.start_row = pick
         self.start_at = pick.count()
         pick.addWidget(self.start_btn)
+        # A clock, because the clock is the whole of what this button waives:
+        # the window and the gap between messages go, the daily caps stay.
         self.send_now_btn = components.button(
-            "Send now", kind="secondary", size="lg",
+            "Send now", kind="secondary", size="lg", icon="clock",
             on_click=self._on_send_now_clicked)
         self.send_now_btn.setToolTip(
             "Ignore the sending window and the gap between messages. Daily caps "
             "still apply.")
         pick.addWidget(self.send_now_btn)
         self.pause_btn = components.button("Pause", kind="secondary", size="lg",
+                                           icon="pause",
                                            on_click=self._on_pause_clicked)
         self.pause_btn.setEnabled(False)
         pick.addWidget(self.pause_btn)
         self.stop_btn = components.button("Stop", kind="danger", size="lg",
+                                          icon="stop",
                                           on_click=self._on_stop_clicked)
         self.stop_btn.setEnabled(False)
         pick.addWidget(self.stop_btn)
@@ -1931,20 +2193,7 @@ class OutreachScreen(QWidget):
             _measure(QFontMetrics(page.font()), _COLUMN_CH) + t.space["4"] * 2)
         middle.addWidget(accounts_card)
 
-        log_side = _rows(margin="0", spacing="2", t=t)
-        log_side.addWidget(components.section_label("Activity"))
-        self.log_list = QListWidget()
-        self.log_list.setObjectName("saved_list")
-        self.log_list.setSelectionMode(QAbstractItemView.NoSelection)
-        # Without wrapping, a line longer than the panel makes the whole list
-        # scroll sideways: the placeholder sentence and a business with a long
-        # name both run past the panel's width at the window's minimum size.
-        # Wrapped, the panel stays a column of text at every width and no line
-        # is ever hidden off to the right.
-        self.log_list.setWordWrap(True)
-        self.log_list.itemDoubleClicked.connect(self._on_sent_item_activated)
-        log_side.addWidget(self.log_list, stretch=1)
-        middle.addLayout(log_side, stretch=1)
+        middle.addWidget(self._build_console(t), stretch=1)
         box.addLayout(middle, stretch=1)
         self._repaint_log()
 
@@ -1953,6 +2202,48 @@ class OutreachScreen(QWidget):
             "stop at each account's daily cap. Closing the app pauses the run; "
             "the queue survives and picks up where it left off."))
         return page
+
+    def _build_console(self, t) -> QWidget:
+        """The activity log, as the console `ui/components.py` already draws.
+
+        What it replaces: a bare QListWidget wearing `saved_list`, four hundred
+        proportional 13px lines tinted three ways through `setForeground`, the
+        stamp in the same ink as the message it stamps, and no way to get any
+        of it off the screen and into a bug report. `log_console()` is
+        monospace, marks every line with its level's own drawn glyph in that
+        level's family, and carries the two verbs anybody actually does with a
+        log. `_LogLineDelegate` adds the one thing it leaves to a caller.
+
+        Three of its settings are this panel's own. The console elides and this
+        one wraps, because at the 880px window minimum the panel is 375px wide
+        and a business name is wider than that — elided, the end of a failure
+        is off the right-hand edge of a list with no horizontal scrollbar to
+        reach it with. Uniform item sizes go with the wrap, since a wrapped
+        line is two rows tall and the one under it is one. And selection stays
+        off: a log line is read and double-clicked, never picked, and Copy
+        takes the whole log rather than a selection of it.
+        """
+        console = components.log_console(
+            title="Activity", limit=_LOG_LIMIT,
+            placeholder="Nothing sent yet. Press Start and each message "
+                        "appears here as it goes out.")
+        listing = console.list
+        listing.setSelectionMode(QAbstractItemView.NoSelection)
+        listing.setWordWrap(True)
+        listing.setUniformItemSizes(False)
+        listing.setTextElideMode(Qt.ElideNone)
+        listing.setItemDelegate(_LogLineDelegate(t, listing))
+        console.activated.connect(self._on_log_activated)
+        # Clear empties the console, and the screen keeps the record the
+        # console is restored from after a rebuild — so it has to hear about
+        # it. Without this the next palette change puts back, line for line,
+        # the log the user had just cleared.
+        console.clear_button.clicked.connect(self._on_log_cleared)
+        self.log_panel = console
+        # The list keeps a name of its own because everything that reads a line
+        # back asks the list — the console is the chrome around it.
+        self.log_list = listing
+        return console
 
     # ── Stats tab ────────────────────────────────────────────────────────────
 
@@ -1978,24 +2269,45 @@ class OutreachScreen(QWidget):
         page = QWidget()
         box = _rows(page, margin="0", spacing="3", t=t)
 
-        head = _cols(margin="0", spacing="2", t=t)
-        head.addWidget(components.section_label("Results"))
-        head.addStretch()
         self.stats_campaign = components.body_label("", tone="tertiary")
         self.stats_campaign.setWordWrap(False)
-        head.addWidget(self.stats_campaign)
-        box.addLayout(head)
+        box.addWidget(_section_header("Stats", _SECTION_NOTES["Stats"],
+                                      actions=(self.stats_campaign,), t=t))
 
-        # The row ends in a stretch rather than sharing the window between six
-        # tiles: at 2560 each one was a 400px box round a two-digit number.
-        tiles = _cols(margin="0", spacing="3", t=t)
+        # One width for every tile, four to a row, and the slack outside them
+        # rather than inside. Sharing the row between the tiles makes each one
+        # a 400px box round a two-digit number at 2560; letting each size
+        # itself to its own sentence made them 81, 160, 146, 216, 161 and 216px
+        # at 1080, which is six shapes for six numbers that are read as a set.
+        self.tiles_grid = QGridLayout()
+        self.tiles_grid.setContentsMargins(t.space["0"], t.space["0"],
+                                           t.space["0"], t.space["0"])
+        self.tiles_grid.setSpacing(t.space["3"])
+        self.tiles_grid.setColumnStretch(_TILES_PER_ROW, 1)
+        box.addLayout(self.tiles_grid)
+
+        width = (_measure(QFontMetrics(page.font()), _TILE_CH)
+                 + t.space["3"] * 2 + components.BORDER * 2)
         self.tiles: dict[str, QFrame] = {}
+        self._tiles_shown = ()
         for key, caption, tone, note in self._TILES:
             tile = components.stat_tile(caption, "0", tone=tone, hint=note)
-            tiles.addWidget(tile)
+            # A cap and not a fixed width. Capped, four tiles and their gaps
+            # want 828px and the pane is 824 at the smallest window this app
+            # opens at with the rail collapsed, so a fixed width would put the
+            # fourth number four pixels past the edge of the page; a cap gives
+            # every tile the same 198px wherever there is room for it and lets
+            # the row narrow evenly where there is not.
+            tile.setMaximumWidth(width)
             self.tiles[key] = tile
-        tiles.addStretch()
-        box.addLayout(tiles)
+        # Every tile onto the grid once, whatever it is about to say, because
+        # the grid is what parents them: a tile that has never been in a layout
+        # has no parent widget at all, and showing one later would put a stat
+        # tile on screen as a window of its own. The pass under it takes the
+        # ones with nothing to say back off, now that they have a parent to be
+        # hidden inside.
+        self._flow_tiles(tuple(self.tiles))
+        self._layout_tiles()
 
         # Not a tile, because it is not a count of messages: it is how many of
         # them say anything about the business they are addressed to. A user
@@ -2025,7 +2337,7 @@ class OutreachScreen(QWidget):
         sent_head.addWidget(self.sent_count)
         sent_head.addStretch()
         self.open_sent_btn = components.button(
-            "Open message", kind="secondary", size="sm",
+            "Open message", kind="secondary", size="sm", icon="mail",
             on_click=self._on_open_sent_clicked)
         sent_head.addWidget(self.open_sent_btn)
         box.addLayout(sent_head)
@@ -2052,7 +2364,7 @@ class OutreachScreen(QWidget):
         supp_head.addWidget(self.supp_count)
         supp_head.addStretch()
         self.unsuppress_btn = components.button(
-            "Remove selected", kind="secondary", size="sm",
+            "Remove selected", kind="secondary", size="sm", icon="minus",
             on_click=self._on_unsuppress_clicked)
         supp_head.addWidget(self.unsuppress_btn)
         box.addLayout(supp_head)
@@ -3073,25 +3385,36 @@ class OutreachScreen(QWidget):
         chosen = self._selected_leads() \
             if picked is not None and picked.isSelected(index) else [lead]
 
+        # The same drawings the toolbar carries, so a row's actions and the
+        # bulk row's are one vocabulary: two ways to reach one verb, marked the
+        # same way. Both openers take the arrow out of the box, because both
+        # leave this app for a browser.
         menu = QMenu(self)
         website = _text_of(lead.get("website")).strip()
         email = _text_of(lead.get("email")).strip()
         if website:
-            menu.addAction("Open website", lambda: webbrowser.open(
-                website if "://" in website else "https://" + website))
+            menu.addAction(_icons.icon("external"), "Open website",
+                           lambda: webbrowser.open(
+                               website if "://" in website
+                               else "https://" + website))
         if lead.get("maps_link"):
-            menu.addAction("Open in Google Maps",
+            menu.addAction(_icons.icon("external"), "Open in Google Maps",
                            lambda: webbrowser.open(_text_of(lead.get("maps_link"))))
         menu.addSeparator()
         if email:
-            menu.addAction("Copy email", lambda: self._copy(email))
+            menu.addAction(_icons.icon("copy"), "Copy email",
+                           lambda: self._copy(email))
         if lead.get("name"):
-            menu.addAction("Copy business name", lambda: self._copy(_text_of(lead.get("name"))))
-        menu.addAction("Preview this email", lambda: self._preview_lead(lead))
+            menu.addAction(_icons.icon("copy"), "Copy business name",
+                           lambda: self._copy(_text_of(lead.get("name"))))
+        menu.addAction(_icons.icon("eye"), "Preview this email",
+                       lambda: self._preview_lead(lead))
         menu.addSeparator()
-        menu.addAction("Suppress %s (never contact)" % _plural(len(chosen), "lead"),
+        menu.addAction(_icons.icon("minus"),
+                       "Suppress %s (never contact)" % _plural(len(chosen), "lead"),
                        lambda: self._suppress(chosen))
-        menu.addAction("Remove %s from the list" % _plural(len(chosen), "lead"),
+        menu.addAction(_icons.icon("trash"),
+                       "Remove %s from the list" % _plural(len(chosen), "lead"),
                        lambda: self._remove(chosen))
         menu.exec_(self.lead_table.viewport().mapToGlobal(pos))
 
@@ -4313,10 +4636,16 @@ class OutreachScreen(QWidget):
         kind: one green currently means Save, Start Scraping and "mail twenty
         real strangers", and `danger_primary` is the only filled red in the app
         precisely so the last of those cannot wear the first one's clothes.
+
+        The glyph goes with the kind for the same reason. A rehearsal is a play
+        button — something starts and nothing leaves — and a live run is the
+        paper plane the shell's own LIVE badge carries, so the two states of
+        this one control differ by colour, by word and by shape.
         """
         if self.start_btn.property("kind") == kind:
             return
         made = components.button(self.start_btn.text(), kind=kind, size="lg",
+                                 icon=_START_ICONS.get(kind, "play"),
                                  on_click=self._on_start_clicked)
         made.setEnabled(self.start_btn.isEnabled())
         made.setToolTip(self.start_btn.toolTip())
@@ -4683,43 +5012,89 @@ class OutreachScreen(QWidget):
         self._log_lines = []
         self._repaint_log()
 
+    def _on_log_cleared(self) -> None:
+        """The console's own Clear, reaching the record behind it.
+
+        The console has already emptied itself by the time this runs; what is
+        left is the screen's copy, which is what a rebuild reads.
+        """
+        self._log_lines = []
+
     def _append_log(self, message: str, level: str = "info",
                     message_id: int = 0) -> None:
-        self._log_lines.insert(0, ("%s  %s" % (datetime.now().strftime("%H:%M:%S"),
-                                               message), level, _int_of(message_id)))
-        del self._log_lines[_LOG_LIMIT:]
-        self._repaint_log()
+        """One stamped line, without pulling the reader off what they are on.
 
-    # Which tier of ink a line takes. A failure has to look like one at a
-    # glance, and a delivery like a delivery, in a panel that is otherwise 400
-    # identical grey lines.
-    _LOG_INK = {"error": "danger.text", "done": "accent.text",
-                "active": "text.primary"}
+        The console puts each new line at the top, which is the right end for a
+        panel nobody scrolls: the line being waited for is the one on screen.
+        It is the wrong end for the one moment somebody *is* scrolling — a run
+        that logs a line a second used to walk whatever they were reading one
+        row further down every second. Moving the bar by the height of the line
+        that arrived keeps that line where it was; at the top, which is where
+        the panel sits unless it has been scrolled, nothing moves at all.
+        """
+        line = "%s  %s" % (datetime.now().strftime(components.STAMP),
+                           _text_of(message))
+        self._log_lines.insert(0, (line, _text_of(level), _int_of(message_id)))
+        del self._log_lines[_LOG_LIMIT:]
+        bar = self.log_list.verticalScrollBar()
+        held = bar.value()
+        self._push_log(line, _text_of(level), _int_of(message_id))
+        if held > 0:
+            first = self.log_list.item(0)
+            bar.setValue(held + (self.log_list.visualItemRect(first).height()
+                                 if first is not None else 0))
 
     def _repaint_log(self) -> None:
-        """Draw the log, or the sentence that says what would fill it.
+        """Put every line the screen holds into a console that has none.
 
-        Same treatment as the suppression list: an unexplained bordered box is
-        the one surface on this screen that would not say what belongs in it.
+        Called with a console that has just been built — at startup, and again
+        when a palette change rebuilds every widget on this screen — because
+        the log is the one thing here that cannot be read back out of the
+        database.
+
+        Written into the console's line store in one pass rather than appended
+        line by line, and that is a measurement rather than a preference.
+        `_LogConsole.append` redraws the whole list per line, which is the
+        right shape for a line arriving off a worker and quadratic for a
+        restore: a full 400-line log costs **5,424ms** of a palette change that
+        way and **9ms** this way, measured inside the rebuild both times, on
+        the one screen the user is looking at while it happens — which takes
+        the whole change from 5,658ms to 425. The console publishes `lines()`
+        and no way to put them back: the shape written here is the shape
+        `lines()` reads, and a `set_lines()` beside it is where this belongs.
+        See the handover note.
+
+        The stamp travels inside the line rather than being taken from the
+        clock on the way in, which is the whole reason the lines are kept as
+        text: re-stamped on a rebuild, a campaign that had been running for
+        three days would come back claiming every message left at the moment
+        the user changed theme.
         """
-        t = components.active_theme()
-        self.log_list.clear()
-        if not self._log_lines:
-            item = QListWidgetItem(
-                "Nothing sent yet. Press Start and each message appears here "
-                "as it goes out.")
-            item.setFlags(Qt.NoItemFlags)
-            self.log_list.addItem(item)
-            return
-        for message, level, message_id in self._log_lines:
-            item = QListWidgetItem(message)
-            item.setForeground(QColor(
-                t.color[self._LOG_INK.get(level, "text.secondary")]))
-            if message_id:
-                item.setData(Qt.UserRole, message_id)
-                item.setData(Qt.UserRole + 1, True)
-                item.setToolTip("Double-click to read exactly what was sent")
-            self.log_list.addItem(item)
+        panel = self.log_panel
+        panel._lines = [("", line, level, message_id or None,
+                         self._log_tip(message_id))
+                        for line, level, message_id in self._log_lines]
+        panel._repaint()
+
+    def _push_log(self, line: str, level: str, message_id: int) -> None:
+        """One line into the console, carrying the message it can open."""
+        self.log_panel.append(line, level=level, stamp=False,
+                              data=message_id or None,
+                              tooltip=self._log_tip(message_id))
+
+    @staticmethod
+    def _log_tip(message_id: int) -> str:
+        """What hovering a line says, and only for a line that opens onto one."""
+        return "Double-click to read exactly what was sent" if message_id else ""
+
+    def _on_log_activated(self, message_id) -> None:
+        """A double-clicked line opens the message it is about.
+
+        The console hands back what the line was given rather than a row
+        number, which is what makes this survive four hundred inserts above it.
+        A rehearsal's line carries nothing, because nothing left to read.
+        """
+        self._open_sent_message(_int_of(message_id))
 
     # ── Sending: accounts and countdown ──────────────────────────────────────
 
@@ -4840,10 +5215,52 @@ class OutreachScreen(QWidget):
     def _paint_stats(self, stats: dict) -> None:
         stats = stats if isinstance(stats, dict) else {}
         for key, tile in self.tiles.items():
-            count = _int_of(stats.get(key))
-            tile.value_label.setText(str(count))
-            if key in self._TILES_WHEN_NONZERO:
-                tile.setVisible(bool(count))
+            tile.value_label.setText(str(_int_of(stats.get(key))))
+        self._layout_tiles()
+
+    def _layout_tiles(self) -> None:
+        """Lay out the tiles that have something to say, four to a row.
+
+        Which those are is read off the numbers the tiles are carrying rather
+        than off their visibility, and both halves of that matter. A widget
+        that has never been on screen reports itself hidden, so a dashboard
+        laid out from `isHidden()` at build time is a dashboard with nothing in
+        it; and a tile's number is the same thing its visibility was decided
+        from anyway, so asking the number is asking one question instead of
+        keeping two answers in step.
+        """
+        self._flow_tiles(tuple(
+            key for key, _caption, _tone, _note in self._TILES
+            if key not in self._TILES_WHEN_NONZERO
+            or _int_of(self.tiles[key].value_label.text())))
+
+    def _flow_tiles(self, shown: tuple) -> None:
+        """Put `shown` on the grid in order, and take the rest off it.
+
+        Re-flowed rather than left with a hole in it. Rehearsed is hidden on
+        every campaign nobody has rehearsed, and a dashboard with a gap in the
+        middle of it reads as a number that failed to arrive rather than as one
+        that was never asked for.
+
+        A tile that comes off the grid is hidden with it, because a widget
+        removed from a layout keeps its parent: left alone it would go on
+        painting itself wherever the layout last put it, which for a tile that
+        has never been laid out at all is the top-left corner of the page.
+
+        Nothing happens when the same tiles are showing as last time, which is
+        every call but two in a campaign's life: this runs on every stats
+        signal, and a running send loop emits one of those per message.
+        """
+        if shown == self._tiles_shown:
+            return
+        self._tiles_shown = shown
+        while self.tiles_grid.count():
+            self.tiles_grid.takeAt(0)
+        for at, key in enumerate(shown):
+            self.tiles_grid.addWidget(self.tiles[key], at // _TILES_PER_ROW,
+                                      at % _TILES_PER_ROW)
+        for key, tile in self.tiles.items():
+            tile.setVisible(key in shown)
 
     # A campaign of five hundred is a long list to walk on a tab change, and the
     # answer past a couple of thousand would not change what the user does about

@@ -23,19 +23,53 @@ The screen keeps every signal and every worker call it had. What it lost is its
 chrome: the shell owns the product name, the destinations and Settings, so
 `home_signal` is now emitted by the empty state's own button rather than by a
 button in a bar of this screen's own.
+
+The macOS pass over it is three measured things and no new controls:
+
+  * **a hover marked one cell of eight.** The table selects by row and the sheet
+    tints `::item:hover`, but Qt sets `State_MouseOver` on the cell the pointer
+    is in and on nothing else — measured at 5,960 tinted pixels in the Business
+    Name cell and 0 in the seven cells beside it, so the row a click was about to
+    take was never the row that lit up. `_RowHover` is the whole fix: it marks
+    the row rather than the cell, and it does it as a delegate over the shared
+    table so no other screen's table changes shape.
+  * **every value read at one weight.** A cell with nothing in it painted its em
+    dash in `text.primary` — the same ink as a real phone number — so twelve of
+    the twenty-one collectable fields are optional and a table of them read as a
+    table of values until each one had been read. An empty cell paints
+    `text.tertiary` now and a filled one still paints `text.primary`, measured
+    off the pixels in both palettes.
+  * **the run said what it was doing in words alone.** "Paused", "Stopped by an
+    error" and "Done — 40 businesses" were one grey sentence in one place, told
+    apart only by reading them. Each state carries its own mark from
+    `ui/icons.py` beside the sentence, in the semantic family it belongs to.
+
+  * **the run over several searches scrolled sideways.** The spec was measured
+    against the eight-column default and that case is unchanged — 830px of
+    viewport at 880 and no scrollbar — but a run over two domains and two areas
+    adds two `fit` columns that take their natural width whatever the room is,
+    which spent 177px repeating "dentists" and "Toronto" down every row and
+    pushed the table 57px past its own edge with Email the column falling off
+    it. Both are `stretch` now: 2px at 880, and the same widths as before once
+    the window has the room.
+
+Every action that has an obvious shape now carries it — the CSV, the hand-off to
+Outreach, the two run controls, and the six entries of the row menu.
 """
 
 import webbrowser
 
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import QEvent, QObject, Qt, pyqtSignal
 from PyQt5.QtWidgets import (
-    QApplication, QHBoxLayout, QMenu, QProgressBar, QScrollArea,
-    QStackedWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QApplication, QHBoxLayout, QLabel, QMenu, QProgressBar, QScrollArea,
+    QStackedWidget, QStyle, QStyledItemDelegate, QTableWidgetItem, QVBoxLayout,
+    QWidget,
 )
 
 from core.exporter import export_csv, FIELD_LABELS
 from core.scraper import ScrapeWorker
 from ui import components
+from ui import icons
 from ui.components import Cell, Column
 
 # ── The column spec ──────────────────────────────────────────────────────────
@@ -63,8 +97,21 @@ from ui.components import Cell, Column
 # address.
 
 _COLUMNS = {
-    "domain":       Column("Search Domain", "fit", min_ch=8, max_ch=22),
-    "area":         Column("Search Area", "fit", min_ch=8, max_ch=22),
+    # The two pseudo-columns are `stretch` and not `fit`, and they are the one
+    # place that choice is about the narrow window rather than the wide one. A
+    # `fit` column takes its natural width whatever the room is, so a run over
+    # two domains and two areas spent 177px of an 830px viewport at 880
+    # repeating "dentists" and "Toronto" down every row — and the table scrolled
+    # 57px sideways to fit the rest, with Email the column that fell off the
+    # end. As `stretch` they fall back to their floors when there is nothing
+    # spare, elide with a tooltip like every other column that carries meaning,
+    # and take their full width again as soon as the window has it. The weight
+    # is 1 because a value that is the same on every row is the last thing that
+    # should grow.
+    "domain":       Column("Search Domain", "stretch", weight=1, min_ch=8,
+                           max_ch=22),
+    "area":         Column("Search Area", "stretch", weight=1, min_ch=8,
+                           max_ch=22),
     "name":         Column("Business Name", "stretch", weight=3, min_ch=14,
                            max_ch=36),
     "category":     Column("Category", "fit", min_ch=8, max_ch=22,
@@ -116,6 +163,105 @@ _NUMERIC = ("rating", "review_count", "latitude", "longitude")
 # What an empty cell shows. Held here rather than written at three call sites
 # because `_row_matches` and the CSV path both have to agree with it.
 BLANK = "—"
+
+# The tone a cell's ink takes. A blank is a blank: painting its em dash in the
+# same `text.primary` as a real address is what made a column of mostly-empty
+# socials read as a column of values, and the eye had to read each one to find
+# out which. Named rather than passed inline so the two call sites — the value
+# and the number — cannot disagree about it.
+EMPTY_TONE = "tertiary"
+
+# What a run's state looks like, beside the sentence that says it. Colour is
+# never alone here: each state has a different shape from every other, and the
+# sentence beside it says the same thing in words, so a monochrome screenshot
+# and a colour-blind reader lose nothing.
+STATES = {
+    # `secondary` and not the `info` family: nothing has happened yet, and a
+    # blue mark on a screen at rest is an alert about a non-event. A neutral
+    # state's mark is the tone of the sentence it stands beside.
+    "ready":   ("info", "secondary"),
+    "running": ("play", "accent"),
+    "paused":  ("pause", "warning"),
+    "stopped": ("stop", "secondary"),
+    "done":    ("check", "success"),
+    "failed":  ("error", "danger"),
+    "copied":  ("copy", "success"),
+}
+
+# The tone and the size `components.button` hands an icon on a secondary control
+# at `control.sm`. Named rather than guessed, because Pause swaps its own glyph
+# when the run holds and a swap that picks either of these differently is a
+# button whose mark stops matching the three beside it. Both are token names —
+# `ui/icons.py` resolves the colour and the pixel size from the palette.
+RUN_ICON_TONE, RUN_ICON_SIZE = "secondary", "sm"
+
+# The state mark is the same size and takes its tone from `STATES`, because the
+# tone is what the state means and the size is what the line it sits in is.
+STATE_ICON_SIZE = "sm"
+
+# And what a menu entry's mark takes. `xs` because a menu row is a line of body
+# text and not a control: an icon drawn at the button size beside a 13px label
+# is the one that makes a menu look like a toolbar that fell over.
+MENU_ICON_TONE, MENU_ICON_SIZE = "secondary", "xs"
+
+
+class _RowHover(QStyledItemDelegate):
+    """Hover marks the row a click would take, not the cell the pointer is in.
+
+    Measured before it existed: hovering the Business Name cell of a row tinted
+    5,960 pixels in that cell and 0 in each of the seven beside it, on both the
+    offscreen and the Windows platform. The sheet is not the problem — its
+    `QTableWidget::item:hover` rule is what paints those 5,960 — Qt is: an item
+    view sets `State_MouseOver` on the index under the pointer, and this table
+    selects whole rows, so the row that lights up on hover was never the row a
+    click was about to take.
+
+    A delegate rather than a change to `components.table()`, because the fix
+    belongs to a table that selects by row and not to every table in the app,
+    and rather than a widget-local stylesheet, because a screen may not write
+    QSS: the sheet already says what a hovered row looks like, and all this does
+    is tell it which cells are in one.
+
+    The event filter watches the viewport instead of overriding `viewportEvent`
+    for the same reason — the table is `components`' and this is a screen.
+    """
+
+    def __init__(self, table):
+        super().__init__(table)
+        self._table = table
+        self._row = -1
+        table.setItemDelegate(self)
+        table.viewport().installEventFilter(self)
+
+    def row(self) -> int:
+        """Which row is under the pointer, or -1. For tests and for measuring."""
+        return self._row
+
+    def eventFilter(self, watched, event) -> bool:
+        """Never swallows: the table's own tooltip handling runs after this."""
+        kind = event.type()
+        if kind in (QEvent.HoverMove, QEvent.HoverEnter):
+            self._mark(self._table.indexAt(event.pos()).row())
+        elif kind in (QEvent.HoverLeave, QEvent.Leave):
+            self._mark(-1)
+        return QObject.eventFilter(self, watched, event)
+
+    def _mark(self, row: int) -> None:
+        if row == self._row:
+            return
+        self._row = row
+        self._table.viewport().update()
+
+    def paint(self, painter, option, index) -> None:
+        """The one line that does the work, and nothing else changed.
+
+        The option is passed on exactly as it arrived apart from the one flag,
+        so the elide mode, the alignment and the palette are still the view's
+        own and a cell paints as it did.
+        """
+        if index.row() == self._row:
+            option.state |= QStyle.State_MouseOver
+        super().paint(painter, option, index)
 
 
 class SortableItem(QTableWidgetItem):
@@ -210,16 +356,30 @@ class ResultsScreen(QWidget):
     # ── Construction ─────────────────────────────────────────────────────────
 
     def _build(self):
+        """Three bands, and the space between them is what says they are three.
+
+        The run, then the rule, then the surface — and the surface is its own
+        stack: its toolbar and its table are `space.2` apart while the bands are
+        `space.4`, so a filter box reads as belonging to the table under it
+        rather than as a third thing floating between two others. That is the
+        whole of the hierarchy on this screen; nothing here is in a box.
+        """
         t = components.active_theme()
         root = _rows(self, margin="5", spacing="4", t=t)
 
         root.addLayout(self._build_status(t))
         root.addWidget(components.divider())
-        root.addLayout(self._build_table_header(t))
-        root.addWidget(self._build_table_stack(t), stretch=1)
-        root.addWidget(components.hint(
-            "Double-click a row to open it in Google Maps, right-click one for "
-            "more, click a header to sort."))
+
+        surface = _rows(margin="0", spacing="2", t=t)
+        surface.addLayout(self._build_table_header(t))
+        surface.addWidget(self._build_table_stack(t), stretch=1)
+        # Under the 80-character measure `hint` caps at, so it is one line and
+        # not two: at 106 characters it wrapped, and a two-line caption under a
+        # table reads as a paragraph somebody forgot to finish.
+        surface.addWidget(components.hint(
+            "Double-click for Google Maps, right-click for more, click a "
+            "header to sort."))
+        root.addLayout(surface, stretch=1)
 
         self.toaster = components.Toaster(self)
         root.addWidget(self.toaster.widget)
@@ -241,18 +401,35 @@ class ResultsScreen(QWidget):
             line.addWidget(button)
         block.addLayout(line)
 
+        # Three sentences this screen does not choose the length of — what was
+        # searched for, what the run is doing, and where the CSV is being
+        # written — so all three are `elided_label` and none of them is a
+        # `body_label` with its wrap turned off. That combination caps itself at
+        # eighty characters and then clips whatever is past the cap with no
+        # ellipsis and no tooltip, which is the one thing this app's own table
+        # contract forbids: "dentists, roofing contractors · Toronto, Ottawa,
+        # Hamilton" is 63 characters and a Windows export path is routinely
+        # past 80.
         meta = _cols(margin="0", spacing="3", t=t)
-        self.area_label = components.body_label("", tone="tertiary")
-        self.area_label.setWordWrap(False)
-        self.status_label = components.body_label("Ready", tone="secondary")
-        self.status_label.setWordWrap(False)
+        self.area_label = components.elided_label("", tone="tertiary")
+        # The mark and the sentence are one thing and travel together, so the
+        # gap between them is `space.1` and not the row's own `space.3`.
+        state = _cols(margin="0", spacing="1", t=t)
+        self.status_mark = QLabel()
+        self.status_mark.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.status_label = components.elided_label("Ready", tone="secondary")
         self.status_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        meta.addWidget(self.area_label)
+        state.addWidget(self.status_mark)
+        state.addWidget(self.status_label)
+        meta.addWidget(self.area_label, 1)
         meta.addStretch()
-        meta.addWidget(self.status_label)
+        meta.addLayout(state)
         block.addLayout(meta)
+        self._status = ("Ready", "ready")
+        self._set_status("Ready", "ready")
 
-        self.export_path_label = components.hint("")
+        self.export_path_label = components.elided_label("", tone="tertiary",
+                                                         tier="small")
         block.addWidget(self.export_path_label)
 
         # `space.hair`, the one place a 2px rule is a rule and not a layout
@@ -268,27 +445,71 @@ class ResultsScreen(QWidget):
         return block
 
     def _build_actions(self, t):
+        """The four verbs, each with the shape it has everywhere else.
+
+        `send` on Start Outreach and not a second drawing of its own: it is the
+        mark the rail already carries beside the destination this button routes
+        to, and a button that goes somewhere should wear the same glyph as the
+        place it goes.
+        """
         self.export_btn = components.button(
-            "Export CSV", kind="secondary", size="sm",
+            "Export CSV", kind="secondary", size="sm", icon="document",
             on_click=self._on_export_clicked)
         self.export_btn.setToolTip("Save the current results to a CSV file")
 
         self.outreach_btn = components.button(
-            "Start Outreach", kind="primary", size="sm",
+            "Start Outreach", kind="primary", size="sm", icon="send",
             on_click=self._on_outreach_clicked)
         self.outreach_btn.setToolTip(
             "Audit these businesses and prepare a cold-email campaign")
 
         self.pause_btn = components.button(
-            "Pause", kind="secondary", size="sm",
+            "Pause", kind="secondary", size="sm", icon="pause",
             on_click=self._on_pause_clicked)
+        self.pause_btn.setToolTip("Hold the scrape where it is")
 
         self.action_btn = components.button(
-            "Stop", kind="danger", size="sm",
+            "Stop", kind="danger", size="sm", icon="stop",
             on_click=self._on_action_clicked)
         self.action_btn.setToolTip("Stop the scrape and keep what it has")
         return (self.export_btn, self.outreach_btn, self.pause_btn,
                 self.action_btn)
+
+    # ── What the run is doing, in a mark as well as in words ─────────────────
+
+    def _set_status(self, text: str, state: str = "") -> None:
+        """The status sentence, and the shape that says which kind it is.
+
+        Every write to the status line comes through here, so a state cannot
+        arrive without its mark or a mark outlive the sentence it belonged to —
+        which is the failure mode of a second label updated at eight call sites.
+
+        The mark and the words take the same tone, which is the icon set's own
+        rule and the reason the label is an `elided_label`: a `body_label` bakes
+        its colour into a stylesheet at construction, so a line that changes
+        tone would have to be a new widget every time a message arrives.
+        """
+        self._status = (text, state)
+        self.status_label.setText(text)
+        found = STATES.get(state)
+        if found is None:
+            self.status_label.set_tone("secondary")
+            self.status_mark.clear()
+            self.status_mark.setVisible(False)
+            self.status_mark.setToolTip("")
+            self.status_mark.setAccessibleName("")
+            return
+        name, tone = found
+        self.status_label.set_tone(tone)
+        self.status_mark.setPixmap(icons.pixmap(name, tone=tone,
+                                                size=STATE_ICON_SIZE))
+        self.status_mark.setVisible(True)
+        self.status_mark.setToolTip(text)
+        self.status_mark.setAccessibleName(state)
+
+    def status(self) -> tuple:
+        """(sentence, state) — what the line is saying, for tests and restyle."""
+        return self._status
 
     def _build_table_header(self, t):
         row = _cols(margin="0", spacing="3", t=t)
@@ -343,8 +564,25 @@ class ResultsScreen(QWidget):
         spec = [_COLUMNS.get(field, Column(FIELD_LABELS.get(field, field)))
                 for field in fields] or [Column("Business Name", "stretch")]
         table = components.table(spec, density=t.density, sortable=False)
+        # A header that can be cut says its whole name on hover, and only the
+        # ones that can are given the tooltip. A `fit` column is sized to the
+        # wider of its header and its content and never shrinks below that, so
+        # every one of them is measured whole with room to spare — "Category"
+        # paints 54px of ink in 125px. A `stretch` column falls back to its
+        # floor when the window is small, and at 880 with both pseudo-columns
+        # showing "Search Domain" paints 43px of an 75px name. The cells under
+        # it already answer a hover with what was cut; this is the row above
+        # them, which `components.table` has no view of.
+        for index, column in enumerate(spec):
+            item = table.horizontalHeaderItem(index)
+            if item is not None and column.kind == "stretch":
+                item.setToolTip(column.title)
         table.customContextMenuRequested.connect(self._show_row_menu)
         table.cellDoubleClicked.connect(self._on_cell_double_clicked)
+        # Held on the screen as well as parented to the table: the reference is
+        # what makes it findable, and the parent is what makes it die with the
+        # table it belongs to when `_rebuild_table` swaps one in.
+        self.row_hover = _RowHover(table)
         return table
 
     # ── The theme, live ──────────────────────────────────────────────────────
@@ -359,8 +597,11 @@ class ResultsScreen(QWidget):
         search box and which mode the screen is in.
         """
         search, running, paused = self._search_text, self._is_running, self._is_paused
-        status, area = self.status_label.text(), self.area_label.text()
-        export, error = self.export_path_label.text(), self._error
+        # `full_text` and not `text`: an elided label hands Qt whatever fitted,
+        # so carrying `text()` across a palette change would rebuild the screen
+        # around "dentists, roofing contr…" and lose the rest for good.
+        status, area = self._status, self.area_label.full_text()
+        export, error = self.export_path_label.full_text(), self._error
         records, count = list(self.results), self.count_label.text()
         sub, progress = self.count_sub.text(), self.progress_bar.value()
 
@@ -382,7 +623,7 @@ class ResultsScreen(QWidget):
         for record in records:
             self.add_table_row(record)
 
-        self.status_label.setText(status)
+        self._set_status(*status)
         self.area_label.setText(area)
         self.export_path_label.setText(export)
         self.export_path_label.setVisible(bool(export))
@@ -405,6 +646,8 @@ class ResultsScreen(QWidget):
         self._is_running = True
         self._is_paused = False
         self.pause_btn.setText("Pause")
+        self.pause_btn.setIcon(icons.icon("pause", tone=RUN_ICON_TONE,
+                                          size=RUN_ICON_SIZE))
         self.pause_btn.setEnabled(True)
         self.pause_btn.show()
         self.action_btn.show()
@@ -456,7 +699,7 @@ class ResultsScreen(QWidget):
         self.count_label.setText("0")
         self.count_sub.setText("of %d" % self._max_results)
         self.row_count_label.setText("")
-        self.status_label.setText("Starting…")
+        self._set_status("Starting…", "running")
         self.area_label.setText("%s · %s" % (", ".join(self._domains),
                                              ", ".join(self._areas)))
         self.export_path_label.setText(
@@ -525,7 +768,7 @@ class ResultsScreen(QWidget):
             self.worker.stop()
         self.pause_btn.setEnabled(False)
         self.action_btn.setEnabled(False)
-        self.status_label.setText("Stopping…")
+        self._set_status("Stopping…", "stopped")
 
     def _on_pause_clicked(self):
         if not self.worker or not self.worker.isRunning():
@@ -539,16 +782,20 @@ class ResultsScreen(QWidget):
         self._is_paused = paused
         if paused:
             self.pause_btn.setText("Resume")
-            self.status_label.setText("Paused")
+            self.pause_btn.setIcon(icons.icon("play", tone=RUN_ICON_TONE,
+                                              size=RUN_ICON_SIZE))
+            self._set_status("Paused", "paused")
         else:
             self.pause_btn.setText("Pause")
-            self.status_label.setText("Resuming…")
+            self.pause_btn.setIcon(icons.icon("pause", tone=RUN_ICON_TONE,
+                                              size=RUN_ICON_SIZE))
+            self._set_status("Resuming…", "running")
 
     def _on_log(self, message: str, status: str):
         if status == "active":
-            self.status_label.setText(message)
+            self._set_status(message, "running")
         elif status == "done" and message.startswith("#"):
-            self.status_label.setText(message.lstrip("#").strip())
+            self._set_status(message.lstrip("#").strip(), "running")
 
     def update_progress(self, collected: int):
         self.count_label.setText(str(collected))
@@ -578,11 +825,17 @@ class ResultsScreen(QWidget):
         cells = []
         for field in self.fields:
             text = self._value(data, field)
+            # A blank reads as a blank rather than as a value. Twelve of the
+            # twenty-one collectable fields are optional and most rows are
+            # missing several, so a table that paints every em dash in
+            # `text.primary` is a table where the eye has to read each cell to
+            # find out whether there is anything in it.
+            tone = "" if text else EMPTY_TONE
             if field in _NUMERIC:
-                cells.append(Cell(text=text or BLANK,
+                cells.append(Cell(text=text or BLANK, tone=tone,
                                   sort=self._number(text)))
             else:
-                cells.append(Cell(text=text or BLANK,
+                cells.append(Cell(text=text or BLANK, tone=tone,
                                   sort=(text or "").lower()))
         row = self.table.add_row(cells, data=data)
 
@@ -671,6 +924,13 @@ class ResultsScreen(QWidget):
             webbrowser.open(url)
 
     def _show_row_menu(self, pos):
+        """The six verbs on one business, each with a shape as well as a name.
+
+        Two shapes and not six: what leaves the app carries `external` and what
+        lands on the clipboard carries `copy`, so the menu reads as two groups
+        at a glance rather than as six lines to be read in order. The separator
+        between them was already there and now says the same thing twice.
+        """
         index = self.table.indexAt(pos)
         if not index.isValid():
             return
@@ -678,29 +938,33 @@ class ResultsScreen(QWidget):
         if not rec:
             return
         menu = QMenu(self)
+        away = icons.icon("external", tone=MENU_ICON_TONE, size=MENU_ICON_SIZE)
+        clip = icons.icon("copy", tone=MENU_ICON_TONE, size=MENU_ICON_SIZE)
         maps_url = rec.get("maps_link") or rec.get("_href")
         website = rec.get("website")
         phone = rec.get("phone")
         email = rec.get("email")
 
         if maps_url:
-            menu.addAction("Open in Google Maps", lambda: webbrowser.open(maps_url))
+            menu.addAction(away, "Open in Google Maps",
+                           lambda: webbrowser.open(maps_url))
         if website:
-            menu.addAction("Open website", lambda: webbrowser.open(website))
+            menu.addAction(away, "Open website", lambda: webbrowser.open(website))
         if maps_url or website:
             menu.addSeparator()
         if phone:
-            menu.addAction("Copy phone", lambda: self._copy(phone))
+            menu.addAction(clip, "Copy phone", lambda: self._copy(phone))
         if email:
-            menu.addAction("Copy email", lambda: self._copy(email))
+            menu.addAction(clip, "Copy email", lambda: self._copy(email))
         if rec.get("name"):
-            menu.addAction("Copy name", lambda: self._copy(rec.get("name")))
-        menu.addAction("Copy row (tab-separated)", lambda: self._copy_row(rec))
+            menu.addAction(clip, "Copy name", lambda: self._copy(rec.get("name")))
+        menu.addAction(clip, "Copy row (tab-separated)",
+                       lambda: self._copy_row(rec))
         menu.exec_(self.table.viewport().mapToGlobal(pos))
 
     def _copy(self, text: str):
         QApplication.clipboard().setText(str(text))
-        self.status_label.setText("Copied to clipboard")
+        self._set_status("Copied to clipboard", "copied")
 
     def _copy_row(self, rec: dict):
         self._copy("\t".join(self._value(rec, field) for field in self.fields))
@@ -783,7 +1047,7 @@ class ResultsScreen(QWidget):
         self.progress_bar.setValue(0)
         self.row_count_label.setText("")
         self._update_table_page()
-        self.status_label.setText("Continuing to next search…")
+        self._set_status("Continuing to next search…", "running")
         self.worker.continue_next_domain()
 
     def on_done(self):
@@ -794,19 +1058,20 @@ class ResultsScreen(QWidget):
             if n > 0:
                 d, a = self._current_task()
                 self._notify_task_export(d, a, n, False)
-                self.status_label.setText("Stopped — partial results saved")
+                self._set_status("Stopped — partial results saved", "stopped")
             else:
-                self.status_label.setText("Stopped — no results collected")
+                self._set_status("Stopped — no results collected", "stopped")
         else:
             if not self._multi:
                 d = self._domains[0] if self._domains else ""
                 a = self._areas[0] if self._areas else ""
                 hit_limit = self._max_results > 0 and n >= self._max_results
                 self._notify_task_export(d, a, n, hit_limit)
-                self.status_label.setText(
-                    "Done — %d businesses" % n if n else "Done — no results")
+                self._set_status(
+                    "Done — %d businesses" % n if n else "Done — no results",
+                    "done")
             else:
-                self.status_label.setText("Done — all searches scraped")
+                self._set_status("Done — all searches scraped", "done")
 
         self.count_sub.setText("of %d" % self._max_results)
         self._update_row_count()
@@ -826,7 +1091,7 @@ class ResultsScreen(QWidget):
         """
         text = str(message or "").strip() or "The scrape stopped for an unknown reason."
         self._error = text
-        self.status_label.setText("Stopped by an error")
+        self._set_status("Stopped by an error", "failed")
         self._show_error(text)
         self._show_toast("The scrape stopped: %s" % text, tone="danger")
         self._set_idle_mode()

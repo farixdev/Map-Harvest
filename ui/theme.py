@@ -37,28 +37,28 @@ the range is what `tests/test_theme.py` measures rather than takes on trust:
   * the ink. A selected ground has to clear 3:1 against the ground it replaces,
     and the dimmest text tier has to clear 4.5:1 against the selected ground, so
     the dimmest tier ends up 13.5x the row it is read on. `surface` sits at
-    l=0.0769 (l is L+0.05, the WCAG offset), which puts that tier at l>=1.038 —
+    l=0.0776 (l is L+0.05, the WCAG offset), which puts that tier at l>=1.048 —
     brighter than white. What is achievable is one ink rather than four, and the
     sheet paints exactly that: every rule that grounds on `surfaceActive` names
-    `text.onAccent`, which measures 4.52:1 in dark and 14.22:1 in light, and
+    `text.onAccent`, which measures 4.50:1 in dark and 13.97:1 in light, and
     `test_a_selected_ground_never_carries_ink_it_cannot_read` holds it there.
   * the outline. `border.default` and `surfaceActive` both sit at least 3x above
     `surface`, so putting 3:1 between the two of them needs one of them 9x above
-    `surface` — l>=0.63, a near-white hairline on every control — while the ink
+    `surface` — l>=0.70, a near-white hairline on every control — while the ink
     rule caps the selected ground at l<=0.2333. The sheet answers it a rule at a
     time instead: a control whose ground becomes `surfaceActive` takes its edge
     in `text.onAccent` too.
 
 The same arithmetic is why the focus ring is dimmer than the resting border in
 dark and cannot be lifted above it. Rule 5 puts `border.default` at 3x the
-lightest ground it touches (3 x l raised = 0.342) and the readable-selection cap
+lightest ground it touches (3 x l raised = 0.340) and the readable-selection cap
 puts any subordinate mark at or under l=0.233, so the resting border is 46%
 louder than the loudest ring the ordering permits. Spelled as a span, the dark
 theme is asked for 1.4 x 1.4 (the surface ladder) x 3 (the border on `raised`)
 x 4.5 (white on the selection) = 26.46:1 between the page and its brightest ink,
 and black to white is 21:1. It is 26% short before a single colour is chosen.
-The light theme has the range — its page is a mid grey with 9.2:1 of room below
-it — and carries the full ordering: rest 3.83, focus 4.81, selection 6.22 on the
+The light theme has the range — its page is a mid grey with 8.9:1 of room below
+it — and carries the full ordering: rest 3.94, focus 5.34, selection 6.55 on the
 page, and the same order on all five grounds.
 
 Where a rule could not be met, the reason is arithmetic and is written down at
@@ -89,99 +89,123 @@ from PyQt5.QtWidgets import (
 # The dark palette is laid out along relative luminance, because every rule in
 # the contract is a luminance ratio:
 #
-#   canvas 0.0040  inset 0.0115  surface 0.0269  surfaceHover 0.0418
-#   raised 0.0639  surfaceActive 0.1825   border.default 0.3012
-#   text.disabled 0.3579  text.tertiary 0.5032  text.primary 0.9284
+#   canvas 0.0049  inset 0.0132  surface 0.0276  surfaceHover 0.0425
+#   raised 0.0634  surfaceActive 0.1833   border.default 0.2946
+#   text.disabled 0.3528  text.tertiary 0.5035  text.primary 0.8975
 #
-# canvas -> surface is 1.42:1 and surface -> raised 1.48:1, so a card reads as a
+# canvas -> surface is 1.41:1 and surface -> raised 1.46:1, so a card reads as a
 # card and a dialog sits above the page. `raised` is the lightest ground any
 # text lands on, which is what fixes the floor for the whole text ramp: 4.5:1 on
-# it needs L >= 0.4585, and that is why `text.tertiary` is as bright as it is.
+# it needs L >= 0.4610, and that is why `text.tertiary` is as bright as it is.
+#
+# The greys carry a single cool cast — b a few points over r at every step —
+# rather than the blue-grey the palette used to run, because that is what the
+# register being aimed at does: a charcoal that reads as neutral beside a
+# saturated blue and does not compete with it for hue.
 
 _DARK = {
-    "canvas": "#0C0D10",
-    "surface": "#2A2E33",
-    "surfaceHover": "#363A40",
+    # Very dark charcoal and deliberately not black: at 14/15/21 it is a ground
+    # a shadow can still fall on. It also sits at the top of the window rule 3
+    # leaves it — `surface` is capped by the selected ground below, and 1.4:1
+    # under that cap is L <= 0.0054.
+    "canvas": "#0E0F15",
+    "surface": "#2D2E34",
+    "surfaceHover": "#383A41",
     # The selected ground, and the tightest value in the palette. White ink caps
-    # it at L 0.1833 (4.5:1) and 3:1 against `surface` floors it at L 0.1807;
-    # #707782 measures L 0.1825, which is 4.52:1 for the ink and 3.03:1 for the
+    # it at L 0.1833 (4.5:1) and 3:1 against `surface` floors it at L 0.1828;
+    # #727780 measures L 0.1833, which is 4.50:1 for the ink and 3.01:1 for the
     # ground. There is no room above or below, which is the price of a selection
     # that is both legible and unmistakable on a dark page — and it is why the
     # ink on this one ground is `text.onAccent` and not the four-tier text ramp:
-    # the ramp's dimmest tier would have to measure l >= 1.038, and white is
+    # the ramp's dimmest tier would have to measure l >= 1.048, and white is
     # 1.05. Every rule in the sheet that grounds here says so.
-    "surfaceActive": "#707782",
-    "raised": "#43484F",
-    "inset": "#1A1C20",
+    "surfaceActive": "#727780",
+    "raised": "#45474F",
+    "inset": "#1D1E24",
     "scrim": "rgba(0, 0, 0, 0.66)",
 
-    "border.subtle": "#4B4F57",
-    "border.default": "#8D96A3",
-    "border.strong": "#A5AEBE",
+    # A hairline, at last. `border.subtle` used to sit at L 0.0778, above
+    # `raised`, where a divider inside a card was a line you read before the
+    # words beside it; at L 0.0501 it sits below `raised` and still clears the
+    # just-noticeable difference from both grounds it can be drawn between
+    # (delta-E 3.5 from `raised`, 3.4 from `surfaceHover`).
+    "border.subtle": "#3D3F48",
+    # Loud, and not by choice: rule 5 puts it 3:1 above `raised`, the lightest
+    # ground it is drawn on, which floors it at L 0.2907. It measures 3.04:1
+    # there and 6.28:1 on the page.
+    "border.default": "#8F93A6",
+    "border.strong": "#A6AAB9",
 
-    "text.primary": "#F5F7FA",
-    "text.secondary": "#C9D4E8",
-    "text.tertiary": "#B2BDCE",
-    "text.disabled": "#99A2B1",
+    "text.primary": "#F3F3F5",
+    "text.secondary": "#D1D3D8",
+    "text.tertiary": "#BABCC3",
+    "text.disabled": "#9EA0A9",
     "text.onAccent": "#FFFFFF",
 
-    # The brand green, and the app icon's own hue. Every filled state is dark
-    # enough for white ink at 4.5:1, which is what "the accent fill must darken
-    # until it passes" costs: the old #22A559 with white measured 3.18:1.
-    "accent.subtle": "#053418",
-    "accent.default": "#15743D",
-    "accent.hover": "#1A8547",
-    "accent.active": "#116534",
-    # The focus ring. 3.70:1 on canvas and 3.25:1 on inset, against a selection
-    # that measures 4.30:1 and 3.78:1 on the same two grounds — subordinate
+    # The accent is a blue now, and the constraint that shaped the old green
+    # shapes it identically: rule 2 asks white to clear 4.5:1 on every filled
+    # state, so the blue is as light as that allows and no lighter. #0A84FF
+    # itself measures 3.11:1 with white and cannot be the fill; scaled down its
+    # own hue line it becomes #0869CC, which measures 5.38:1, with the hover at
+    # 4.65:1 — the tightest fill in the palette — and the pressed state at
+    # 6.51:1. That is the whole cost of a filled accent that can be read.
+    "accent.subtle": "#03274C",
+    "accent.default": "#0869CC",
+    "accent.hover": "#0973DE",
+    "accent.active": "#075DB3",
+    # The focus ring. 3.83:1 on canvas and 3.33:1 on inset, against a selection
+    # that measures 4.25:1 and 3.69:1 on the same two grounds — subordinate
     # everywhere, which is the rule. It cannot also clear 3:1 on `surface`
-    # (it measures 2.60:1 there): doing so would need a ring above 4.28:1 on
+    # (it measures 2.71:1 there): doing so would need a ring above 4.24:1 on
     # canvas, and the selection cannot go higher without dropping its ink under
     # 4.5:1. Ordering wins, because the audit's critical finding is the ordering.
     #
-    # It is also dimmer than the border it replaces — 3.70:1 against
-    # `border.default`'s 6.50:1 on canvas — and that is the one defect in this
+    # It is also dimmer than the border it replaces — 3.83:1 against
+    # `border.default`'s 6.28:1 on canvas — and that is the one defect in this
     # file with no colour that fixes it. A ring above the resting border has to
-    # clear 3 x l(raised) = 0.342, and a ring at or under the selection cannot
+    # clear 3 x l(raised) = 0.340, and a ring at or under the selection cannot
     # pass l = 0.233; the two bounds cross by 46%, so the whole window is empty
-    # and every green in it is a green that outranks the selection. What is left
-    # is holding the ring at the top of the window it does have: it measures 86%
+    # and every blue in it is a blue that outranks the selection. What is left
+    # is holding the ring at the top of the window it does have: it measures 90%
     # of the selection on every ground, and
     # `test_the_focus_ring_is_as_loud_as_the_ordering_lets_it_be` keeps it there.
     # The light palette has the range and carries the full ordering.
-    "accent.border": "#177C42",
-    "accent.text": "#5CD98F",
+    "accent.border": "#086ED5",
+    "accent.text": "#88C4FF",
 
-    # Teal, not a second green. `accent` is the brand and `success` is a state,
-    # and two ramps of six values each in one hue is how a palette ends up with
-    # 18 pairs under the just-noticeable difference.
-    "success.subtle": "#01352E",
-    "success.default": "#067165",
-    "success.hover": "#098274",
-    "success.active": "#056357",
-    "success.border": "#077A6D",
-    "success.text": "#45DFCB",
+    # Green is a state again, now that the brand is not one. The five families
+    # are the platform's own semantic set — blue, green, orange, red, teal —
+    # which is also what keeps them apart: `info` is the teal and not a second
+    # blue, for the same reason `success` used to be the teal and not a second
+    # green. Two ramps of six values each in one hue is how a palette ends up
+    # with 18 pairs under the just-noticeable difference.
+    "success.subtle": "#0A2A12",
+    "success.default": "#1B7732",
+    "success.hover": "#1E8337",
+    "success.active": "#18682C",
+    "success.border": "#208A3A",
+    "success.text": "#4FD871",
 
-    "warning.subtle": "#422D02",
-    "warning.default": "#865E0A",
-    "warning.hover": "#996C0D",
-    "warning.active": "#745007",
-    "warning.border": "#90650B",
-    "warning.text": "#F5C86A",
+    "warning.subtle": "#472D03",
+    "warning.default": "#996006",
+    "warning.hover": "#A56706",
+    "warning.active": "#895505",
+    "warning.border": "#B06E07",
+    "warning.text": "#FFC56A",
 
-    "danger.subtle": "#62171A",
-    "danger.default": "#B83439",
-    "danger.hover": "#D33D42",
-    "danger.active": "#A02C30",
-    "danger.border": "#C7383E",
-    "danger.text": "#FFA3A8",
+    "danger.subtle": "#681C18",
+    "danger.default": "#C5352D",
+    "danger.hover": "#D53A31",
+    "danger.active": "#B03028",
+    "danger.border": "#E33E34",
+    "danger.text": "#FFA39E",
 
-    "info.subtle": "#0D3760",
-    "info.default": "#2067AD",
-    "info.hover": "#2677C6",
-    "info.active": "#1A5996",
-    "info.border": "#236FB9",
-    "info.text": "#86C2FF",
+    "info.subtle": "#0D3036",
+    "info.default": "#1F7381",
+    "info.hover": "#227E8E",
+    "info.active": "#1C6673",
+    "info.border": "#248697",
+    "info.text": "#83CFDD",
 }
 
 # Built to the same five rules from the light end, not by inverting the dark one
@@ -190,68 +214,78 @@ _DARK = {
 #
 # The page is a mid grey and that is arithmetic, not taste. `raised` has to stay
 # clear of pure white so `text.onAccent` is not the same token twice over, which
-# puts it at L 0.9035; `surface` is then capped at L 0.6150 by the 1.4:1 step
-# below it, and `canvas` at L 0.4090 by the step below that. A #F7F8FA page with
-# white cards measures 1.08:1 and fails rule 3 outright.
+# puts it at L 0.9375; `surface` is then capped at L 0.6457 by the 1.4:1 step
+# below it, and `canvas` at L 0.4420 by the step below that. The #F5F5F7 page
+# with white cards the register would otherwise ask for measures 1.08:1 and
+# fails rule 3 outright — a ladder of 1.4:1 twice over is 1.96x of offset
+# luminance between the page and a popover, and there is not that much room
+# between a near-white card and white. So the light theme takes the register's
+# hues and its blue, and its own page tone is what the contract leaves it.
 #
-# One consequence runs through the whole palette: against a canvas at L 0.4090
-# the brightest possible mark is white at 2.29:1, so everything the page has to
+# One consequence runs through the whole palette: against a canvas at L 0.4420
+# the brightest possible mark is white at 2.13:1, so everything the page has to
 # distinguish — buttons, rails, focus rings, the selected ground — is darker
-# than the page rather than lighter.
+# than the page rather than lighter. It is also the theme with the range for
+# the full ordering the audit asked for, and it carries it: on the page a
+# resting border measures 3.94:1, a focus ring 5.34:1 and a selected row
+# 6.55:1, and the same order holds on all five grounds.
 
 _LIGHT = {
-    "canvas": "#A4ACB9",
-    "surface": "#CACDD5",
-    "surfaceHover": "#BFC3CC",
-    "surfaceActive": "#222B3B",
-    "raised": "#F3F4F5",
-    "inset": "#E0E3E6",
+    "canvas": "#AEB1BF",
+    "surface": "#D0D2DA",
+    "surfaceHover": "#C3C5D0",
+    "surfaceActive": "#2A2C31",
+    "raised": "#F7F8F9",
+    "inset": "#E4E5EA",
     "scrim": "rgba(12, 13, 16, 0.55)",
 
-    "border.subtle": "#9AA3B2",
-    "border.default": "#474B53",
-    "border.strong": "#363A40",
+    "border.subtle": "#979BAD",
+    "border.default": "#4B4D57",
+    "border.strong": "#3E4049",
 
-    "text.primary": "#121316",
-    "text.secondary": "#1D1F23",
-    "text.tertiary": "#3C4046",
-    "text.disabled": "#525760",
+    "text.primary": "#0E1012",
+    "text.secondary": "#202227",
+    "text.tertiary": "#3B3E44",
+    "text.disabled": "#535760",
     "text.onAccent": "#FFFFFF",
 
-    "accent.subtle": "#BDD9C4",
-    "accent.default": "#116534",
-    "accent.hover": "#0E5B2F",
-    "accent.active": "#0C5129",
-    "accent.border": "#084622",
-    "accent.text": "#043116",
+    # The same blue, read the other way up: the fill darkens where the dark
+    # theme's brightens, and `subtle` is a pale tint of it rather than a deep
+    # one. White measures 7.02:1 on the resting fill here.
+    "accent.subtle": "#C1E0FF",
+    "accent.default": "#0758AB",
+    "accent.hover": "#06509C",
+    "accent.active": "#05498C",
+    "accent.border": "#043A70",
+    "accent.text": "#032950",
 
-    "success.subtle": "#B7DBD4",
-    "success.default": "#056357",
-    "success.hover": "#045A4F",
-    "success.active": "#035047",
-    "success.border": "#02453C",
-    "success.text": "#013029",
+    "success.subtle": "#B5EFC3",
+    "success.default": "#196B2D",
+    "success.hover": "#166129",
+    "success.active": "#145825",
+    "success.border": "#124E21",
+    "success.text": "#0C3516",
 
-    "warning.subtle": "#EED6BE",
-    "warning.default": "#745007",
-    "warning.hover": "#694906",
-    "warning.active": "#5E4105",
-    "warning.border": "#523703",
-    "warning.text": "#392502",
+    "warning.subtle": "#FFE6BE",
+    "warning.default": "#945C06",
+    "warning.hover": "#885405",
+    "warning.active": "#7B4C05",
+    "warning.border": "#704604",
+    "warning.text": "#4A2E03",
 
-    "danger.subtle": "#F0C4C4",
-    "danger.default": "#A02C30",
-    "danger.hover": "#93272B",
-    "danger.active": "#842226",
-    "danger.border": "#721C1F",
-    "danger.text": "#511114",
+    "danger.subtle": "#FFCECC",
+    "danger.default": "#B03028",
+    "danger.hover": "#A12B25",
+    "danger.active": "#922721",
+    "danger.border": "#84241E",
+    "danger.text": "#581814",
 
-    "info.subtle": "#C8D7F4",
-    "info.default": "#1A5996",
-    "info.hover": "#175089",
-    "info.active": "#14477B",
-    "info.border": "#103D6A",
-    "info.text": "#082A4B",
+    "info.subtle": "#BDE6ED",
+    "info.default": "#1B6371",
+    "info.hover": "#195A66",
+    "info.active": "#16515C",
+    "info.border": "#13464F",
+    "info.text": "#0D3036",
 }
 
 # Steps of one another by design, and the only pairs exempt from the delta-E
@@ -270,11 +304,18 @@ STEP_PAIRS = frozenset(
 # name -> (px, weight). Ratios step about 1.2 between tiers instead of the
 # +1px march the audit found, and there is a heading tier at last: the largest
 # text in the app used to be 15px.
+#
+# The sizes are the ones the platform scale this system takes its register from
+# gives its title tiers — 28 for a large title, 22 and 17 for the two below it,
+# 13 for body — rather than the web's 20 and 16, which at this density read as
+# a document rather than as an application. Four heading tiers at 600, four
+# body tiers at 400 and 500, and that is the whole hierarchy: a large calm
+# title, medium section headings, small muted descriptions.
 
 _FONT = {
     "display": (28, 600),
-    "h1": (20, 600),
-    "h2": (16, 600),
+    "h1": (22, 600),
+    "h2": (17, 600),
     "h3": (14, 600),
     "body": (13, 400),
     "bodyMed": (13, 500),
@@ -283,15 +324,38 @@ _FONT = {
     "mono": (12, 400),
 }
 
-# `caption` is specified with +0.4px tracking. Qt 5's stylesheet parser has no
-# `letter-spacing` property — it accepts `font`, `font-family`, `font-size`,
-# `font-style` and `font-weight` and nothing else — so the value lives here for
-# `QFont.setLetterSpacing` to apply and is not emitted into the sheet.
-TRACKING = {"caption": 0.4}
+# Tracking, in px, for the tiers that ask for it: the large sizes tighten and
+# the uppercase caption opens, which is the same shape the reference scale uses
+# and the reason a 28px title set at 0 looks loose beside 13px body. A tier that
+# is not named here is at 0. Qt 5's stylesheet parser has no `letter-spacing`
+# property — it accepts `font`, `font-family`, `font-size`, `font-style` and
+# `font-weight` and nothing else — so these live here for
+# `QFont.setLetterSpacing` to apply and are not emitted into the sheet.
+TRACKING = {"display": -0.4, "h1": -0.3, "h2": -0.2, "caption": 0.4}
 
 # Named one family at a time rather than as a CSS list where it matters: Qt 5
-# hands `font-family` to QFont::setFamily, which matches the whole string.
-_SANS = "'DM Sans', 'Segoe UI', 'Inter', sans-serif"
+# hands `font-family` to QFont::setFamily, which takes the FIRST name in the
+# list and then falls back through its own matching, not through the rest of
+# the list — the old stack led with 'DM Sans', which is on no Windows machine
+# this ships to, so every rule in the sheet asked for a font that was never
+# there and got whatever `base_font()` had already set.
+#
+# Segoe UI, and not Segoe UI Variable, which is the newer face and the closer
+# match on paper. Qt 5.15 registers one style for the variable face —
+# `QFontDatabase.styles` answers ['Regular'] — so the scale's own three weights
+# collapse into two. Measured through the sheet, at 17px, as the ink one string
+# takes: Segoe UI Variable draws `font-weight: 400` and `500` identically
+# (122091 units each) and only 600 differs (188592, and synthesised at that),
+# while Segoe UI separates all three — 121149, 162135, 209576. A hierarchy
+# carried on weight cannot be set in a face with one weight, so the hierarchy
+# chooses the face. `tests/test_theme.py` re-measures both.
+#
+# Qt maps a CSS weight to its own 0-99 scale by dividing by eight, so the 600
+# these tiers are specified at arrives as QFont::Bold and 500 as DemiBold. That
+# is the register the scale wants — a drawn semibold for emphasis, bold for the
+# heading tiers — and it is worth knowing before anyone reads 600 as semibold
+# and lowers it.
+_SANS = "'Segoe UI', 'Segoe UI Variable', sans-serif"
 _MONO = "'Cascadia Mono', 'Consolas', 'DejaVu Sans Mono', monospace"
 
 # ── Space, radius, control, motion ───────────────────────────────────────────
@@ -708,14 +772,14 @@ QPushButton:hover {
 }
 
 /* The selected ground takes the outline with it. `border.default` measures
-   1.51:1 on `surfaceActive` in dark and 1.62:1 in light, so a control that is
+   1.48:1 on `surfaceActive` in dark and 1.66:1 in light, so a control that is
    pressed or checked lost its edge at exactly the moment it was being acted on
    — and no border token can fix that, because one that clears 3:1 on the
    selected ground has to sit either three times above it (L >= 0.65, a
    near-white hairline round every control in the app) or three times below it
    (L <= 0.028, which then fails 3:1 on `surface`). What does clear it is the
-   ink the ground already carries: `text.onAccent` measures 4.52:1 on the dark
-   selection and 14.22:1 on the light one, so on this ground the edge and the
+   ink the ground already carries: `text.onAccent` measures 4.50:1 on the dark
+   selection and 13.97:1 on the light one, so on this ground the edge and the
    label are the same colour. */
 QPushButton:pressed {
     background-color: ${color.surfaceActive};
@@ -862,7 +926,7 @@ QPushButton#reveal:checked {
 }
 
 /* ── Tabs: selection is the louder signal ────────────────────────────────── */
-/* A selected tab changes ground (4.31:1 on the page in dark) and gains a 2px
+/* A selected tab changes ground (4.25:1 on the page in dark) and gains a 2px
    accent rail. The base state carries the same 1px box and the same 2px rail
    in `transparent`, so nothing moves when either mark arrives. */
 
@@ -1180,8 +1244,8 @@ QSlider::sub-page:horizontal {
 
    The ring is `accent.border` and never white: white measured 17.01:1 against a
    selected tab at 1.50:1, which is the finding this whole system exists to fix.
-   It is subordinate by measurement now — 3.70:1 on the page against a selection
-   at 4.31:1. */
+   It is subordinate by measurement now — 3.83:1 on the page against a selection
+   at 4.25:1. */
 
 QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QComboBox:focus,
 QSpinBox#spin:focus, QDoubleSpinBox#spin:focus, QDateEdit#spin:focus {
@@ -1201,14 +1265,15 @@ QPushButton#reveal:focus {
 
 /* The one button the shared ink cannot mark. `#start_btn` already rests on a
    1px `accent.border` — the rim that keeps a filled accent button findable on
-   the page, 3.70:1 in dark and 4.81:1 in light — so a ring in the same token
+   the page, 3.83:1 in dark and 5.34:1 in light — so a ring in the same token
    repainted the border in the colour it already was and changed exactly zero
    pixels. The primary action was the one control in the app with no focus
    indicator at all, which is the defect this block exists to prevent.
 
-   `accent.subtle` steps the other way instead: 2.38:1 against the fill in dark
-   and 4.73:1 in light, dark enough that it can never outrank the selection
-   beside it (1.40:1 on the page against a selection at 4.31:1) and still a
+   `accent.subtle` steps the other way instead: 2.79:1 against the fill in dark
+   and 5.14:1 in light, far enough off it that it can never be mistaken for the
+   selection beside it (1.27:1 on the page against a selection at 4.25:1) and
+   still a
    1px ring on a border that was 1px already, so no geometry moves. */
 QPushButton#start_btn:focus {
     border: 1px solid ${color.accent.subtle};
@@ -1417,7 +1482,7 @@ def base_font() -> QFont:
         size = 9 if sys.platform.startswith("win") else 10
     families = set(QFontDatabase().families())
     _BASE_FONT = QFont(system.family(), size)
-    for family in ("DM Sans", "Segoe UI", system.family()):
+    for family in ("Segoe UI", "Segoe UI Variable", system.family()):
         if family in families:
             _BASE_FONT = QFont(family, size)
             break
@@ -1429,6 +1494,17 @@ def base_font() -> QFont:
 # so a process that outlives one — the test suite does not, but a future one
 # might — cannot be handed a style belonging to an application that has gone.
 _WORN: tuple = ()
+
+
+def worn():
+    """The theme `apply()` last put on the application, or None before any.
+
+    `ui/icons.py` reads it. An icon is drawn on demand from wherever a widget
+    is built, which is nowhere near the call that chose the appearance, and the
+    alternative — handing every screen a theme so it can hand it to every icon
+    — is how a palette ends up half-applied after a switch.
+    """
+    return _WORN[2] if _WORN else None
 
 
 def apply(app: QApplication, t: Theme) -> None:

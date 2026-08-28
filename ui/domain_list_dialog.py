@@ -12,6 +12,22 @@ reached is a dialog that cannot be used.
 So it opens at a size measured off the text it holds rather than written down,
 and carries a minimum instead of a maximum. Everything it paints comes from
 `ui/theme.py` through `ui/components.py`.
+
+It is laid out the way the settings screen lays out a section, because it is
+the same kind of surface and the app should only have one of them: a title in
+the heading tier, one muted line under it saying what the box is for, the box
+itself, then a hairline and the two commands at the foot on the right. The
+window title bar says the same word as the heading and that is not a
+duplication to trim — a dialog is read from the inside out, the title bar is
+chrome the platform draws and not always where the eye lands first, and on
+macOS itself a sheet has no title bar at all. What the heading does is give the
+sentence under it something to belong to.
+
+The count at the foot is there because what this box holds and what it saves are
+not the same thing: blank lines go, and so does the space around every entry, so
+forty pasted lines is not forty searches. That difference used to be invisible
+until the scrape ran a different number of queries than the person who started
+it had counted.
 """
 
 from PyQt5.QtCore import QSize
@@ -43,6 +59,7 @@ class ListDialog(QDialog):
         self.setWindowTitle(title)
         self.setModal(True)
         self._saved: list = list(items or [])
+        self._title = title
         self._hint = hint
         self._placeholder = placeholder
         self._build()
@@ -54,22 +71,35 @@ class ListDialog(QDialog):
                                   t.space["5"])
         layout.setSpacing(t.space["3"])
 
+        head = QVBoxLayout()
+        head.setContentsMargins(t.space["0"], t.space["0"], t.space["0"],
+                                t.space["0"])
+        head.setSpacing(t.space["1"])
+        self.title_label = C.heading(self._title, "h2")
+        head.addWidget(self.title_label)
         # Through `body_label`, so the sentence is capped at the 80 characters
         # the type scale asks for instead of running the whole width of whatever
         # the dialog has been dragged to.
-        layout.addWidget(C.body_label(self._hint, tone="secondary"))
+        self.hint_label = C.body_label(self._hint, tone="secondary")
+        head.addWidget(self.hint_label)
+        layout.addLayout(head)
 
         self.text_edit = QTextEdit()
         if self._placeholder:
             self.text_edit.setPlaceholderText(self._placeholder)
         if self._saved:
             self.text_edit.setPlainText("\n".join(self._saved))
+        self.text_edit.textChanged.connect(self._recount)
         layout.addWidget(self.text_edit, stretch=1)
+
+        layout.addWidget(C.divider())
 
         row = QHBoxLayout()
         row.setContentsMargins(t.space["0"], t.space["0"], t.space["0"],
                                t.space["0"])
         row.setSpacing(t.space["2"])
+        self.count_label = C.hint("")
+        row.addWidget(self.count_label)
         row.addStretch()
         self.cancel_btn = C.button("Cancel", kind="secondary", size="md",
                                    on_click=self.reject)
@@ -78,6 +108,7 @@ class ListDialog(QDialog):
         row.addWidget(self.cancel_btn)
         row.addWidget(self.save_btn)
         layout.addLayout(row)
+        self._recount()
 
         self.resize(self._wanted())
         # A floor and no ceiling. The floor is one row of the well plus the
@@ -86,6 +117,17 @@ class ListDialog(QDialog):
         # exactly what a big screen is for.
         self.setMinimumSize(QSize(self._wanted().width() // 2,
                                   self.sizeHint().height()))
+
+    def _entries(self) -> list:
+        """The lines that will be kept, which is not the lines that were typed."""
+        return [line.strip() for line in self.text_edit.toPlainText().splitlines()
+                if line.strip()]
+
+    def _recount(self) -> None:
+        kept = len(self._entries())
+        self.count_label.setText(
+            "Nothing entered yet" if not kept else
+            "1 entry" if kept == 1 else "%d entries" % kept)
 
     def _wanted(self) -> QSize:
         """The opening size, measured in the font that is drawing the box."""
@@ -97,8 +139,7 @@ class ListDialog(QDialog):
                      self.sizeHint().height() + rows)
 
     def _save(self):
-        lines = self.text_edit.toPlainText().splitlines()
-        self._saved = [line.strip() for line in lines if line.strip()]
+        self._saved = self._entries()
         self.accept()
 
     def items(self) -> list:

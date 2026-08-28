@@ -44,6 +44,18 @@ this file now answers with:
   `theme` or `density` into settings.json was the only route and `_merge` used
   to drop them. They are controls now, and they take effect while you watch.
 
+The shape all of that is laid out in is one shape, and that is the fourth thing
+the audit measured here. It found seven left edges on the Sending tab alone —
+four of them within 30px of each other and two 4px apart in adjacent groups —
+because every group built its own geometry and sized its own label column to
+its own longest word. There is one geometry now and it is the one macOS System
+Settings uses: a section is a title and one muted line saying what it is for;
+under that are groups; a group is a caption over a box; a box is rows with a
+hairline between each pair, the label on the left and the control on the right;
+a row that needs explaining carries one quiet line under it; and a sentence
+about a whole group sits under its box rather than inside it. `_Group` below is
+all of that, and nothing on this screen lays out a row of its own.
+
 Every value this screen paints comes from `ui.theme` through `ui.components`.
 There is no hex literal, font size, spacing number or fixed height in this file
 that did not come out of a token — the one exception is the preview document,
@@ -457,17 +469,181 @@ def _row_box() -> QHBoxLayout:
 
 
 def _loose(*widgets) -> QHBoxLayout:
-    """Controls that sit in column one at their own width, not the column's.
+    """Controls that sit at the right of column one rather than filling it.
 
     A combo handed a whole stretching column becomes a 700px well holding the
-    word "Direct". This keeps the left edge — which is what the column is for —
-    and gives back the rest.
+    word "Direct", so the column gives back everything the control does not ask
+    for. The stretch goes in *front* of them, and that is the difference
+    between a form and a settings pane: a row reads as a label on the left and
+    its value on the right with the distance between them, so every value in a
+    group lines up on one right edge whether it is a dropdown, a number or a
+    row of day boxes. A field that holds a sentence — an address, a URL, a
+    model name — is added to the column directly instead and fills it, because
+    what that control is being asked for is room.
     """
     box = _row_box()
+    box.addStretch()
     for widget in widgets:
         box.addWidget(widget)
-    box.addStretch()
     return box
+
+
+# ── The register ─────────────────────────────────────────────────────────────
+# The shape of this screen, in one place, because the audit's finding about it
+# was that there were seven shapes: each group built its own geometry, sized
+# its own label column to its own longest word, and hung its own explanatory
+# line wherever the code happened to be — so no two groups agreed and adjacent
+# ones sat 4px apart on the Sending tab alone.
+#
+# One shape, and it is System Settings': a section is a title and one muted
+# line saying what it is for; under that are groups; a group is a caption over
+# a box; a box is rows with a hairline between each pair, the label on the left
+# and the control on the right; a row that needs explaining carries one quiet
+# line under it; and a sentence about the whole group sits under the box rather
+# than inside it. Nothing on this screen builds any of that itself, which is
+# what makes "one grid" a property of the file rather than a habit.
+
+
+def _measured(label: QWidget) -> QHBoxLayout:
+    """A capped label in a row of its own, so it is measured at its own width.
+
+    `ui/components.py` caps every wrapped label at the 80-character measure the
+    type scale asks for, with `setMaximumWidth`. A QVBoxLayout asks an item
+    `heightForWidth` for the width the *layout* has rather than the width the
+    item will be given, so a sentence capped at 432px inside a 990px box is
+    asked how tall it is at 990px, answers with one line, and is then drawn at
+    432px in a 17px slot with its second line cut through. Measured on the
+    Compliance tab: three switch descriptions given 16px each where the text
+    needed 33, and the dry-run paragraph given 40 where it needed 65.
+
+    A horizontal box allocates the widths first — respecting the maximum — and
+    only then asks each item how tall it is at the width it actually got, so
+    every one of them comes back with the height it will be drawn at.
+    """
+    row = _row_box()
+    row.addWidget(label)
+    row.addStretch()
+    return row
+
+
+def _page_head(title: str, description: str) -> QVBoxLayout:
+    """What this section is, and the one line saying what it is for.
+
+    `h2` and not `h1`: the shell's own header draws the screen's name at `h1`
+    directly above this, so a section titled at the same tier would read as a
+    second screen rather than as a page of the one on show.
+    """
+    t = _t()
+    head = QVBoxLayout()
+    head.setContentsMargins(t.space["0"], t.space["0"], t.space["0"],
+                            t.space["0"])
+    head.setSpacing(t.space["1"])
+    head.addWidget(C.heading(title, "h2"))
+    if description:
+        head.addLayout(_measured(C.body_label(description, tone="secondary")))
+    return head
+
+
+class _Group:
+    """One box of rows: a caption over it, hairlines in it, footnotes under it.
+
+    A caption is optional and is left off wherever it would only say the row's
+    own label back — a box holding one "Postal address" row under a caption
+    reading POSTAL ADDRESS is the same word twice in two type tiers, which
+    reads as a mistake rather than as a hierarchy.
+    """
+
+    def __init__(self, column: QVBoxLayout, title: str = "", actions=()):
+        t = _t()
+        self.box = QVBoxLayout()
+        self.box.setContentsMargins(t.space["0"], t.space["0"], t.space["0"],
+                                    t.space["0"])
+        self.box.setSpacing(t.space["2"])
+
+        self.caption = _section_label(title) if title else None
+        if title or actions:
+            head = _row_box()
+            if self.caption is not None:
+                head.addWidget(self.caption)
+            head.addStretch()
+            for action in actions:
+                head.addWidget(action)
+            self.box.addLayout(head)
+
+        self.frame = QFrame()
+        self.frame.setObjectName("card")
+        self.stack = QVBoxLayout(self.frame)
+        self.stack.setContentsMargins(t.space["4"], t.space["3"], t.space["4"],
+                                      t.space["3"])
+        self.stack.setSpacing(t.space["2"])
+        self.box.addWidget(self.frame)
+        column.addLayout(self.box)
+        self._rows = 0
+
+    def _rule(self) -> None:
+        """The hairline between two rows, and never above the first one."""
+        if self._rows:
+            self.stack.addWidget(_divider())
+        self._rows += 1
+
+    def field(self, label: str, control, note=None):
+        """One labelled row: the name on the left, the control on the right.
+
+        A grid of its own per row, which looks like the opposite of the "one
+        grid" this section is about and is what makes it true. Every row is laid
+        out on the same two columns — a `_FormLabel` reserving the widest label
+        on the screen, then whatever the control asks for — so they all line up;
+        and keeping the row's *description* out of the grid keeps the grid
+        honest. Measured: a word-wrapped label inside a QGridLayout puts that
+        layout through a height-for-width pass whose column geometry is the one
+        left in `cellRect` afterwards, so three groups on the Sending tab
+        reported column one at 187 while every other group on the screen
+        reported 204 — the same 17px stagger between adjacent groups the audit
+        found, arriving this time from Qt's own cached column data rather than
+        from the label widths.
+        """
+        self._rule()
+        grid = _form_grid()
+        grid.addWidget(_form_label(label), 0, 0)
+        if isinstance(control, QWidget):
+            grid.addWidget(control, 0, 1)
+        else:
+            grid.addLayout(control, 0, 1)
+        self.stack.addLayout(grid)
+        return self._under(note)
+
+    def wide(self, control, note=None):
+        """A row that carries its own name: a checkbox, a preview, a bar."""
+        self._rule()
+        if isinstance(control, QWidget):
+            self.stack.addWidget(control)
+        else:
+            self.stack.addLayout(control)
+        return self._under(note)
+
+    def _under(self, note):
+        """The quiet line under the row above it — a sentence, or a made label.
+
+        Full width and starting at the row's own left edge rather than under the
+        control, because it explains the row and not the value: indented to
+        column one it would read as a caption on whatever is in the box above
+        it, which for a row of seven day checkboxes is the last of the seven.
+
+        A made label because half of these are notes the screen updates and
+        hides: `_hint("")` built once and kept, so that saying nothing costs no
+        layout and nothing moves when it starts saying something.
+        """
+        if note is None or note == "":
+            return None
+        line = note if isinstance(note, QWidget) else _hint(note)
+        self.stack.addLayout(_measured(line))
+        return line
+
+    def foot(self, note):
+        """The sentence about the whole group, under the box rather than in it."""
+        line = note if isinstance(note, QWidget) else _hint(note)
+        self.box.addLayout(_measured(line))
+        return line
 
 
 def _line(placeholder: str = "") -> QLineEdit:
@@ -1313,31 +1489,24 @@ class _AccountRow(QWidget):
                                t.space["0"])
         root.setSpacing(t.space["3"])
 
-        head = QHBoxLayout()
-        head.setContentsMargins(t.space["0"], t.space["0"], t.space["0"],
-                                t.space["0"])
-        head.setSpacing(t.space["2"])
-        self.title_label = QLabel("Account %d" % index)
-        title = self.title_label
-        title.setObjectName("muted")
         self.enabled_cb = C.toggle(
             "Enabled", help="Disabled accounts stay configured but never send")
         self.remove_btn = C.button("Remove", kind="danger", size="sm",
                                    on_click=lambda: self.remove_requested.emit(self))
         self.remove_btn.setToolTip("Take this mailbox off the sending rota")
-        head.addWidget(title)
-        head.addStretch()
-        head.addWidget(self.enabled_cb)
-        head.addWidget(self.remove_btn)
-        root.addLayout(head)
 
-        grid = _form_grid()
+        # One account is one group, in the same box as every other group on
+        # this screen: its ordinal is the caption and the two commands that act
+        # on the whole mailbox sit beside it, so the card's own edge is what
+        # separates one account from the next.
+        group = _Group(root, "Account %d" % index,
+                       actions=(self.enabled_cb, self.remove_btn))
+        self.title_label = group.caption
 
         self.email_edit = QLineEdit()
         self.email_edit.setPlaceholderText("you@gmail.com")
         self.email_edit.setFixedHeight(t.control["md"])
-        grid.addWidget(_form_label("Gmail address"), 0, 0)
-        grid.addWidget(self.email_edit, 0, 1, 1, 2)
+        group.field("Gmail address", self.email_edit)
 
         self.password_field = _secret_field("16-character app password")
         self.verify_btn = C.button(
@@ -1345,26 +1514,23 @@ class _AccountRow(QWidget):
             on_click=lambda: self.verify_requested.emit(self))
         self.verify_btn.setToolTip(
             "Sign in to Gmail with these credentials without sending anything")
-        grid.addWidget(_form_label("App password"), 1, 0)
-        grid.addWidget(self.password_field, 1, 1)
-        grid.addWidget(self.verify_btn, 1, 2, Qt.AlignTop)
-
-        self.status_label = QLabel("")
+        self.status_label = _StatusNote()
         self.status_label.setObjectName("status_busy")
-        self.status_label.setWordWrap(True)
         self.status_label.hide()
-        grid.addWidget(self.status_label, 2, 1, 1, 2)
+        password_row = _row_box()
+        password_row.addWidget(self.password_field, stretch=1)
+        password_row.addWidget(self.verify_btn)
+        group.field("App password", password_row, note=self.status_label)
 
         self.display_edit = QLineEdit()
         self.display_edit.setPlaceholderText("Name recipients see, e.g. Sam Rivera")
         self.display_edit.setFixedHeight(t.control["md"])
-        grid.addWidget(_form_label("Display name"), 3, 0)
-        grid.addWidget(self.display_edit, 3, 1, 1, 2)
+        group.field("Display name", self.display_edit)
 
         caps_row = _row_box()
+        caps_row.addStretch()
         self.daily_cap_spin = _spin(1, 500, 5, "/day", chars=3)
         self.daily_cap_spin.setToolTip("This account's own ceiling; the global cap still applies")
-        caps_row.addWidget(self.daily_cap_spin)
         self.warmup_cb = C.toggle(
             "Warm up from",
             help="Ramp this account's daily volume from the warm-up start date")
@@ -1374,32 +1540,34 @@ class _AccountRow(QWidget):
         self.warmup_date.setCalendarPopup(True)
         self.warmup_date.setFixedHeight(t.control["md"])
         self.warmup_cb.toggled.connect(self.warmup_date.setEnabled)
+        caps_row.addWidget(self.daily_cap_spin)
         caps_row.addWidget(self.warmup_cb)
         caps_row.addWidget(self.warmup_date)
-        caps_row.addStretch()
-        grid.addWidget(_form_label("Daily cap"), 4, 0)
-        grid.addLayout(caps_row, 4, 1, 1, 2)
-
         # What this account will actually send today, when that is not what the
         # box above it says. The three caps compose as a minimum in
         # `core.campaign`, so an account ramping up from a warm-up date sends
         # ten while the field reads forty.
         self.effective_label = _hint("")
         self.effective_label.setVisible(False)
-        grid.addWidget(self.effective_label, 5, 1, 1, 2)
+        group.field("Daily cap", caps_row, note=self.effective_label)
 
         self.imap_cb = C.toggle(
             "Read replies and bounces on this mailbox (IMAP)",
             help="Lets the app detect replies and hard bounces on this mailbox")
-        grid.addWidget(self.imap_cb, 6, 1, 1, 2)
+        group.wide(self.imap_cb)
 
-        root.addLayout(grid)
         self._load(account or {})
         self._watch()
 
     def renumber(self, index: int) -> None:
-        """The ordinal in the heading, after a row above this one has gone."""
-        self.title_label.setText("Account %d" % index)
+        """The ordinal in the heading, after a row above this one has gone.
+
+        Upper-cased here as well as in `components.section_label`, which does it
+        once at construction: a caption renumbered through `setText` alone comes
+        back in sentence case and reads as a different tier from the caption
+        over every other group on the screen.
+        """
+        self.title_label.setText(("Account %d" % index).upper())
 
     def _watch(self) -> None:
         """One signal out for every edit anywhere in the row.
@@ -1803,8 +1971,8 @@ class SettingsScreen(QWidget):
         scroll.setWidget(page)
         return scroll
 
-    def _page(self) -> tuple:
-        """An empty page and the column its sections are added to.
+    def _page(self, title: str = "", description: str = "") -> tuple:
+        """An empty section, titled, and the column its groups are added to.
 
         The right margin is the gutter a vertical scrollbar needs: without it
         the bar is drawn over the last few pixels of every control on the page.
@@ -1815,44 +1983,27 @@ class SettingsScreen(QWidget):
         column.setContentsMargins(t.space["0"], t.space["0"], t.space["3"],
                                   t.space["0"])
         column.setSpacing(t.space["6"])
+        if title:
+            column.addLayout(_page_head(title, description))
         return page, column
-
-    @staticmethod
-    def _section(column: QVBoxLayout, title: str) -> QVBoxLayout:
-        """One titled group, on the one spacing every other group uses."""
-        t = _t()
-        box = QVBoxLayout()
-        box.setContentsMargins(t.space["0"], t.space["0"], t.space["0"],
-                               t.space["0"])
-        box.setSpacing(t.space["2"])
-        box.addWidget(_section_label(title))
-        column.addLayout(box)
-        return box
-
-    @staticmethod
-    def _field(grid: QGridLayout, row: int, label: str, control) -> int:
-        """One labelled row of a form, on the geometry every form here shares."""
-        grid.addWidget(_form_label(label), row, 0)
-        if isinstance(control, QWidget):
-            grid.addWidget(control, row, 1)
-        else:
-            grid.addLayout(control, row, 1)
-        return row + 1
 
     # ── AI ───────────────────────────────────────────────────────────────────
 
     def _build_ai_page(self) -> QWidget:
-        page, column = self._page()
+        page, column = self._page(
+            "AI",
+            "What the model is allowed to write into an email, and what it is "
+            "allowed to spend doing it.")
 
-        provider = self._section(column, "Provider")
-        grid = _form_grid()
+        # No caption on this one: the box holds a single row already labelled
+        # Provider, and PROVIDER over "Provider" is one word in two tiers.
+        provider = _Group(column)
         self.provider_combo = _combo(PROVIDERS)
-        self._field(grid, 0, "Provider", _loose(self.provider_combo))
-        provider.addLayout(grid)
-        provider.addWidget(_hint(
+        provider.field("Provider", _loose(self.provider_combo))
+        provider.foot(
             "The model writes one subject line, one opener and one PS per lead. "
             "With the provider off, emails still send using the plain templates."
-        ))
+        )
 
         self.groq_key, self.groq_model, self.groq_status = self._provider_block(
             column, "Groq", "gsk_…", "llama-3.3-70b-versatile", "groq")
@@ -1863,26 +2014,22 @@ class SettingsScreen(QWidget):
             "meta-llama/llama-3.3-70b-instruct", "openrouter")
         self.openrouter_key.editingFinished.connect(self._fetch_openrouter_models)
 
-        budget = self._section(column, "Token budget")
-        grid = _form_grid()
+        budget = _Group(column, "Token budget")
         self.tokens_per_lead_spin = _spin(60, 600, 10, "", 3)
         self.monthly_cap_spin = _spin(0, 100_000_000, 100_000, "", 9)
-        row = self._field(grid, 0, "Max tokens per lead",
-                          _loose(self.tokens_per_lead_spin))
-        self._field(grid, row, "Monthly token cap", _loose(self.monthly_cap_spin))
-        budget.addLayout(grid)
+        budget.field("Max tokens per lead", _loose(self.tokens_per_lead_spin))
+        budget.field("Monthly token cap", _loose(self.monthly_cap_spin))
 
         self.budget_bar = QProgressBar()
         self.budget_bar.setObjectName("budget_bar")
         self.budget_bar.setTextVisible(False)
-        budget.addWidget(self.budget_bar)
         self.budget_label = QLabel("")
         self.budget_label.setObjectName("muted")
-        budget.addWidget(self.budget_label)
-        budget.addWidget(_hint(
+        budget.wide(self.budget_bar, note=self.budget_label)
+        budget.foot(
             "Answers are cached per business, so re-running the same leads costs "
             "nothing. When the cap is spent the plain templates take over."
-        ))
+        )
 
         column.addStretch()
         return page
@@ -1890,9 +2037,6 @@ class SettingsScreen(QWidget):
     def _provider_block(self, column: QVBoxLayout, name: str,
                         key_placeholder: str, model_placeholder: str,
                         provider: str):
-        box = self._section(column, name)
-        grid = _form_grid()
-
         key_field = _secret_field(key_placeholder)
         test_btn = C.button("Test", kind="secondary", size="md")
         test_btn.setToolTip(
@@ -1905,10 +2049,18 @@ class SettingsScreen(QWidget):
         key_row = _row_box()
         key_row.addWidget(key_field, stretch=1)
         key_row.addWidget(test_btn)
-        row = self._field(grid, 0, "API key", key_row)
-        grid.addWidget(status, row, 1)
-        self._field(grid, row + 1, "Model", model_edit)
-        box.addLayout(grid)
+
+        group = _Group(column, name)
+        # The result of Test is a note about the key above it and not about the
+        # provider, so it sits under that row rather than at the foot of the box
+        # where it would be reporting on the model line as well.
+        group.field("API key", key_row, note=status)
+        # Filling the column rather than hugging the right edge: this dropdown
+        # is editable and what gets typed into it is
+        # `meta-llama/llama-3.3-70b-instruct`, so what it is being asked for is
+        # room. The timezone box next door is editable too and does hug the
+        # right, because the longest thing it ever holds is `America/Vancouver`.
+        group.field("Model", model_edit)
 
         test_btn.clicked.connect(
             lambda: self._test_provider(provider, key_field, model_edit,
@@ -1918,10 +2070,11 @@ class SettingsScreen(QWidget):
     # ── Sender profile ───────────────────────────────────────────────────────
 
     def _build_sender_page(self) -> QWidget:
-        page, column = self._page()
+        page, column = self._page(
+            "Sender",
+            "Who every email is from, and the lines each one signs off with.")
 
-        identity = self._section(column, "Identity")
-        grid = _form_grid()
+        identity = _Group(column, "Identity")
         self.profile_edits: dict[str, QLineEdit] = {}
         rows = (
             ("company", "Company", "Auto Army"),
@@ -1932,35 +2085,43 @@ class SettingsScreen(QWidget):
             ("phone", "Phone", "Optional, shown in the footer"),
             ("calendar_link", "Calendar link", "The one link every first-touch email carries"),
         )
-        for row, (key, label, placeholder) in enumerate(rows):
+        for key, label, placeholder in rows:
             edit = _line(placeholder)
             self.profile_edits[key] = edit
-            self._field(grid, row, label, edit)
-        identity.addLayout(grid)
+            identity.field(label, edit)
 
-        postal = self._section(column, "Postal address")
-        grid = _form_grid()
+        postal = _Group(column)
         self.postal_edit = QTextEdit()
         self.postal_edit.setPlaceholderText(
             "Street, city, region, postal code, country")
         self.postal_edit.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.postal_edit.document().contentsChanged.connect(self._fit_postal_box)
         self._fit_postal_box()
-        self._field(grid, 0, "Postal address", self.postal_edit)
-        postal.addLayout(grid)
-        postal.addWidget(_hint(
+        postal.field("Postal address", self.postal_edit)
+        postal.foot(
             "Legally required in the footer of every commercial email. Campaigns "
             "check for it before sending unless you switch that check off under "
             "Compliance."
-        ))
+        )
 
-        tone = self._section(column, "Tone")
-        grid = _form_grid()
+        tone = _Group(column)
         self.tone_combo = _combo(TONES)
-        self._field(grid, 0, "Tone", _loose(self.tone_combo))
-        tone.addLayout(grid)
+        tone.field("Tone", _loose(self.tone_combo))
 
-        services = self._section(column, "Services you sell")
+        services = _Group(column)
+        self.services_list = QListWidget()
+        self.services_list.setObjectName("service_list")
+        self.services_list.setMinimumHeight(6 * _t().control["row"])
+        # A list of editable things should answer a double-click. Renaming is
+        # the only edit a service has, and it is refused with a reason on the
+        # shipped ones rather than silently doing nothing.
+        self.services_list.itemDoubleClicked.connect(
+            lambda _item: self._rename_service())
+        services.field("Services you sell", self.services_list)
+
+        # Under the list and inside the box, which is where a list's own
+        # commands go: above it they read as commands on the group, and the
+        # group is the sender profile rather than the catalogue.
         head = _row_box()
         head.addStretch()
         head.addWidget(C.button("Add service", kind="secondary", size="sm",
@@ -1975,33 +2136,20 @@ class SettingsScreen(QWidget):
             head.addWidget(C.button(
                 text, kind="secondary", size="sm",
                 on_click=lambda state=checked: self._set_all_services(state)))
-        services.addLayout(head)
-        grid = _form_grid()
-        self.services_list = QListWidget()
-        self.services_list.setObjectName("service_list")
-        self.services_list.setMinimumHeight(6 * _t().control["row"])
-        # A list of editable things should answer a double-click. Renaming is
-        # the only edit a service has, and it is refused with a reason on the
-        # shipped ones rather than silently doing nothing.
-        self.services_list.itemDoubleClicked.connect(
-            lambda _item: self._rename_service())
-        self._field(grid, 0, "Services you sell", self.services_list)
-        services.addLayout(grid)
-        services.addWidget(_hint(
+        services.wide(head)
+        services.foot(
             "Only the ticked services are ever offered in an email, and always "
             "in this exact wording. Add your own with Add service; the ones you "
             "add can be renamed and removed. The shipped ones can be unticked."
-        ))
+        )
 
-        proof = self._section(column, "Proof points")
-        grid = _form_grid()
+        proof = _Group(column)
         self.proof_edit = QTextEdit()
         self.proof_edit.setFixedHeight(3 * _t().control["row"])
         self.proof_edit.setPlaceholderText(
             "One per line, e.g. cut a roofing client's quote turnaround from 2 "
             "days to 20 minutes")
-        self._field(grid, 0, "Proof points", self.proof_edit)
-        proof.addLayout(grid)
+        proof.field("Proof points", self.proof_edit)
 
         column.addStretch()
         return page
@@ -2046,10 +2194,25 @@ class SettingsScreen(QWidget):
     def _build_templates_page(self) -> QWidget:
         t = _t()
         page = QWidget()
-        columns = QHBoxLayout(page)
+        stack = QVBoxLayout(page)
+        stack.setContentsMargins(t.space["0"], t.space["0"], t.space["0"],
+                                 t.space["0"])
+        stack.setSpacing(t.space["3"])
+        # The one section titled without a line under it, and the line costs
+        # exactly what it is worth: measured at the 880x620 window minimum, the
+        # editor column has 246px of viewport with the title alone and 223 with
+        # the line as well, against a BODY label whose bottom edge sits at 233 —
+        # so the sentence explaining this page is paid for by slicing through
+        # the label of the box the page is for. That was a defect once already
+        # and it is not worth buying back. The four column captions and the
+        # preview say what this section is; the title says which section it is.
+        stack.addLayout(_page_head("Templates", ""))
+
+        columns = QHBoxLayout()
         columns.setContentsMargins(t.space["0"], t.space["0"], t.space["0"],
                                    t.space["0"])
         columns.setSpacing(t.space["4"])
+        stack.addLayout(columns, stretch=1)
         columns.addWidget(self._build_template_list_column())
 
         editor = QWidget()
@@ -2856,7 +3019,11 @@ class SettingsScreen(QWidget):
         column = QVBoxLayout(page)
         column.setContentsMargins(t.space["0"], t.space["0"], t.space["0"],
                                   t.space["0"])
-        column.setSpacing(t.space["2"])
+        column.setSpacing(t.space["3"])
+        column.addLayout(_page_head(
+            "Gmail",
+            "The mailboxes that do the sending, and what each of them is "
+            "allowed to send."))
 
         head = _row_box()
         head.addWidget(_section_label("Sending accounts"))
@@ -2866,7 +3033,7 @@ class SettingsScreen(QWidget):
         self.add_account_btn.setToolTip("Put another Gmail mailbox on the rota")
         head.addWidget(self.add_account_btn)
         column.addLayout(head)
-        column.addWidget(_hint(APP_PASSWORD_HINT))
+        column.addLayout(_measured(_hint(APP_PASSWORD_HINT)))
 
         body = QWidget()
         wrap = QVBoxLayout(body)
@@ -2881,24 +3048,27 @@ class SettingsScreen(QWidget):
 
         self.no_accounts_label = C.body_label(
             "No sending accounts yet — add one to send anything.")
-        wrap.addWidget(self.no_accounts_label)
+        wrap.addLayout(_measured(self.no_accounts_label))
         wrap.addStretch()
         column.addWidget(self._scrolled(body), stretch=1)
 
-        column.addWidget(_hint(
+        column.addLayout(_measured(_hint(
             "Several accounts spread the volume and keep any one mailbox under "
             "Gmail's limits. Verify each one before the first campaign."
-        ))
+        )))
         return page
 
     # ── Sending schedule ─────────────────────────────────────────────────────
 
     def _build_sending_page(self) -> QWidget:
-        page, column = self._page()
+        page, column = self._page(
+            "Sending",
+            "When mail goes out, how fast it goes, and how much of it any one "
+            "day carries.")
 
-        days = self._section(column, "Days")
-        grid = _form_grid()
+        days = _Group(column)
         days_row = _row_box()
+        days_row.addStretch()
         self.day_boxes: list[QCheckBox] = []
         for name in DAY_NAMES:
             box = QCheckBox(name)
@@ -2906,15 +3076,11 @@ class SettingsScreen(QWidget):
             box.toggled.connect(lambda _on: self._refresh_schedule_notes())
             self.day_boxes.append(box)
             days_row.addWidget(box)
-        days_row.addStretch()
-        self._field(grid, 0, "Sending days", days_row)
-        days.addLayout(grid)
         self.days_note = _hint("")
         self.days_note.setVisible(False)
-        days.addWidget(self.days_note)
+        days.field("Sending days", days_row, note=self.days_note)
 
-        window = self._section(column, "Window")
-        grid = _form_grid()
+        window = _Group(column, "Window")
         self.start_hour_spin = _spin(0, 23, 1, ":00", 2)
         self.end_hour_spin = _spin(1, 24, 1, ":00", 2)
         self.timezone_combo = QComboBox()
@@ -2922,97 +3088,87 @@ class SettingsScreen(QWidget):
         self.timezone_combo.setFixedHeight(_t().control["md"])
         self.timezone_combo.addItems(list(COMMON_ZONES))
         hours_row = _row_box()
+        hours_row.addStretch()
         hours_row.addWidget(self.start_hour_spin)
         hours_row.addWidget(QLabel("to"))
         hours_row.addWidget(self.end_hour_spin)
-        hours_row.addStretch()
-        row = self._field(grid, 0, "Sending window", hours_row)
-        self._field(grid, row, "Timezone", _loose(self.timezone_combo))
-        window.addLayout(grid)
-        for spin in (self.start_hour_spin, self.end_hour_spin):
-            spin.valueChanged.connect(lambda _value: self._refresh_schedule_notes())
         self.window_note = _hint("")
         self.window_note.setVisible(False)
-        window.addWidget(self.window_note)
-        window.addWidget(_hint(
-            "Local time unless you name an IANA zone. Naming one sends at those "
-            "hours in the customer's day rather than in yours."
-        ))
+        # Each note under the row it is about rather than at the foot of the
+        # box: the window is composed by one rule and the zone resolved by
+        # another, and a stack of three sentences under two controls says
+        # nothing about which sentence answers which.
+        window.field("Sending window", hours_row, note=self.window_note)
         self.timezone_note = _hint("")
         self.timezone_note.setVisible(False)
-        window.addWidget(self.timezone_note)
+        window.field("Timezone", _loose(self.timezone_combo),
+                     note=self.timezone_note)
+        for spin in (self.start_hour_spin, self.end_hour_spin):
+            spin.valueChanged.connect(lambda _value: self._refresh_schedule_notes())
+        window.foot(
+            "Local time unless you name an IANA zone. Naming one sends at those "
+            "hours in the customer's day rather than in yours."
+        )
         self.timezone_combo.currentTextChanged.connect(self._refresh_timezone_note)
 
-        pacing = self._section(column, "Pacing")
-        grid = _form_grid()
+        pacing = _Group(column, "Pacing")
         self.min_gap_spin = _spin(5, 7200, 15, " s", 4)
         self.max_gap_spin = _spin(5, 7200, 15, " s", 4)
         self.daily_cap_spin = _spin(1, 500, 5, "", 3)
         self.hourly_cap_spin = _spin(1, 200, 1, "", 3)
-        row = 0
-        for label, widget in (
-                ("Minimum gap between sends", self.min_gap_spin),
-                ("Maximum gap between sends", self.max_gap_spin),
-                ("Daily cap per account", self.daily_cap_spin),
-                ("Hourly cap per account", self.hourly_cap_spin)):
-            row = self._field(grid, row, label, _loose(widget))
-            widget.valueChanged.connect(
-                lambda _value: self._refresh_schedule_notes())
-        pacing.addLayout(grid)
         self.gap_note = _hint("")
         self.gap_note.setVisible(False)
-        pacing.addWidget(self.gap_note)
         self.cap_note = _hint("")
         self.cap_note.setVisible(False)
-        pacing.addWidget(self.cap_note)
-        pacing.addWidget(_hint(
+        for label, widget, note in (
+                ("Minimum gap between sends", self.min_gap_spin, None),
+                ("Maximum gap between sends", self.max_gap_spin, self.gap_note),
+                ("Daily cap per account", self.daily_cap_spin, self.cap_note),
+                ("Hourly cap per account", self.hourly_cap_spin, None)):
+            pacing.field(label, _loose(widget), note=note)
+            widget.valueChanged.connect(
+                lambda _value: self._refresh_schedule_notes())
+        pacing.foot(
             "Each gap is picked at random inside the range. A fixed interval is "
             "the clearest automation fingerprint a filter can look for."
-        ))
+        )
 
-        warm = self._section(column, "Warm-up")
+        warm = _Group(column, "Warm-up")
         self.warmup_cb = C.toggle(
             "Ramp new accounts up gradually",
             help="The ramp starts from each account's own warm-up date")
         self.warmup_cb.toggled.connect(lambda _on: self._refresh_schedule_notes())
-        warm.addWidget(self.warmup_cb)
-        grid = _form_grid()
+        warm.wide(self.warmup_cb, note=self.warmup_cb.help_label)
         self.warmup_start_spin = _spin(1, 200, 1, "/day", 3)
         self.warmup_step_spin = _spin(1, 100, 1, "/day", 3)
         self.warmup_max_spin = _spin(1, 500, 5, "/day", 3)
-        row = 0
         for label, widget in (("Start at", self.warmup_start_spin),
                               ("Increase each day by", self.warmup_step_spin),
                               ("Stop increasing at", self.warmup_max_spin)):
-            row = self._field(grid, row, label, _loose(widget))
+            warm.field(label, _loose(widget))
             widget.valueChanged.connect(
                 lambda _value: self._refresh_schedule_notes())
-        warm.addLayout(grid)
-        warm.addWidget(_hint(
+        warm.foot(
             "A brand-new Gmail account that sends 40 cold emails on day one gets "
             "throttled or suspended. The ramp starts from each account's warm-up "
             "date."
-        ))
+        )
 
-        follow = self._section(column, "Follow-ups")
+        follow = _Group(column, "Follow-ups")
         self.followup_cb = C.toggle(
             "Send follow-ups when nobody replies",
             help="A reply, a bounce or an unsubscribe cancels the rest")
-        follow.addWidget(self.followup_cb)
-        grid = _form_grid()
+        follow.wide(self.followup_cb, note=self.followup_cb.help_label)
         self.followup_gap_spin = _spin(1, 60, 1, " days", 2)
         self.followup_steps_spin = _spin(0, 5, 1, "", 2)
-        row = self._field(grid, 0, "Wait between touches",
-                          _loose(self.followup_gap_spin))
-        self._field(grid, row, "Follow-ups per lead",
-                    _loose(self.followup_steps_spin))
-        follow.addLayout(grid)
-        follow.addWidget(_hint(
+        follow.field("Wait between touches", _loose(self.followup_gap_spin))
+        follow.field("Follow-ups per lead", _loose(self.followup_steps_spin))
+        follow.foot(
             "The wait is a floor, not an exact gap: a follow-up is placed no "
             "sooner than this, then queued behind whatever the day's caps and "
             "sending window allow, so on a long list it usually lands later than "
             "the number above."
-        ))
+        )
 
         column.addStretch()
         return page
@@ -3069,25 +3225,21 @@ class SettingsScreen(QWidget):
     # ── Compliance ───────────────────────────────────────────────────────────
 
     def _build_compliance_page(self) -> QWidget:
-        page, column = self._page()
+        page, column = self._page(
+            "Compliance",
+            "What every email is required to carry, and the switch that decides "
+            "whether any of it is really sent.")
 
-        unsub = self._section(column, "Unsubscribe")
-        grid = _form_grid()
+        unsub = _Group(column)
         self.unsubscribe_edit = _line("unsubscribe@yourdomain.com")
-        self._field(grid, 0, "Unsubscribe address", self.unsubscribe_edit)
-        unsub.addLayout(grid)
-        unsub.addWidget(_hint(
+        unsub.field("Unsubscribe address", self.unsubscribe_edit)
+        unsub.foot(
             "Blank uses the sending account's own address. Every email carries a "
             "List-Unsubscribe header, and an unsubscribe cancels that lead's "
             "queued follow-ups."
-        ))
+        )
 
-        carried = self._section(column, "What every email carries")
-        carried.addWidget(_hint(
-            "All three are on because they are what keeps mail out of the spam "
-            "folder. Each one can be switched off, and each one says what that "
-            "costs."
-        ))
+        carried = _Group(column, "What every email carries")
         self.append_unsubscribe_cb = self._guard_toggle(
             carried, "Append the unsubscribe line",
             "Off means a recipient has no way to opt out. That is what gets a "
@@ -3102,28 +3254,32 @@ class SettingsScreen(QWidget):
             carried, "Require a complete sender profile before sending",
             "Off lets a campaign start with your name, your address or a verified "
             "sending account missing, at your own risk.")
+        carried.foot(
+            "All three are on because they are what keeps mail out of the spam "
+            "folder. Each one can be switched off, and each one says what that "
+            "costs."
+        )
 
-        rehearsal = self._section(column, "Dry run")
+        rehearsal = _Group(column, "Dry run")
         self.dry_run_cb = QCheckBox(
             "Dry run — build and log every email, send none")
         self.dry_run_cb.setCursor(Qt.PointingHandCursor)
         self.dry_run_cb.toggled.connect(self._on_dry_run_toggled)
-        rehearsal.addWidget(self.dry_run_cb)
         self.live_warning = C.body_label(
             "LIVE SENDING IS ON. Starting a campaign will deliver real email to "
             "real businesses from your Gmail account.", tone="danger")
-        rehearsal.addWidget(self.live_warning)
-        rehearsal.addWidget(_hint(
+        rehearsal.wide(self.dry_run_cb, note=self.live_warning)
+        rehearsal.foot(
             "A dry run walks the whole schedule and renders every message, but "
             "opens no SMTP connection and spends none of the day's quota. The "
             "queue goes back exactly as it was, so the campaign is still ready "
             "to send for real afterwards. Use it once before any new campaign."
-        ))
+        )
 
         column.addStretch()
         return page
 
-    def _guard_toggle(self, box: QVBoxLayout, label: str, cost: str) -> QCheckBox:
+    def _guard_toggle(self, group: _Group, label: str, cost: str) -> QCheckBox:
         """One protection, on by default, with the price of turning it off under it.
 
         The user asked not to be blocked and that is what these are: switches,
@@ -3134,9 +3290,7 @@ class SettingsScreen(QWidget):
         toggle = C.toggle(label, help=cost)
         toggle.setChecked(True)
         toggle.toggled.connect(lambda _on: self._schedule_template_preview())
-        box.addWidget(toggle)
-        if toggle.help_label is not None:
-            box.addWidget(toggle.help_label)
+        group.wide(toggle, note=toggle.help_label)
         return toggle
 
     # ── Appearance ───────────────────────────────────────────────────────────
@@ -3152,32 +3306,31 @@ class SettingsScreen(QWidget):
         density is chosen by is what it does to a table row, which is on this
         page under them.
         """
-        page, column = self._page()
+        page, column = self._page(
+            "Appearance",
+            "How this app looks. Both controls take effect while you watch.")
 
-        look = self._section(column, "Look")
-        grid = _form_grid()
+        look = _Group(column, "Look")
         self.theme_combo = _combo(THEME_CHOICES)
         self.density_combo = _combo(DENSITY_CHOICES)
-        row = self._field(grid, 0, "Theme", _loose(self.theme_combo))
-        self._field(grid, row, "Density", _loose(self.density_combo))
-        look.addLayout(grid)
+        look.field("Theme", _loose(self.theme_combo))
+        look.field("Density", _loose(self.density_combo))
         for combo in (self.theme_combo, self.density_combo):
             combo.currentIndexChanged.connect(
                 lambda _index: self._on_appearance_picked())
-        look.addWidget(_hint(
+        look.foot(
             "Both apply as you pick them. Save writes the choice to your "
             "settings file so the app opens in it next time."
-        ))
+        )
 
-        preview = self._section(column, "What density does to a row")
+        preview = _Group(column, "What density does to a row")
         self.density_preview_box = QVBoxLayout()
         self.density_preview_box.setContentsMargins(
             _t().space["0"], _t().space["0"], _t().space["0"], _t().space["0"])
         self.density_preview_box.setSpacing(_t().space["2"])
         self.density_preview = None
-        preview.addLayout(self.density_preview_box)
         self.density_note = _hint("")
-        preview.addWidget(self.density_note)
+        preview.wide(self.density_preview_box, note=self.density_note)
         self._rebuild_density_preview()
 
         column.addStretch()
@@ -3615,11 +3768,16 @@ class SettingsScreen(QWidget):
         self._relist_accounts()
 
     def _relist_accounts(self) -> None:
-        """Put the rows back in the column with a rule between each pair.
+        """Put the rows back in the column, renumbered from the top.
 
-        Rebuilt from `_account_rows` rather than edited in place: the dividers
-        are interleaved and the titles are ordinals, so an insert or a removal
-        anywhere but the end leaves both wrong.
+        Rebuilt from `_account_rows` rather than edited in place: the titles are
+        ordinals, so an insert or a removal anywhere but the end leaves every
+        heading below it wrong.
+
+        No rule between them any more. Each account is a box of its own now, so
+        a hairline in the gap is a line between two things that already have
+        edges — the same mark the app uses *inside* a box to separate two rows,
+        spent outside one to separate two boxes.
         """
         while self.accounts_box.count():
             item = self.accounts_box.takeAt(0)
@@ -3629,8 +3787,6 @@ class SettingsScreen(QWidget):
                 if not isinstance(widget, _AccountRow):
                     widget.deleteLater()
         for index, row in enumerate(self._account_rows):
-            if index:
-                self.accounts_box.addWidget(_divider())
             row.renumber(index + 1)
             self.accounts_box.addWidget(row)
             row.show()

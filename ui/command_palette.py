@@ -33,19 +33,45 @@ Matching is a subsequence rather than a substring: "prep" finds Prepare
 campaign, and "gto" finds Go to Outreach. Ranking prefers matches that start a
 word and matches that run together, so the command the user is thinking of is
 the one already selected when they stop typing.
+
+The shape is the one Spotlight and Raycast settled on and it is three
+decisions, each answering something a flat list of names does badly:
+
+* **A query field that is the largest thing in the panel**, flush to the top
+  edge with a rule under it rather than floating inside a padded box. It is the
+  only control here, the caret is already in it, and everything below it is a
+  consequence of what is typed into it — so it reads as the surface rather than
+  as a widget on the surface.
+* **Headings over runs of rows.** Forty-odd commands in one column is a list to
+  read; the same forty under "Destination", "Section" and "Actions" is a list to
+  scan. A heading is not a row: it takes no selection, and the arrow keys step
+  straight past it, so the keyboard never lands anywhere Return would do
+  nothing.
+* **A mark on every row.** A column of identical text is told apart only by
+  reading it, which is what a palette exists to avoid — the eye should reach
+  Start sending by its shape before it has finished reading "Start".
+
+There is no drop shadow under the card and that is deliberate rather than
+missed. Depth here is already carried by the scrim: the panel sits on 55–66%
+black over the whole window in both palettes, which separates it from the page
+by more than a shadow could add — and a black shadow cast onto a black wash is
+a blur nobody can see, re-rendered through a graphics effect every time the
+list changes height, which is every keystroke.
 """
 
 from dataclasses import dataclass
 from typing import Callable, Optional
 
 from PyQt5.QtCore import QEvent, QRect, QSize, Qt
-from PyQt5.QtGui import QColor
+from PyQt5.QtGui import QColor, QFont
 from PyQt5.QtWidgets import (
     QFrame, QListWidget, QListWidgetItem, QStyle, QStyledItemDelegate,
     QVBoxLayout, QWidget,
 )
 
 from ui import components as C
+from ui import icons as I
+from ui import theme as _theme
 
 # The palette in the two units it is actually being asked for: how long a
 # command name is, and how many of them are worth showing before the list is a
@@ -59,6 +85,59 @@ COLUMNS, ROWS = 54, 8
 # Outreach" for the query "out", where a plain count of hits ties them.
 _HIT, _RUN, _WORD = 1, 3, 5
 
+# Where a command goes when its `where` is its own label rather than a place.
+# The shell writes the control's own wording into `where` — "Start rehearsal",
+# "Audit 40 leads" — which is worth showing on the row and is not a heading,
+# because a heading with one row under it is a row with a title on it.
+OTHER = "Actions"
+
+# The mark a row wears, read off the verb the shell already wrote into its
+# name. Read off the name and not handed down from the shell because the seam
+# is the whole point of this file: a screen contributes a command without this
+# module importing one, so it contributes a *sentence*, and the sentence is
+# what there is to go on. Ordered, first hit wins, so the narrower pairs sit
+# above the wider ones: "go back" before "go to", and "start" above "scrap" so
+# that "Scrape — Start scraping" is a run rather than a search.
+_MARKS = (
+    ("go back", "chevron-left"),
+    ("go to", "chevron-right"),
+    ("dry run", "eye"),
+    ("sidebar", "columns"),
+    ("theme", "eye"),
+    ("density", "table"),
+    ("settings", "gear"),
+    ("prepare", "check"),
+    ("start", "play"),
+    ("pause", "pause"),
+    ("stop", "stop"),
+    ("audit", "search"),
+    ("scrap", "search"),
+    ("export", "document"),
+    ("copy", "copy"),
+    ("suppress", "minus"),
+    ("template", "document"),
+    ("save", "check"),
+    ("discard", "reset"),
+    ("send", "send"),
+    ("mail", "mail"),
+    ("account", "person"),
+    ("stats", "chart"),
+    ("compose", "pencil"),
+    ("lead", "table"),
+)
+
+# What a row wears when nothing in its name is recognised. A command is a thing
+# to go and do, so the default is the mark that says "this leads somewhere"
+# rather than a mark that claims to know what kind of thing it is.
+_DEFAULT_MARK = "chevron-right"
+
+# The three moves that drive the whole surface, said in words rather than in
+# arrow and return glyphs. Those arrive from the text font, ignore the icon
+# set's weight and the palette's ink, and are missing outright from some of the
+# faces Windows will substitute — which is a footer that reads as three empty
+# boxes on exactly the machine least able to explain why.
+KEYS = "Arrows move · Return runs · Escape closes"
+
 
 # ── What a command is ────────────────────────────────────────────────────────
 
@@ -71,6 +150,10 @@ class Command:
     the palette is closed — a send starts, a selection empties, a campaign is
     prepared — and a flag captured at registration would be a lie by the time
     anybody read it.
+
+    `group` and `icon` are both optional and both have an answer when they are
+    left out, which is what keeps every existing caller a caller: the heading
+    falls back to `where` and the mark is read off the name.
     """
 
     key: str
@@ -79,6 +162,8 @@ class Command:
     where: str = ""
     shortcut: str = ""
     available: Optional[Callable[[], bool]] = None
+    group: str = ""
+    icon: str = ""
 
     def enabled(self) -> bool:
         if self.available is None:
@@ -91,6 +176,43 @@ class Command:
     def hint(self) -> str:
         """The right-hand column: the key that also does this, or its home."""
         return self.shortcut or self.where
+
+    def mark(self) -> str:
+        """The icon on the left: the one it was given, or the one it earns."""
+        if self.icon in I.ICONS:
+            return self.icon
+        name = self.title.lower()
+        for word, drawn in _MARKS:
+            if word in name:
+                return drawn
+        return _DEFAULT_MARK
+
+
+def headings(commands) -> dict:
+    """Which heading each command sits under, decided over the whole list.
+
+    A `where` two or more commands share is a place — Destination, Section,
+    Appearance — and earns a heading. A `where` only one command has is not a
+    place at all: the shell writes a screen's own control label in there, so
+    "Start rehearsal" is that row's right-hand column and never a group of one.
+
+    Decided over everything registered rather than over what a query left
+    standing, so a heading does not change under the reader as they type: with
+    the count taken from the matches, typing four letters until one destination
+    is left would move that destination out of Destination and into Actions.
+    """
+    shared: dict = {}
+    for command in commands:
+        shared[command.where] = shared.get(command.where, 0) + 1
+    named = {}
+    for command in commands:
+        if command.group:
+            named[command.key] = command.group
+        elif command.where and shared.get(command.where, 0) > 1:
+            named[command.key] = command.where
+        else:
+            named[command.key] = OTHER
+    return named
 
 
 def score(query: str, title: str):
@@ -142,14 +264,32 @@ def rank(commands, query: str) -> list:
 
 # ── The row ──────────────────────────────────────────────────────────────────
 
+# What each row carries beyond its name. Named rather than written as
+# `Qt.UserRole + 2` at the two ends of the file, because a delegate reading one
+# role and a list writing another is a bug that renders as an empty column.
+HINT, LIVE, HEADING, MARK = (Qt.UserRole, Qt.UserRole + 1,
+                             Qt.UserRole + 2, Qt.UserRole + 3)
+
+# Qt 5's QFont weight runs 0-99 and the type scale is written in CSS weights,
+# which is the scale the generated sheet speaks. Its parser converts one to the
+# other by dividing by eight, so a delegate — which paints with a QFont and has
+# no sheet to hand a rule to — converts the same way, and a heading painted here
+# comes out the weight a `components.section_label` comes out beside it.
+_CSS_TO_QT = 8
+
+
+def _qt_weight(css) -> int:
+    return max(0, min(99, int(css) // _CSS_TO_QT))
+
 
 class _CommandRow(QStyledItemDelegate):
-    """Two columns in one row: what it is called, and how else to reach it.
+    """A heading, or a mark and two columns: what it is called and how else to
+    reach it.
 
     Painted rather than laid out. A row per command built from labels is eight
     widgets each, rebuilt on every keystroke of the query, and the second column
     has to right-align against a list whose width the sheet decides; a delegate
-    draws both columns in one pass and costs nothing to redraw.
+    draws every column in one pass and costs nothing to redraw.
     """
 
     def __init__(self, t, parent=None):
@@ -157,16 +297,40 @@ class _CommandRow(QStyledItemDelegate):
         self._theme = t
 
     def sizeHint(self, option, index) -> QSize:
-        return QSize(option.rect.width(), self._theme.control["row"])
+        t = self._theme
+        tall = t.control["xs"] if index.data(HEADING) else t.control["row"]
+        return QSize(option.rect.width(), tall)
 
     def paint(self, painter, option, index) -> None:
+        painter.save()
+        if index.data(HEADING):
+            self._heading(painter, option, index)
+        else:
+            self._command(painter, option, index)
+        painter.restore()
+
+    def _heading(self, painter, option, index) -> None:
+        """The caption over a run of rows, in the app's own section register."""
+        t = self._theme
+        size, weight = t.font["caption"]
+        font = QFont(option.font)
+        font.setPixelSize(size)
+        font.setWeight(_qt_weight(weight))
+        font.setLetterSpacing(QFont.AbsoluteSpacing, _theme.TRACKING["caption"])
+        painter.setFont(font)
+        painter.setPen(QColor(t.color["text.tertiary"]))
+        box = option.rect.adjusted(t.space["3"], t.space["0"],
+                                   -t.space["3"], t.space["0"])
+        painter.drawText(box, Qt.AlignLeft | Qt.AlignBottom,
+                         str(index.data(Qt.DisplayRole) or "").upper())
+
+    def _command(self, painter, option, index) -> None:
         t = self._theme
         title = index.data(Qt.DisplayRole) or ""
-        hint = index.data(Qt.UserRole) or ""
-        live = bool(index.data(Qt.UserRole + 1))
+        hint = index.data(HINT) or ""
+        live = bool(index.data(LIVE))
         chosen = bool(option.state & QStyle.State_Selected) and live
 
-        painter.save()
         if chosen:
             painter.fillRect(option.rect, QColor(t.color["surfaceActive"]))
             # The same rail a selected row wears everywhere else in the app,
@@ -176,14 +340,27 @@ class _CommandRow(QStyledItemDelegate):
             painter.fillRect(rail, QColor(t.color["accent.default"]))
 
         if not live:
-            ink, second = t.color["text.disabled"], t.color["text.disabled"]
+            ink, second, tone = (t.color["text.disabled"],
+                                 t.color["text.disabled"], "disabled")
         elif chosen:
-            ink, second = t.color["text.onAccent"], t.color["text.onAccent"]
+            ink, second, tone = (t.color["text.onAccent"],
+                                 t.color["text.onAccent"], "onAccent")
         else:
-            ink, second = t.color["text.primary"], t.color["text.tertiary"]
+            ink, second, tone = (t.color["text.primary"],
+                                 t.color["text.tertiary"], "secondary")
 
         box = option.rect.adjusted(t.space["3"], t.space["0"],
                                    -t.space["3"], t.space["0"])
+        # `ui/icons.py` resolves its own colour from the palette the app is
+        # wearing, which is set before this widget is rebuilt in it, so the mark
+        # and the ink beside it are always the same theme's.
+        drawn = I.pixels("sm")
+        mark = QRect(box.left(), box.top() + (box.height() - drawn) // 2,
+                     drawn, drawn)
+        painter.drawPixmap(mark, I.pixmap(str(index.data(MARK) or _DEFAULT_MARK),
+                                          tone=tone, size="sm"))
+        box.setLeft(mark.right() + t.space["2"])
+
         metrics = option.fontMetrics
         taken = metrics.horizontalAdvance(hint) + t.space["4"] if hint else 0
         named = QRect(box)
@@ -196,7 +373,6 @@ class _CommandRow(QStyledItemDelegate):
         if hint:
             painter.setPen(QColor(second))
             painter.drawText(box, Qt.AlignRight | Qt.AlignVCenter, hint)
-        painter.restore()
 
 
 # ── The palette ──────────────────────────────────────────────────────────────
@@ -223,6 +399,12 @@ class CommandPalette(QWidget):
         self._theme = C.active_theme()
         self._commands: list = []
         self._shown: list = []
+        # Which command each row of the list widget is, headings being -1. The
+        # two are no longer the same index and every keystroke depends on the
+        # difference: an arrow key steps through commands and the selection it
+        # sets is a row.
+        self._at: list = []
+        self._headings: dict = {}
         self.hide()
         self._build()
         if parent is not None:
@@ -231,35 +413,82 @@ class CommandPalette(QWidget):
     # ── Building ─────────────────────────────────────────────────────────
 
     def _build(self) -> None:
+        """The query, the rule under it, the list, and the keys in the footer.
+
+        Zero margins on the card and margins on each band inside it, so the two
+        rules run edge to edge. A rule inset from the panel's own border reads
+        as a line somebody drew; a rule that meets both edges is the seam
+        between two parts of one object, which is what these are.
+        """
         t = self._theme
         self.card = QFrame(self)
         self.card.setObjectName("command_card")
         page = QVBoxLayout(self.card)
-        page.setContentsMargins(t.space["4"], t.space["4"], t.space["4"],
-                                t.space["4"])
-        page.setSpacing(t.space["3"])
+        page.setContentsMargins(t.space["0"], t.space["0"], t.space["0"],
+                                t.space["0"])
+        page.setSpacing(t.space["0"])
 
         self.query = C.search_field("Type a command…", max_chars=COLUMNS)
         self.query.setClearButtonEnabled(False)
+        # `search_field` is the filter box a toolbar carries — `control.sm` of
+        # height, `small` of type, in a bordered well — and here it is not a
+        # control on a surface, it is the surface. So it takes the height and
+        # the size a primary control takes, and it gives up the well: a box
+        # drawn inside a panel whose whole purpose is that box reads as a form
+        # to fill in rather than as a caret to type at, and the ring that box
+        # would grow on focus would be a ring around the only focusable thing
+        # in the card. Everything the sheet says about a QLineEdit that these
+        # four declarations do not name still applies.
+        self.query.setFixedHeight(t.control["lg"])
+        self.query.setStyleSheet(
+            "QLineEdit { font-size: %dpx; padding: %dpx %dpx; "
+            "background: transparent; border: none; }"
+            % (t.font["h2"][0], t.space["0"], t.space["1"]))
         self.query.textChanged.connect(self._on_query)
         self.query.installEventFilter(self)
-        page.addWidget(self.query)
+        page.addWidget(self._band(self.query, "3", "2"))
+        page.addWidget(C.divider())
 
         self.list = QListWidget(self.card)
         self.list.setObjectName("command_list")
         self.list.setItemDelegate(_CommandRow(t, self.list))
-        self.list.setUniformItemSizes(True)
+        # Off, because the rows are no longer one height: a heading is shorter
+        # than a command and with this on Qt paints every row at the first one's
+        # size, which draws each command inside a heading's box.
+        self.list.setUniformItemSizes(False)
         self.list.setFocusPolicy(Qt.NoFocus)
         self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.list.setFixedHeight(ROWS * t.control["row"])
         self.list.itemActivated.connect(lambda item: self._run(item))
         self.list.itemClicked.connect(lambda item: self._run(item))
-        page.addWidget(self.list)
 
         self.nothing = C.body_label("No command goes by that name.",
                                     tone="tertiary")
         self.nothing.hide()
-        page.addWidget(self.nothing)
+        self.body = QWidget(self.card)
+        body = QVBoxLayout(self.body)
+        body.setContentsMargins(t.space["1"], t.space["1"], t.space["1"],
+                                t.space["1"])
+        body.setSpacing(t.space["1"])
+        body.addWidget(self.list)
+        body.addWidget(self.nothing)
+        page.addWidget(self.body)
+
+        page.addWidget(C.divider())
+        self.keys = C.hint(KEYS)
+        page.addWidget(self._band(self.keys, "3", "2"))
+
+    def _band(self, inner: QWidget, side: str, ends: str) -> QWidget:
+        """One horizontal band of the card, inset from the two rules it sits
+        between."""
+        t = self._theme
+        holder = QWidget(self.card)
+        box = QVBoxLayout(holder)
+        box.setContentsMargins(t.space[side], t.space[ends], t.space[side],
+                               t.space[ends])
+        box.setSpacing(t.space["0"])
+        box.addWidget(inner)
+        return holder
 
     def restyle(self, t) -> None:
         """Wear `t`, by building the whole thing again in it.
@@ -281,6 +510,7 @@ class CommandPalette(QWidget):
     def open_with(self, commands) -> None:
         """Show the palette over `commands`, with the query already empty."""
         self._commands = list(commands)
+        self._headings = headings(self._commands)
         self.query.blockSignals(True)
         self.query.clear()
         self.query.blockSignals(False)
@@ -297,9 +527,18 @@ class CommandPalette(QWidget):
         """What the palette is showing, in the order it is showing it."""
         return list(self._shown)
 
+    def groups(self) -> list:
+        """The headings on show, in the order they are drawn."""
+        seen = []
+        for command in self._shown:
+            name = self._headings.get(command.key, OTHER)
+            if name not in seen:
+                seen.append(name)
+        return seen
+
     def highlighted(self):
-        row = self.list.currentRow()
-        return self._shown[row] if 0 <= row < len(self._shown) else None
+        at = self._command_at(self.list.currentRow())
+        return self._shown[at] if 0 <= at < len(self._shown) else None
 
     # ── The query ────────────────────────────────────────────────────────
 
@@ -307,14 +546,46 @@ class CommandPalette(QWidget):
         self._fill(text)
 
     def _fill(self, text: str) -> None:
-        self._shown = rank(self._commands, text.strip())
+        """Rebuild the list: the matches, gathered under one heading each.
+
+        Gathered rather than partitioned where the ranking happens to change
+        group, which is the version this replaced and which drew Actions twice
+        with Section between them — the shell registers the dry-run switch
+        among the appearance commands and every screen's own actions after its
+        sections, so a run-length heading is a heading per run and not per
+        group.
+
+        The order inside a group is the ranking's, and the order *of* the
+        groups is the ranking's too — whichever group the best match sits in is
+        drawn first, so what was typed decides the top of the list rather than
+        a registration order the reader cannot see.
+        """
+        order, gathered = [], {}
+        for command in rank(self._commands, text.strip()):
+            name = self._headings.get(command.key, OTHER)
+            if name not in gathered:
+                gathered[name] = []
+                order.append(name)
+            gathered[name].append(command)
+
         self.list.clear()
-        for command in self._shown:
-            item = QListWidgetItem(command.title)
-            item.setData(Qt.UserRole, command.hint())
-            item.setData(Qt.UserRole + 1, command.enabled())
-            item.setToolTip(command.title)
-            self.list.addItem(item)
+        self._shown, self._at = [], []
+        for name in order:
+            head = QListWidgetItem(name)
+            head.setData(HEADING, True)
+            head.setFlags(Qt.NoItemFlags)
+            self.list.addItem(head)
+            self._at.append(-1)
+            for command in gathered[name]:
+                item = QListWidgetItem(command.title)
+                item.setData(HINT, "" if command.hint() == name
+                             else command.hint())
+                item.setData(LIVE, command.enabled())
+                item.setData(MARK, command.mark())
+                item.setToolTip(command.title)
+                self.list.addItem(item)
+                self._at.append(len(self._shown))
+                self._shown.append(command)
         self.nothing.setVisible(not self._shown)
         self.list.setVisible(bool(self._shown))
         self._size_list()
@@ -325,22 +596,47 @@ class CommandPalette(QWidget):
             # needed however short the next one is.
             self._place()
 
+    def _command_at(self, row: int):
+        """Which command a row of the list is, or -1 for a heading."""
+        return self._at[row] if 0 <= row < len(self._at) else -1
+
+    def _row_of(self, at: int) -> int:
+        """Which row of the list a command is, or -1 for one not on show."""
+        try:
+            return self._at.index(at)
+        except ValueError:
+            return -1
+
     def _size_list(self) -> None:
         """As tall as it has rows, up to the ceiling a shortlist is allowed.
 
         Sized rather than scrolled to a fixed box: a query that leaves two
         commands standing should read as two commands, not as two rows adrift
-        in six of empty well.
+        in six of empty well. Counted in commands and measured in pixels,
+        because a heading is neither a command nor the same height as one — a
+        ceiling of eight rows that spent three of them on headings would show
+        five of the answers it found.
         """
-        rows = min(max(len(self._shown), 1), ROWS)
-        self.list.setFixedHeight(rows * self._theme.control["row"])
+        t = self._theme
+        counted, tall = 0, 0
+        for row, at in enumerate(self._at):
+            # Tested before the row is measured rather than after, so the
+            # heading of the group the ceiling cuts off is left outside the box
+            # with the rows it would have introduced.
+            if counted >= ROWS:
+                break
+            counted += 1 if at >= 0 else 0
+            tall += self.list.sizeHintForRow(row)
+        self.list.setFixedHeight(max(tall, t.control["row"]))
 
     def _select(self, start: int, step: int) -> None:
-        """Land on the first runnable row at or after `start`.
+        """Land on the first runnable command at or after `start`.
 
         A dimmed row is shown because knowing the app can do something is worth
         more than hiding it, and skipped because a Return that lands on one
-        would do nothing at all and say nothing about why.
+        would do nothing at all and say nothing about why. A heading is skipped
+        for the harder version of the same reason: it is not a command, so
+        stopping on one would leave Return with nothing to run at all.
         """
         count = len(self._shown)
         for offset in range(count):
@@ -348,13 +644,13 @@ class CommandPalette(QWidget):
             if at < 0:
                 break
             if self._shown[at].enabled():
-                self.list.setCurrentRow(at)
+                self.list.setCurrentRow(self._row_of(at))
                 return
         self.list.setCurrentRow(-1)
 
     def _step(self, step: int) -> None:
-        row = self.list.currentRow()
-        start = (row + step) % len(self._shown) if self._shown else 0
+        at = self._command_at(self.list.currentRow())
+        start = (at + step) % len(self._shown) if self._shown else 0
         self._select(start, step)
 
     def _run(self, item=None) -> None:
@@ -365,9 +661,8 @@ class CommandPalette(QWidget):
             return
         command = self.highlighted()
         if item is not None:
-            row = self.list.row(item)
-            if 0 <= row < len(self._shown):
-                command = self._shown[row]
+            at = self._command_at(self.list.row(item))
+            command = self._shown[at] if at >= 0 else None
         if command is None or not command.enabled():
             return
         self.dismiss()

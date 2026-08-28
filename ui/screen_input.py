@@ -26,19 +26,41 @@ The chrome is gone with the tabs: the shell owns the product name, the
 destinations and Settings, so this screen draws none of them. `settings_signal`
 and `outreach_signal` stay because the window still routes them, and every
 public method and signal the app calls is unchanged.
+
+The macOS pass over it is the half of the audit's wide-window finding that the
+measure did not close. Capping every sentence fixed the empty boxes; the 600px
+checkbox cells became 173px cells, and twenty-one of them in one 2x11 grid is
+still a wall — an unordered list with no headings, which anyone looking for one
+field has to read from the top. So:
+
+  * **the picker is five short lists, not one long one.** Identity, Contact,
+    Reputation, Social profiles, Place, in the order the run fills them in, each
+    under its own rule. A group is a place to stop reading.
+  * **the ten slow fields say so on the page.** They said it in a tooltip,
+    which is a thing you find by hovering something you were not going to click:
+    a `clock` beside the label says it at a glance, and the sentence under the
+    grid says what the clock means.
+  * **the picker answers back.** "12 of 21" on the heading's own line, so All /
+    Default / Fast only / None have a visible effect — 21, 12, 11, 0 — and a
+    half-changed set is not something to count by eye.
+
+Every group of controls is a heading and the space under it rather than a card:
+five boxes down a column is five borders drawn around one thing, and this is the
+screen the audit called mostly empty boxes.
 """
 
 import os
 
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import QSize, Qt, pyqtSignal
 from PyQt5.QtWidgets import (
-    QComboBox, QDoubleSpinBox, QFileDialog, QGridLayout, QHBoxLayout, QLineEdit,
-    QListWidget, QListWidgetItem, QScrollArea, QSizePolicy, QSlider, QSpinBox,
-    QStackedWidget, QVBoxLayout, QWidget,
+    QComboBox, QDoubleSpinBox, QFileDialog, QGridLayout, QHBoxLayout, QLabel,
+    QLineEdit, QListWidget, QListWidgetItem, QScrollArea, QSizePolicy, QSlider,
+    QSpinBox, QStackedWidget, QVBoxLayout, QWidget,
 )
 
 from core.settings import add_saved_search, load_settings, save_settings
 from ui import components
+from ui import icons
 from ui.domain_list_dialog import DomainListDialog, ListDialog
 
 # The measure of one column of this page, in characters, handed to the
@@ -64,6 +86,42 @@ _LAYOUTS = {
 
 MAX_COLUMNS = max(_LAYOUTS)
 
+# What the picker is grouped into, and the order inside a group is the order the
+# scraper fills the fields in. Named here rather than derived from `FIELD_KEYS`,
+# because the grouping is a claim about what a person is looking for — "the
+# address and something to ring" is one errand and "which socials has it got" is
+# another — and no ordering of the CSV's own columns says that.
+#
+# `InputScreen._grouped_fields` is what actually reads this, and it appends
+# anything `FIELD_KEYS` grows that nobody put in a group here: a field that is
+# scrapeable and absent from the picker is a field the user cannot ask for, and
+# a list of names in two places is exactly how that happens.
+FIELD_GROUPS = (
+    ("Identity", ("name", "category")),
+    ("Contact", ("address", "phone", "website", "email")),
+    ("Reputation", ("rating", "review_count", "review_1", "review_2",
+                    "review_3")),
+    ("Social profiles", ("facebook", "instagram", "linkedin", "twitter",
+                         "youtube")),
+    ("Place", ("hours", "maps_link", "latitude", "longitude", "place_id")),
+)
+
+# How many fields sit side by side in a group. Two, because the column this
+# block lives in is capped at a readable measure and a checkbox is a short
+# label: one per line would make the block twice as tall for no gain, and three
+# would put "Business Name" in 110px.
+FIELD_COLUMNS = 2
+
+# The mark a slow field carries, and the tone it carries it in. `tertiary`
+# rather than `warning`: ten of the twenty-one fields are slow, and a page with
+# ten amber marks on it is a page shouting about its own defaults. This is
+# information, and the sentence under the grid is what explains it.
+SLOW_ICON, SLOW_TONE, SLOW_SIZE = "clock", "tertiary", "xs"
+
+# What a saved search is marked with in the list, and what a footer refusal is.
+RECENT_ICON, RECENT_TONE, RECENT_SIZE = "clock", "tertiary", "xs"
+REFUSAL_ICON, REFUSAL_TONE, REFUSAL_SIZE = "warning", "warning", "sm"
+
 
 # ── Local layout helpers ─────────────────────────────────────────────────────
 # Every layout on this screen states its margins and its spacing in tokens. The
@@ -88,18 +146,42 @@ def _grid(box, t, margin, spacing):
     return box
 
 
-def _block(t, title: str) -> QWidget:
+def _block(t, title: str, note: str = "", trailing=None) -> QWidget:
     """One titled section of the page, on the page's own ground.
 
     Deliberately not a `card()`. Five cards down a column is five borders drawn
     around things that are one thing, and this is the screen the audit called
-    "mostly empty boxes" — the rule over a group of controls is the section
-    label, and the ground under it is the page.
+    "mostly empty boxes" — the rule over a group of controls is its heading, and
+    the ground under it is the page.
+
+    The heading is `h3` and not the uppercase caption it used to be, and the
+    line under it is the section's own answer to "what is this for". The caption
+    tier is still in use one level down, on the label over a field and over a
+    group inside the picker, so the page reads at three weights rather than at
+    one: what this section is, what this control is, what this value is.
+
+    `trailing` rides on the heading's own line, at the right of it. It exists
+    for one thing and the alternative was measured: the picker's count started
+    life beside the four presets, and a row of four buttons plus a sentence
+    asked for 383px where every other block asks for 324 — which is the width
+    of a column on this page, so one label would have cost the 1280px window a
+    whole column. A heading is short and the space beside it is free.
     """
     widget = QWidget()
-    box = _rows(widget, margin="0", spacing="3", t=t)
-    box.addWidget(components.section_label(title))
-    widget.body = box
+    box = _rows(widget, margin="0", spacing="2", t=t)
+    if trailing is None:
+        box.addWidget(components.heading(title, "h3"))
+    else:
+        line = _cols(margin="0", spacing="2", t=t)
+        line.addWidget(components.heading(title, "h3"))
+        line.addStretch()
+        line.addWidget(trailing)
+        box.addLayout(line)
+    if note:
+        box.addWidget(components.hint(note, max_chars=MEASURE_CH))
+    body = _rows(margin="0", spacing="3", t=t)
+    box.addLayout(body)
+    widget.body = body
     return widget
 
 
@@ -336,10 +418,12 @@ class InputScreen(QWidget):
         root.addLayout(self._build_footer(t))
 
     def _build_search(self, t) -> QWidget:
-        block = _block(t, "Search")
+        block = _block(t, "Search",
+                       "What to look for, and the town to look for it in.")
 
         self.domain_list_btn = components.button(
-            "List", kind="secondary", size="md", on_click=self._open_domain_list)
+            "List", kind="secondary", size="md", icon="plus",
+            on_click=self._open_domain_list)
         self.domain_list_btn.setToolTip("Add more business types to this run")
         self.domain_field = _Field(
             t, "Domain", placeholder="e.g. car dealers",
@@ -350,7 +434,8 @@ class InputScreen(QWidget):
         block.body.addWidget(self.domain_field)
 
         self.area_list_btn = components.button(
-            "List", kind="secondary", size="md", on_click=self._open_area_list)
+            "List", kind="secondary", size="md", icon="plus",
+            on_click=self._open_area_list)
         self.area_list_btn.setToolTip("Add more cities or areas to this run")
         self.area_field = _Field(
             t, "Area", placeholder="e.g. Lahore",
@@ -382,7 +467,16 @@ class InputScreen(QWidget):
         return block
 
     def _build_fields(self, t) -> QWidget:
-        block = _block(t, "Data to scrape")
+        # What the four presets just did, in a number. Without it the only way
+        # to tell "Default" from "All" is to count twenty-one checkboxes, and
+        # the only way to notice a half-changed set is to count them again. It
+        # sits on the heading's line because the row of presets has no 100px to
+        # spare — see `_block`.
+        self.field_count_label = components.body_label("", tone="tertiary")
+        self.field_count_label.setWordWrap(False)
+        block = _block(t, "Data to scrape",
+                       "Every field ticked here becomes a column in the CSV.",
+                       trailing=self.field_count_label)
 
         picks = _cols(margin="0", spacing="2", t=t)
         for text, tip, slot in (
@@ -401,48 +495,130 @@ class InputScreen(QWidget):
         picks.addStretch()
         block.body.addLayout(picks)
 
-        self.checkboxes = {}
-        grid = QGridLayout()
-        grid.setContentsMargins(t.space["0"], t.space["0"], t.space["0"],
-                                t.space["0"])
-        grid.setHorizontalSpacing(t.space["4"])
-        grid.setVerticalSpacing(t.space["2"])
-        grid.setColumnStretch(0, 1)
-        grid.setColumnStretch(1, 1)
-        for index, (key, name) in enumerate(zip(self.FIELD_KEYS,
-                                                self.FIELD_NAMES)):
-            if key == "email":
-                tip = ("Fetches the business website — slower, and the one "
-                       "field Outreach cannot send without")
-            elif key in self.DETAIL_FIELDS:
-                tip = "Opens each listing's page — slower"
-            elif key in self.ENRICH_FIELDS:
-                tip = "Fetches the business website — slower"
-            else:
-                tip = ""
-            box = components.toggle(name, help=tip)
-            box.setChecked(key not in self.DEFAULT_OFF_FIELDS)
-            self.checkboxes[key] = box
-            grid.addWidget(box, index // 2, index % 2)
-        holder = QWidget()
-        holder.setLayout(grid)
-        block.body.addWidget(holder)
+        block.body.addWidget(self._build_field_grid(t))
 
         block.body.addWidget(components.hint(
-            "Email is on because Outreach needs an address to send to; it and "
-            "the socials fetch each website, and Hours and Reviews open each "
-            "listing. Both are slower.", max_chars=MEASURE_CH))
+            "A clock marks a field that opens each listing or fetches each "
+            "website, which is slower. Email is one and is on anyway: it is "
+            "the address Outreach sends to.", max_chars=MEASURE_CH))
         self.fields_error = components.body_label("", tone="danger",
                                                   max_chars=MEASURE_CH)
         self.fields_error.hide()
         block.body.addWidget(self.fields_error)
+        self._update_field_count()
         return block
 
+    def _build_field_grid(self, t) -> QWidget:
+        """The twenty-one fields, in five named groups, two to a line.
+
+        One grid for all five groups rather than a grid each, so the second
+        column starts at the same x in every group. Five grids stacked down the
+        block would each find their own second-column edge from their own
+        longest label, which is the ragged run of left edges the settings screen
+        was pulled up for and has a test of its own about.
+        """
+        self.checkboxes = {}
+        self.field_marks = {}
+        names = dict(zip(self.FIELD_KEYS, self.FIELD_NAMES))
+
+        grid = QGridLayout()
+        grid.setContentsMargins(t.space["0"], t.space["0"], t.space["0"],
+                                t.space["0"])
+        grid.setHorizontalSpacing(t.space["4"])
+        grid.setVerticalSpacing(t.space["1"])
+        for column in range(FIELD_COLUMNS):
+            grid.setColumnStretch(column, 1)
+
+        at = 0
+        for group, (title, keys) in enumerate(self._grouped_fields()):
+            rule = components.section_label(title)
+            # Air above a heading and not below it, so a rule belongs to what
+            # follows it rather than floating between two groups. The first one
+            # takes none: the presets row above it already carries the gap.
+            rule.setContentsMargins(t.space["0"],
+                                    t.space["0"] if not group else t.space["3"],
+                                    t.space["0"], t.space["0"])
+            grid.addWidget(rule, at, 0, 1, FIELD_COLUMNS)
+            at += 1
+            for index, key in enumerate(keys):
+                grid.addWidget(self._field_row(t, key, names.get(key, key)),
+                               at + index // FIELD_COLUMNS,
+                               index % FIELD_COLUMNS)
+            at += -(-len(keys) // FIELD_COLUMNS)
+
+        holder = QWidget()
+        holder.setLayout(grid)
+        return holder
+
+    def _field_row(self, t, key: str, name: str) -> QWidget:
+        """One field: its checkbox, and the clock if asking for it costs a fetch.
+
+        The wrapper and its stretch are what stop a checkbox being as wide as
+        the cell it is in. Qt stretches a QCheckBox to its grid cell and the
+        whole of that cell toggles it, so a click 100px to the right of
+        "Rating", on what looks like empty page, turned a column on — the 600px
+        checkbox cell of the audit, at 173px with a 62px control in it. Measured
+        after: 56 to 113px, which is each control's own label and nothing else.
+        """
+        box = components.toggle(name, help=self._field_cost(key))
+        box.setChecked(key not in self.DEFAULT_OFF_FIELDS)
+        box.toggled.connect(self._on_field_toggled)
+        self.checkboxes[key] = box
+
+        row = QWidget()
+        line = _cols(row, margin="0", spacing="1", t=t)
+        line.addWidget(box)
+        if key in self.SLOW_FIELDS:
+            mark = QLabel()
+            mark.setPixmap(icons.pixmap(SLOW_ICON, tone=SLOW_TONE,
+                                        size=SLOW_SIZE))
+            mark.setToolTip(self._field_cost(key))
+            mark.setAccessibleName("slow")
+            line.addWidget(mark)
+            self.field_marks[key] = mark
+        line.addStretch()
+        return row
+
+    def _field_cost(self, key: str) -> str:
+        """What ticking this field costs the run, in one sentence."""
+        if key == "email":
+            return ("Fetches the business website — slower, and the one "
+                    "field Outreach cannot send without")
+        if key in self.DETAIL_FIELDS:
+            return "Opens each listing's page — slower"
+        if key in self.ENRICH_FIELDS:
+            return "Fetches the business website — slower"
+        return ""
+
+    @classmethod
+    def _grouped_fields(cls) -> list:
+        """`FIELD_GROUPS`, plus anything `FIELD_KEYS` has that it does not.
+
+        A field the scraper can collect and the picker does not draw is a field
+        nobody can ask for, and it would arrive silently — so the leftovers get
+        a group of their own rather than being dropped on the floor.
+        """
+        groups = [(title, [key for key in keys if key in cls.FIELD_KEYS])
+                  for title, keys in FIELD_GROUPS]
+        placed = {key for _title, keys in groups for key in keys}
+        missing = [key for key in cls.FIELD_KEYS if key not in placed]
+        if missing:
+            groups.append(("Other", missing))
+        return [(title, keys) for title, keys in groups if keys]
+
+    def _on_field_toggled(self, _checked: bool) -> None:
+        self._update_field_count()
+
+    def _update_field_count(self) -> None:
+        chosen, total = len(self.get_checked_fields()), len(self.checkboxes)
+        self.field_count_label.setText("%d of %d" % (chosen, total))
+        self.field_count_label.setToolTip(
+            "%d of the %d collectable fields are ticked" % (chosen, total))
+
     def _build_filters(self, t) -> QWidget:
-        block = _block(t, "Only keep businesses that match")
-        block.body.addWidget(components.hint(
-            "Leave everything blank or zero to keep every result.",
-            max_chars=MEASURE_CH))
+        block = _block(t, "Filters",
+                       "Only businesses that match are kept. Leave everything "
+                       "blank or zero to keep them all.")
 
         grid = self._form(t)
         self.min_rating_spin = self._spin(QDoubleSpinBox(), t)
@@ -502,13 +678,14 @@ class InputScreen(QWidget):
         reset = _cols(margin="0", spacing="2", t=t)
         reset.addStretch()
         reset.addWidget(components.button("Reset filters", kind="ghost",
-                                          size="sm",
+                                          size="sm", icon="reset",
                                           on_click=self._reset_filters))
         block.body.addLayout(reset)
         return block
 
     def _build_output(self, t) -> QWidget:
-        block = _block(t, "Output and run")
+        block = _block(t, "Output and run",
+                       "Where the CSV lands, and how the browser runs.")
 
         self.export_browse_btn = components.button(
             "…", kind="secondary", size="md", on_click=self._browse_export_dir)
@@ -552,16 +729,34 @@ class InputScreen(QWidget):
         return block
 
     def _build_recent(self, t) -> QWidget:
-        block = _block(t, "Recent searches")
+        block = _block(t, "Recent searches",
+                       "Click one to fill this page in again.")
         self.saved_stack = QStackedWidget()
         # A list expands by default, so on a tall window this block took every
         # spare pixel of its column and left the empty state's card floating
-        # halfway down 700px of nothing.
+        # halfway down 700px of nothing. `Preferred` was not enough of an answer
+        # and the measurement says why: `QWidgetItem::expandingDirections`
+        # promotes any widget that *may* grow to expanding when its own layout
+        # expands, and a `QStackedLayout` always claims both directions — so the
+        # block still competed with the column's stretch and still took half of
+        # what was going, 445px against a 142px hint at 2560x1440. `Maximum` has
+        # no grow flag at all, which is the only thing that breaks the chain.
         self.saved_stack.setSizePolicy(QSizePolicy.Preferred,
-                                       QSizePolicy.Preferred)
+                                       QSizePolicy.Maximum)
 
         self.saved_list = QListWidget()
         self.saved_list.setObjectName("saved_list")
+        side = icons.pixels(RECENT_SIZE)
+        self.saved_list.setIconSize(QSize(side, side))
+        # A scroll area's size hint has nothing to do with what is in it — Qt
+        # answers with a flat 256x192 — and a `QStackedWidget` takes the largest
+        # hint of every page it holds, not of the one on show. So the empty
+        # state's card was being centred inside 192px of a list that had nothing
+        # in it, which measured as 110px of gap between "Recent searches" and
+        # the sentence explaining why there is nothing under it. Twelve is the
+        # most `core.settings` keeps, so the grown list has a floor and a
+        # ceiling of its own rather than a scrollbar inside a column.
+        self.saved_list.setSizeAdjustPolicy(QListWidget.AdjustToContents)
         self.saved_list.itemClicked.connect(self._load_saved_search)
         self.saved_stack.addWidget(self.saved_list)
 
@@ -577,16 +772,42 @@ class InputScreen(QWidget):
         return block
 
     def _build_footer(self, t):
-        row = _cols(margin="0", spacing="3", t=t)
-        self.footer_note = components.body_label("", tone="tertiary",
+        """The one control that starts work, and the one line that refuses to.
+
+        The note is on the left and the button on the right with the stretch
+        between them, which is what keeps Start Scraping in the same place
+        whether or not there is anything to say — the contract this screen was
+        rebuilt for is that the control just clicked may not move.
+
+        The mark and the words are one colour, which is the icon set's own rule:
+        a glyph beside a label is the colour of the label, so both change with
+        the palette rather than an amber triangle standing next to grey text.
+        The line was `tertiary` when it was the only thing here and a refusal
+        that reads quieter than a hint is a refusal nobody reads.
+        """
+        row = _cols(margin="0", spacing="1", t=t)
+        self.footer_mark = QLabel()
+        self.footer_mark.setPixmap(icons.pixmap(REFUSAL_ICON, tone=REFUSAL_TONE,
+                                                size=REFUSAL_SIZE))
+        self.footer_mark.setAccessibleName("problem")
+        self.footer_mark.setVisible(False)
+        self.footer_note = components.body_label("", tone=REFUSAL_TONE,
                                                  max_chars=MEASURE_CH)
         self.footer_note.setWordWrap(False)
+        row.addWidget(self.footer_mark)
         row.addWidget(self.footer_note)
         row.addStretch()
         self.start_btn = components.button("Start Scraping", kind="primary",
-                                           size="lg", on_click=self._on_start)
+                                           size="lg", icon="play",
+                                           on_click=self._on_start)
+        self.start_btn.setToolTip("Open Chrome and start collecting")
         row.addWidget(self.start_btn)
         return row
+
+    def _say(self, message: str = "") -> None:
+        """The footer line, and the mark that says it is a refusal and not a hint."""
+        self.footer_note.setText(message)
+        self.footer_mark.setVisible(bool(message))
 
     # ── Form pieces ──────────────────────────────────────────────────────────
 
@@ -820,9 +1041,11 @@ class InputScreen(QWidget):
 
     def _refresh_saved_list(self):
         self.saved_list.clear()
+        mark = icons.icon(RECENT_ICON, tone=RECENT_TONE, size=RECENT_SIZE)
         for entry in self.settings.get("saved_searches") or []:
-            item = QListWidgetItem(self._format_saved_search(entry))
+            item = QListWidgetItem(mark, self._format_saved_search(entry))
             item.setData(Qt.UserRole, entry)
+            item.setToolTip("Load this search")
             self.saved_list.addItem(item)
         self.saved_stack.setCurrentWidget(
             self.saved_list if self.saved_list.count() else self.saved_empty)
@@ -893,7 +1116,15 @@ class InputScreen(QWidget):
     # ── What the screen answers with ─────────────────────────────────────────
 
     def get_checked_fields(self) -> list:
-        return [key for key, box in self.checkboxes.items() if box.isChecked()]
+        """The ticked fields, in `FIELD_KEYS` order whatever order they are drawn in.
+
+        Read off the list rather than off `self.checkboxes` because that dict is
+        now built in the picker's own grouping, and this order is the CSV's
+        column order and the results table's — a grouping decision on this
+        screen may not silently reorder a file.
+        """
+        return [key for key in self.FIELD_KEYS
+                if key in self.checkboxes and self.checkboxes[key].isChecked()]
 
     def get_filters(self) -> dict:
         return {
@@ -949,8 +1180,7 @@ class InputScreen(QWidget):
             self.fields_error.setText(
                 "Tick at least one thing to collect. Default is a good start.")
             self.fields_error.show()
-            self.footer_note.setText("Nothing is ticked, so there is nothing "
-                                     "to collect.")
+            self._say("Nothing is ticked, so there is nothing to collect.")
             return None
 
         return domains, areas, fields, export_dir
@@ -958,14 +1188,14 @@ class InputScreen(QWidget):
     def _refuse(self, field, message: str):
         field.set_error(message)
         field.edit.setFocus(Qt.OtherFocusReason)
-        self.footer_note.setText("Fix the field marked below the box.")
+        self._say("Fix the field marked below the box.")
         return None
 
     def _clear_errors(self):
         for field in (self.domain_field, self.area_field, self.export_field):
             field.set_error("")
         self.fields_error.hide()
-        self.footer_note.setText("")
+        self._say("")
 
     # ── Start ────────────────────────────────────────────────────────────────
 

@@ -40,6 +40,33 @@ so that suppressing a lead becomes undoable, and on the danger tone it does not
 dismiss itself — a message that says something went wrong and then vanishes
 before it is read is worse than no message.
 
+Three more arrived with the navigation rail, and each is the same kind of thing:
+a shape the shell needed that would otherwise have been built inside `ui/app.py`
+and been unavailable to anything else.
+
+`nav_item()` is one row of the rail — an icon, a label and a filled pill when it
+is selected — at two depths, so a destination and a sub-section of a destination
+are one widget rather than two that drift. `rail_width()` is the two widths it
+is laid out at, and both are compositions of the grid rather than round numbers:
+the docstring carries the measurement that fixes them, because a rail was
+rejected once already for taking width from a table that had none to give.
+
+`page_header()` is the title of a content pane and the line under it that says
+what the pane is for. `screen_header()` stays for what it always was, a bar of
+tabs and actions at `control.header`; the two are separate because a page title
+in the `h1` tier with a description under it is not that bar with a flag set.
+
+`log_console()` is the Sending view's activity log, which was four hundred
+proportional 13px lines tinted three ways: monospace so a timestamp is a ruler,
+a drawn marker per level so a failure is found by shape, and the two verbs
+anyone actually does with a log — copy it somewhere, and clear it.
+
+Icons come from `ui/icons.py` and are named, never drawn here: `button(...,
+icon="send")` and `icon_button("copy", ...)` resolve through the set, in a
+palette colour, at a grid size, so a control never holds a pixmap or a colour of
+its own — and a selected rail row's glyph changes with its label instead of
+being left behind in the resting tone.
+
 Every value is read from the theme at build time. There is not a hex literal, a
 font size, a spacing number or a fixed height in this file that did not come out
 of `ui/theme.py`, and `tests/test_components.py` asserts that against the source
@@ -49,16 +76,18 @@ text rather than trusting the claim.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 
 from PyQt5.QtCore import QEvent, QObject, QSize, QTimer, Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QFont, QFontMetrics, QIcon
 from PyQt5.QtWidgets import (
-    QAbstractItemView, QButtonGroup, QCheckBox, QComboBox, QFrame, QHBoxLayout,
-    QHeaderView, QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton,
-    QSizePolicy, QTableWidget, QTableWidgetItem, QToolButton, QToolTip,
-    QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QFrame,
+    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QMessageBox, QProgressBar, QPushButton, QSizePolicy, QTableWidget,
+    QTableWidgetItem, QToolButton, QToolTip, QVBoxLayout, QWidget,
 )
 
+from ui import icons as _icons
 from ui import theme as _theme
 
 # The one length in the app that is not a spacing value and has no token: the
@@ -271,6 +300,91 @@ class _MeasuredLabel(QLabel):
         self.updateGeometry()
 
 
+class _ElidedLabel(QLabel):
+    """A single line that shortens to the width it is given, with a tooltip.
+
+    A QLabel with `wordWrap` off reports its whole sentence as its *minimum*
+    size, so one long line inside the chrome sets a floor on how narrow the
+    window can be dragged — the page header's description and the shell's
+    context line are both sentences the shell does not choose and cannot cap.
+    This one asks for a single ellipsis and no more, and paints as much of the
+    sentence as the layout actually handed it.
+
+    The tooltip is the same contract `table()` holds its cells to: nothing that
+    does not fit may be silent about it, and nothing that does fit may claim a
+    tooltip it does not need.
+    """
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(parent)
+        self._full = ""
+        self.setWordWrap(False)
+        # `Preferred` and not `Ignored`, which is the obvious answer and is
+        # wrong by exactly one measurement: a QHBoxLayout hands an Ignored
+        # widget no width at all when anything beside it is stretching, so the
+        # shell's line of state rendered 0px wide on every screen while
+        # `isVisible()` went on answering True. Preferred asks for the whole
+        # sentence and settles for `minimumSizeHint`, which is one ellipsis.
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        self.setText(text)
+
+    def setText(self, text: str) -> None:
+        """Nothing happens when the sentence has not changed.
+
+        `QLabel.setText` returns early on an identical string and this cannot,
+        because the string it holds is the whole sentence and the string Qt
+        holds is whatever fitted. The shell relabels the page header on every
+        `_sync`, which a running campaign reaches once per message, so without
+        the guard each message clears a tooltip and invalidates a layout to
+        write the words that are already there.
+        """
+        wanted = str(text)
+        if wanted == self._full:
+            return
+        self._full = wanted
+        super().setText(self._full)
+        self.setToolTip("")
+        self.updateGeometry()
+        self.update()
+
+    def full_text(self) -> str:
+        return self._full
+
+    def is_elided(self) -> bool:
+        return bool(self._full) and \
+            self.fontMetrics().horizontalAdvance(self._full) > self._room()
+
+    def minimumSizeHint(self) -> QSize:
+        metrics = self.fontMetrics()
+        return QSize(metrics.horizontalAdvance("…"), metrics.height())
+
+    def sizeHint(self) -> QSize:
+        metrics = self.fontMetrics()
+        return QSize(metrics.horizontalAdvance(self._full), metrics.height())
+
+    def _room(self) -> int:
+        margins = self.contentsMargins()
+        return max(0, self.width() - margins.left() - margins.right())
+
+    def paintEvent(self, event) -> None:
+        """Cut to fit, here, because only a paint knows the width it was given.
+
+        Both writes are guarded on having something to change. `QLabel.setText`
+        calls `updateGeometry`, and a paint that invalidates its own parent's
+        layout unconditionally is a layout that never settles — the size hint is
+        taken from the whole sentence rather than the shortened one for the same
+        reason, so shortening cannot move anything.
+        """
+        shown = self.fontMetrics().elidedText(self._full, Qt.ElideRight,
+                                              self._room())
+        if shown != super().text():
+            super().setText(shown)
+        wanted = self._full if shown != self._full else ""
+        if wanted != self.toolTip():
+            self.setToolTip(wanted)
+        super().paintEvent(event)
+
+
 def heading(text: str, level: str = "h2") -> QLabel:
     """A heading at one of the four heading tiers.
 
@@ -325,6 +439,38 @@ def body_label(text: str, *, tone: str = "secondary", max_chars: int = 80) -> QL
     label.setProperty("tone", tone)
     _paint(label, "QLabel", color=_ink(t, tone),
            font_size=_px(size), font_weight=weight, background="transparent")
+    return label
+
+
+def elided_label(text: str = "", *, tone: str = "secondary",
+                 tier: str = "body") -> QLabel:
+    """One line of copy that shortens rather than widening what holds it.
+
+    The counterpart to `body_label`, which is the only thing in the app that
+    should *wrap* text. This is the only thing that should cut it: a sentence
+    in a row of chrome — a page description, a line of state, an address in a
+    header — has a width handed to it rather than a width to ask for.
+    """
+    t = active_theme()
+    size, weight = t.font[tier if tier in t.font else "body"]
+    label = _ElidedLabel(text)
+    label.setProperty("role", "elided")
+
+    def _set_tone(name: str) -> None:
+        """Repaint in another tone without rebuilding the widget.
+
+        `body_label` bakes its tone into a stylesheet at construction, so a line
+        of state that changes tone has to be a new label — and the shell's
+        context line changes tone once per message during a campaign. A tone is
+        a colour lookup, and a colour lookup is this file's business, so it is
+        answered here rather than by a caller reaching for the palette.
+        """
+        label.setProperty("tone", name)
+        _paint(label, "QLabel", color=_ink(t, name), font_size=_px(size),
+               font_weight=weight, background="transparent")
+
+    label.set_tone = _set_tone
+    _set_tone(tone)
     return label
 
 
@@ -481,6 +627,218 @@ def _select_tab(buttons, index: int) -> None:
         tab.setChecked(at == index)
 
 
+def page_header(title: str, *, description: str = "", actions=()) -> QWidget:
+    """The title of the page and the one line that says what it is for.
+
+    A separate function from `screen_header` rather than a flag on it, because
+    the two answer different questions and only one of them is still the shell's.
+    `screen_header` is a *bar*: a title, a strip of tabs and a row of actions at
+    `control.header`, which is what a screen carried when a screen owned its own
+    chrome. This is the header of a content pane — the title in the h1 tier the
+    type scale reserves for exactly this, a description under it, and whatever
+    global state the shell wants on the right. There are no tabs on it: a
+    section of a screen is a row in the rail now.
+
+    `set_title` and `set_description` are on the returned widget because the
+    shell relabels this on every navigation and a header rebuilt per screen
+    change is four widgets deleted under the user's pointer to say one different
+    word.
+    """
+    t = active_theme()
+    header = QWidget()
+    header.setObjectName("results_header")
+    _paint(header, "QWidget#results_header", background_color="transparent",
+           border_bottom="%s solid %s" % (_px(BORDER), t.color["border.subtle"]))
+
+    box = _hbox(header, margin="0", spacing="3", t=t)
+    box.setContentsMargins(t.space["6"], t.space["2"], t.space["5"], t.space["2"])
+    header.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+
+    stack = _vbox(margin="0", spacing="0", t=t)
+    name = heading(title, "h1")
+    stack.addWidget(name)
+    line = elided_label(description, tone="tertiary", tier="small")
+    line.setProperty("role", "description")
+    line.setVisible(bool(description))
+    stack.addWidget(line)
+    # The title block takes the free width rather than a stretch item taking
+    # it, so the description has somewhere to be long and shortens into that
+    # space instead of pushing the actions off the right of a narrow window.
+    box.addLayout(stack, 1)
+
+    for action in actions:
+        box.addWidget(_as_widget(action))
+
+    def _set_title(text: str) -> None:
+        name.setText(str(text))
+
+    def _set_description(text: str) -> None:
+        line.setText(str(text))
+        line.setVisible(bool(text))
+
+    header.title_label = name
+    header.description_label = line
+    header.actions_layout = box
+    header.set_title = _set_title
+    header.set_description = _set_description
+    return header
+
+
+# ── Chrome: the navigation rail ──────────────────────────────────────────────
+# Two functions and a width. Everything about *where* the rail goes, what is in
+# it and what remembers its state belongs to `ui/app.py`; what belongs here is
+# the one row, so that the row a destination draws and the row a sub-section
+# draws are the same widget at two depths rather than two widgets that drifted.
+
+
+def rail_width(t, *, collapsed: bool = False) -> int:
+    """How wide the navigation rail is, in grid steps rather than in pixels.
+
+    Both values are compositions and both are measured against the same
+    constraint, which is the reason the rail collapses at all. The audit
+    rejected a rail because horizontal space is this app's scarcest resource:
+    at 1280x860 with twenty leads the results table elides 40 of 160 cells and
+    holds that count down to a 1125px viewport, below which it goes to 60. A
+    collapsed rail costs 56 of the 1230px that table has today and leaves it at
+    1174 — the same 40. An open one costs 200 and leaves 1030, which is 60.
+
+    So: `control.md` of icon with `space.3` of air on either side when
+    collapsed, and five of the grid's 40px steps when open — enough for the
+    icon, the gap and a twenty-character destination name at `body`.
+    """
+    if collapsed:
+        return t.control["md"] + t.space["3"] * 2
+    return t.space["8"] * 5
+
+
+def rail(*, collapsed: bool = False) -> QWidget:
+    """The container the navigation rows are stacked in, at its own width.
+
+    `app_bar` is its objectName, and it keeps that name because it is the same
+    object as the bar it replaces: the app's one piece of persistent chrome, and
+    the sheet already grounds it in `surface` and gives it a hairline edge. The
+    one declaration that had to move is which edge — a rail is bounded on the
+    right, a bar underneath — and it is painted here, where every other override
+    of the application sheet in this app already lives.
+
+    The layout is exposed as `column` because the shell fills it and the shell
+    is the only thing that knows what goes in it.
+    """
+    t = active_theme()
+    frame = QWidget()
+    frame.setObjectName("app_bar")
+    _paint(frame, "QWidget#app_bar", background_color=t.color["surface"],
+           border_right="%s solid %s" % (_px(BORDER), t.color["border.subtle"]))
+    frame.setFixedWidth(rail_width(t, collapsed=collapsed))
+    frame.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+
+    column = _vbox(frame, margin="0", spacing="1", t=t)
+    column.setContentsMargins(t.space["2"], t.space["3"], t.space["2"],
+                              t.space["2"])
+    frame.column = column
+    return frame
+
+
+def nav_item(text: str, *, icon=None, depth: int = 0, collapsed: bool = False,
+             current: bool = False, tooltip: str = "") -> QPushButton:
+    """One row of the rail: an icon, a label, and a filled pill when selected.
+
+    The selection is a pill and not the 2px accent rail the sheet gives
+    `QPushButton#tab`, and that is the whole visual argument for a rail over a
+    strip of tabs. A rail is read down a column, where a left edge marking one
+    row in eight is a hairline the eye has to hunt for; a filled rounded ground
+    is found at a glance and is what System Settings, Finder and every editor
+    sidebar in the register use.
+
+    Held to the contract's ordering all the same. The selected ground is
+    `surfaceActive`, which measures 3.01:1 against the `surface` the rail is
+    painted on, and its ink is `text.onAccent`, which is the one tier that reads
+    on it. The resting border is a transparent hairline in every state so that
+    the focus ring — `accent.border`, subordinate to the fill by construction —
+    arrives without moving the row by a pixel.
+
+    A child row is the same widget at `depth=1`: one control height smaller, and
+    indented past the parent's icon so the tree reads as a tree. That is how
+    Finder and System Settings show a section of a destination, and it is where
+    the second row of tabs went.
+
+    `current` is the third state, and it exists because two filled pills stacked
+    on top of each other is one block, not two marks. A destination whose
+    sections are showing under it is not the selection — one of those sections
+    is — so it takes `text.primary` ink and no ground, and what says it is the
+    open one is that it is the only row in the rail with children under it.
+    """
+    t = active_theme()
+    size = "lg" if depth <= 0 else "md"
+    resting = "primary" if current else "secondary"
+    btn = button("" if collapsed else str(text), kind="nav", size=size)
+    btn.setCheckable(True)
+    btn.setToolTip(tooltip or str(text))
+    btn.setAccessibleName(str(text))
+    btn.setProperty("depth", int(depth))
+    btn.setProperty("collapsed", bool(collapsed))
+    btn.setProperty("current", bool(current))
+    btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+    if icon is not None:
+        btn.setIcon(_state_icon(icon, size=_ICON_SIZE.get(size, "sm"),
+                                resting=resting))
+        side = _icons.pixels(_ICON_SIZE.get(size, "sm"))
+        btn.setIconSize(QSize(side, side))
+
+    # The label starts where the parent's icon starts, and a child's starts one
+    # step further in. Written as padding rather than as a spacer so the pill
+    # itself still spans the whole rail — an indented *ground* would read as a
+    # narrower control, which is not what a sub-section is.
+    lead = t.space["3"] + t.space["5"] * max(0, int(depth))
+    tier = "bodyMed" if depth <= 0 else "body"
+    padding = ("0 %s" % _px(t.space["3"]) if collapsed
+               else "0 %s 0 %s" % (_px(t.space["2"]), _px(lead)))
+    _paint_all(btn, (
+        ("QPushButton", {
+            "background_color": "transparent",
+            "color": t.color["text.%s" % resting],
+            "border": "%s solid transparent" % _px(BORDER),
+            "border_radius": _px(t.radius["md"]),
+            "padding": padding,
+            "text_align": "center" if collapsed else "left",
+            "font_size": _px(t.font["body"][0]),
+            "font_weight": t.font[tier][1]}),
+        ("QPushButton:hover", {"color": t.color["text.primary"],
+                               "background_color": t.color["surfaceHover"]}),
+        ("QPushButton:checked", {"color": t.color["text.onAccent"],
+                                 "background_color": t.color["surfaceActive"]}),
+        ("QPushButton:checked:hover", {"color": t.color["text.onAccent"],
+                                       "background_color": t.color["surfaceActive"]}),
+        ("QPushButton:disabled", {"color": t.color["text.disabled"]}),
+        ("QPushButton:focus", _ring(t)),
+    ))
+    return btn
+
+
+def _state_icon(name, *, size: str = "sm", resting: str = "secondary") -> QIcon:
+    """One icon carrying the colours a rail row is read in.
+
+    A stylesheet can swap a row's ink when it is selected and cannot touch the
+    pixmap beside it, so a rail painted from the sheet alone shows a selected
+    row with `text.onAccent` words next to a `text.secondary` drawing. QIcon
+    carries a pixmap per mode and per state and the style picks between them, so
+    the glyph tracks the label instead of being left behind on the one row that
+    matters.
+    """
+    if isinstance(name, QIcon):
+        return name
+    glyph = QIcon()
+    for tone, mode, state in ((resting, QIcon.Normal, QIcon.Off),
+                              ("primary", QIcon.Active, QIcon.Off),
+                              ("onAccent", QIcon.Normal, QIcon.On),
+                              ("onAccent", QIcon.Active, QIcon.On),
+                              ("disabled", QIcon.Disabled, QIcon.Off)):
+        glyph.addPixmap(_icons.pixmap(str(name), tone=tone, size=size),
+                        mode, state)
+    return glyph
+
+
 # ── Controls ─────────────────────────────────────────────────────────────────
 
 # Kind decides colour; the caller never does. One green in the app currently
@@ -502,9 +860,53 @@ _KINDS = {
     "danger_primary": "live",
     "tab": "tab",
     "rehearsal": "rehearsal",
+    "nav": "",
 }
 
 _SIZES = ("xs", "sm", "md", "lg")
+
+# What colour an icon takes on each kind of button. A filled control is the one
+# place the four-tier text ramp is the wrong answer — `ui/icons.py` names the
+# tone the same way this file does, so the glyph and the label beside it resolve
+# to one colour and change together when the palette does.
+_ICON_TONE = {
+    "primary": "onAccent",
+    "danger_primary": "onAccent",
+    "danger": "danger",
+    "rehearsal": "warning",
+    "secondary": "secondary",
+    "ghost": "secondary",
+    "tab": "secondary",
+    "nav": "secondary",
+}
+
+# Which icon size goes with which control height. An icon in a 24px chip and an
+# icon in a 40px primary action are not the same drawing at the same scale, and
+# leaving Qt to pick gives every button the 16px default whatever it is on.
+_ICON_SIZE = {"xs": "xs", "sm": "sm", "md": "sm", "lg": "md"}
+
+
+def _as_icon(icon, *, tone: str = "secondary", size: str = "sm"):
+    """A QIcon from a name in `ui.icons` or a QIcon, and None for anything else.
+
+    A name is the form worth having and the reason this exists: `icon="send"`
+    resolves through the drawn set, in a palette colour, at a grid size, so a
+    call site never holds a pixmap or a colour of its own.
+
+    None rather than `QIcon(text)` for a string that is not a name, because
+    `QIcon` accepts any string, resolves it as a file path, and hands back a
+    null icon in silence — so a typo would render as a control carrying neither
+    a glyph nor a label. The caller falls back to drawing the string as text
+    instead, which is what keeps the one Unicode mark still in this file
+    working: the `×` a chip and a toast dismiss with, for which the drawn set
+    has no shape and should not grow one on a guess.
+    """
+    if icon is None or isinstance(icon, QIcon):
+        return icon
+    name = str(icon)
+    if name in _icons.ICONS:
+        return _icons.icon(name, tone=tone, size=size)
+    return None
 
 
 def button(text: str, *, kind: str = "secondary", size: str = "md", icon=None,
@@ -516,6 +918,11 @@ def button(text: str, *, kind: str = "secondary", size: str = "md", icon=None,
     at 26, 28, 30, 32, 34 and 40px across the app precisely because each call
     site set its own. A caller that wants a different height picks a different
     size; there is no pixel argument to pass.
+
+    `icon` takes a name from `ui.icons` as well as a QIcon, and a name is the
+    form to reach for: it arrives already toned for the kind of button it is
+    landing on and sized for the height it is landing at, so an icon on a filled
+    primary and an icon on a ghost are one drawing in two legible colours.
     """
     t = active_theme()
     if size not in _SIZES:
@@ -529,7 +936,12 @@ def button(text: str, *, kind: str = "secondary", size: str = "md", icon=None,
     btn.setFixedHeight(t.control[size])
     btn.setCursor(Qt.PointingHandCursor)
     if icon is not None:
-        btn.setIcon(icon if isinstance(icon, QIcon) else QIcon(str(icon)))
+        glyph = _as_icon(icon, tone=_ICON_TONE.get(kind, "secondary"),
+                         size=_ICON_SIZE.get(size, "sm"))
+        if glyph is not None:
+            btn.setIcon(glyph)
+            side = _icons.pixels(_ICON_SIZE.get(size, "sm"))
+            btn.setIconSize(QSize(side, side))
     if kind == "ghost":
         _paint_all(btn, (
             ("QPushButton", {
@@ -552,12 +964,18 @@ def button(text: str, *, kind: str = "secondary", size: str = "md", icon=None,
     return btn
 
 
-def icon_button(icon, *, tooltip: str, size: str = "md") -> QToolButton:
-    """A square button carrying a glyph or a QIcon, and always a tooltip.
+def icon_button(icon, *, tooltip: str, size: str = "md",
+                on_click=None) -> QToolButton:
+    """A square button carrying a name from `ui.icons`, a QIcon or a glyph.
 
-    Always, because an icon with no name is a guess: the tooltip is also the
-    accessible name, so a screen reader and a hovering mouse are told the same
-    thing.
+    Always a tooltip, because an icon with no name is a guess: the tooltip is
+    also the accessible name, so a screen reader and a hovering mouse are told
+    the same thing.
+
+    A name is the form to reach for. The three characters this control used to
+    be handed — ☀, ☾, × — are Unicode glyphs in the text font, which means they
+    ignore the palette, ignore the icon set's stroke weight, and on Windows
+    arrive in colour whatever the theme says.
     """
     t = active_theme()
     if size not in _SIZES:
@@ -565,14 +983,19 @@ def icon_button(icon, *, tooltip: str, size: str = "md") -> QToolButton:
     side = t.control[size]
     btn = QToolButton()
     btn.setProperty("role", "icon")
-    if isinstance(icon, QIcon):
-        btn.setIcon(icon)
+    glyph = _as_icon(icon, tone="secondary", size=_ICON_SIZE.get(size, "sm"))
+    if glyph is not None:
+        btn.setIcon(glyph)
+        edge = _icons.pixels(_ICON_SIZE.get(size, "sm"))
+        btn.setIconSize(QSize(edge, edge))
     else:
         btn.setText(str(icon))
     btn.setFixedSize(side, side)
     btn.setCursor(Qt.PointingHandCursor)
     btn.setToolTip(tooltip)
     btn.setAccessibleName(tooltip)
+    if on_click is not None:
+        btn.clicked.connect(lambda _checked=False: on_click())
     # The application sheet has no QToolButton rule at all, so without the
     # `:focus` line here this control is the one thing in the app a keyboard can
     # reach and not see.
@@ -755,6 +1178,12 @@ def search_field(placeholder: str = "Search…", *, max_chars: int = 30) -> QLin
     edit.setPlaceholderText(placeholder)
     edit.setClearButtonEnabled(True)
     edit.setFixedHeight(t.control["sm"])
+    # The one field in the app that is told apart from every other field by
+    # what it does rather than by where it sits, so it is the one that earns a
+    # mark inside the well. Added as an action, which is how Qt puts a glyph in
+    # a line edit without a layout and without stealing the clear button's side.
+    edit.addAction(_icons.icon("search", tone="tertiary", size="sm"),
+                   QLineEdit.LeadingPosition)
     return edit
 
 
@@ -1387,6 +1816,188 @@ def error_state(*, title: str, body: str, retry=None) -> QWidget:
     if isinstance(retry, (tuple, list)) and len(retry) == 2:
         return _state("error", title, body, str(retry[0]), retry[1], t)
     return _state("error", title, body, None, None, t)
+
+
+# ── Data: the activity console ───────────────────────────────────────────────
+# What the Sending view has been reading a campaign out of: a bare QListWidget
+# of proportional 13px lines, tinted three ways and carrying nothing else. Four
+# hundred of those is a wall — a timestamp in a proportional face does not line
+# up column to column, so the eye has no ruler to run down, and a failure looks
+# exactly like a delivery until it is read word by word.
+#
+# The console is the same list with the three things a log needs: a monospace
+# face so every stamp is the same width, a drawn marker per level so a failure
+# is found by shape before it is read, and the two verbs anyone actually does
+# with a log — copy the whole of it somewhere, and clear it.
+
+# Level -> (icon, tone). The tones are the semantic families, so a line's marker
+# and its ink are one colour and both follow the palette.
+_LOG_LEVELS = {
+    "error": ("error", "danger"),
+    "failed": ("error", "danger"),
+    "warning": ("warning", "warning"),
+    "done": ("check", "success"),
+    "success": ("check", "success"),
+    "active": ("clock", "accent"),
+    "sending": ("clock", "accent"),
+    "info": ("info", "info"),
+}
+
+STAMP = "%H:%M:%S"
+
+
+class _LogConsole(QWidget):
+    """A titled, monospaced activity log with a marker per line.
+
+    Newest first, which is the order the send loop already writes in and the
+    right one for a list nobody scrolls: the line that just arrived is the line
+    being waited for, and a console that appends downwards has to either steal
+    the scrollbar back on every message or hide the newest under the fold.
+
+    Every line keeps whatever the caller attached to it, so the double-click
+    that opens the message a line is about survives the move off the raw list —
+    `activated` carries that value back rather than a row index, because the
+    rows renumber under an insert at the top and an index does not.
+    """
+
+    activated = pyqtSignal(object)
+
+    def __init__(self, title: str, placeholder: str, limit: int, t, parent=None):
+        super().__init__(parent)
+        self._limit = max(1, int(limit))
+        self._placeholder = str(placeholder)
+        self._lines: list = []
+        self._theme = t
+
+        box = _vbox(self, margin="0", spacing="2", t=t)
+        head = _hbox(margin="0", spacing="2", t=t)
+        head.addWidget(section_label(title))
+        head.addStretch()
+        self.copy_button = icon_button("copy", tooltip="Copy the whole log",
+                                       size="sm", on_click=self.copy)
+        self.clear_button = icon_button("trash", tooltip="Clear the log",
+                                        size="sm", on_click=self.clear)
+        head.addWidget(self.copy_button)
+        head.addWidget(self.clear_button)
+        box.addLayout(head)
+
+        self.list = QListWidget()
+        self.list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.list.setUniformItemSizes(True)
+        self.list.setWordWrap(False)
+        self.list.setTextElideMode(Qt.ElideRight)
+        self.list.setIconSize(QSize(_icons.pixels("xs"), _icons.pixels("xs")))
+        self.list.itemDoubleClicked.connect(self._on_activated)
+        size, weight = t.font["mono"]
+        _paint_all(self.list, (
+            # The family list is `ui/theme.py`'s own — naming it again here is
+            # the second place a font could be changed, which is the defect this
+            # module exists to stop.
+            ("QListWidget", {"font_family": _theme._MONO,
+                             "font_size": _px(size),
+                             "font_weight": weight,
+                             "background_color": t.color["inset"],
+                             "color": t.color["text.secondary"],
+                             "border": "%s solid %s" % (_px(BORDER),
+                                                        t.color["border.default"]),
+                             "border_radius": _px(t.radius["md"]),
+                             "padding": _px(t.space["1"])}),
+            ("QListWidget::item", {"padding": "%s %s" % (_px(t.space["hair"]),
+                                                         _px(t.space["1"])),
+                                   "border_radius": _px(t.radius["sm"])}),
+            ("QListWidget::item:selected", {
+                "background_color": t.color["surfaceActive"],
+                "color": t.color["text.onAccent"]}),
+            ("QListWidget:focus", _ring(t)),
+        ))
+        box.addWidget(self.list, 1)
+        self._repaint()
+
+    # ── What a caller does to it ─────────────────────────────────────────
+
+    def append(self, text: str, *, level: str = "info", data=None,
+               tooltip: str = "", stamp: bool = True) -> None:
+        """One line, stamped here rather than by every call site."""
+        when = datetime.now().strftime(STAMP) if stamp else ""
+        self._lines.insert(0, (when, str(text), str(level), data, str(tooltip)))
+        del self._lines[self._limit:]
+        self._repaint()
+
+    def clear(self) -> None:
+        self._lines = []
+        self._repaint()
+
+    def copy(self) -> None:
+        """The whole log onto the clipboard, oldest first.
+
+        Oldest first and not as shown: a log pasted into a bug report is read
+        forwards, and the order that makes the newest line easy to find on
+        screen is the wrong one the moment it leaves the screen.
+        """
+        board = QApplication.clipboard()
+        if board is not None:
+            board.setText(self.text())
+
+    def text(self) -> str:
+        return "\n".join("%s  %s" % (when, line) if when else line
+                         for when, line, _lv, _d, _tip in reversed(self._lines))
+
+    def lines(self) -> list:
+        """(stamp, text, level, data), newest first — what the console holds."""
+        return [(when, line, level, data)
+                for when, line, level, data, _tip in self._lines]
+
+    def set_placeholder(self, text: str) -> None:
+        self._placeholder = str(text)
+        self._repaint()
+
+    def restyle(self, t) -> None:
+        """Rebuilt by the caller in the new palette; this is the cheap half."""
+        self._theme = t
+        self._repaint()
+
+    # ── What it draws ────────────────────────────────────────────────────
+
+    def _repaint(self) -> None:
+        """Redraw the list, or the sentence that says what would fill it.
+
+        An unexplained bordered box is the one thing a data surface may not be:
+        an empty console and a console whose campaign has not started look
+        identical, and only one of them means anything is wrong.
+        """
+        t = self._theme
+        self.list.clear()
+        self.copy_button.setEnabled(bool(self._lines))
+        self.clear_button.setEnabled(bool(self._lines))
+        if not self._lines:
+            item = QListWidgetItem(self._placeholder)
+            item.setFlags(Qt.NoItemFlags)
+            item.setForeground(QColor(t.color["text.tertiary"]))
+            self.list.addItem(item)
+            return
+        for when, line, level, data, tip in self._lines:
+            name, tone = _LOG_LEVELS.get(level, _LOG_LEVELS["info"])
+            item = QListWidgetItem("%s  %s" % (when, line) if when else line)
+            item.setIcon(_icons.icon(name, tone=tone, size="xs"))
+            item.setForeground(QColor(
+                _ink(t, tone) if level in _LOG_LEVELS else t.color["text.secondary"]))
+            item.setData(FULL_ROLE, line)
+            if data is not None:
+                item.setData(SORT_ROLE, data)
+            if tip:
+                item.setToolTip(tip)
+            self.list.addItem(item)
+
+    def _on_activated(self, item) -> None:
+        data = item.data(SORT_ROLE)
+        if data is not None:
+            self.activated.emit(data)
+
+
+def log_console(*, title: str = "Activity", placeholder: str = "",
+                limit: int = 400) -> QWidget:
+    """The console the Sending view reads a running campaign out of."""
+    return _LogConsole(title, placeholder, limit, active_theme())
 
 
 # ── Feedback: toasts ─────────────────────────────────────────────────────────
