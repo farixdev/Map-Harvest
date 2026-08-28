@@ -632,6 +632,10 @@ def scrape_domain_progressive(
             return matched, False
 
         cards = parse_feed_html(_feed_html(driver))
+        if cards:
+            missing_critical = sum(1 for c in cards if not c.get("name") or not c.get("maps_link"))
+            if missing_critical / len(cards) > 0.5:
+                worker.log_signal.emit("Warning: Degraded result detected (many listings are missing names or links). Google Maps layout may have changed.", "warning")
         new_this_round = 0
         for card in cards:
             if card.get("_sponsored"):
@@ -710,6 +714,9 @@ def scrape_domain_progressive(
             f'Fetching details {idx}/{total}: {card.get("name", "")[:40]}', "active")
         want = _detail_wants(card, fields, spec)
         detail = _extract_detail(driver, href, want)
+        if detail.get("_error"):
+            card["_error"] = detail["_error"]
+            worker.log_signal.emit(f'Warning: detail extraction failed for {card.get("name", "unknown")}: {detail["_error"]}', "warning")
         for f in want:
             if detail.get(f) and (
                 f in DETAIL_ONLY_FIELDS or f in UPGRADEABLE_FIELDS or not card.get(f)

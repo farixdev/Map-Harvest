@@ -460,7 +460,7 @@ def set_lead_audit(conn, lead_id: int, audit: dict, ai: dict) -> None:
 # ── Campaigns ────────────────────────────────────────────────────────────────
 
 def create_campaign(conn, name: str, template_id: str, profile: dict,
-                    settings_snapshot: dict) -> int:
+                    settings_snapshot: dict, status: str = "draft") -> int:
     """Start a campaign, freezing the profile and settings that shaped it.
 
     The snapshot is not redundant with `settings.json`: a campaign runs for days
@@ -470,9 +470,9 @@ def create_campaign(conn, name: str, template_id: str, profile: dict,
     return _write(
         conn,
         "INSERT INTO campaigns (name, template_id, profile_json, settings_json, "
-        "status, created_at) VALUES (?, ?, ?, ?, 'draft', ?)",
+        "status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
         (_text(name), _text(template_id), _json(profile or {}),
-         _json(settings_snapshot or {}), time.time()),
+         _json(settings_snapshot or {}), _text(status).strip(), time.time()),
     )
 
 
@@ -487,6 +487,10 @@ def list_campaigns(conn) -> list[dict]:
 def set_campaign_status(conn, campaign_id: int, status: str) -> None:
     _write(conn, "UPDATE campaigns SET status = ? WHERE id = ?",
            (_text(status).strip(), _int(campaign_id)))
+
+
+def delete_campaign_messages(conn, campaign_id: int) -> None:
+    _write(conn, "DELETE FROM messages WHERE campaign_id = ?", (_int(campaign_id),))
 
 
 # ── Messages ─────────────────────────────────────────────────────────────────

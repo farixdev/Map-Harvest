@@ -38,11 +38,20 @@ def export_csv(
     if output_path and output_path.lower().endswith(".csv"):
         filepath = output_path
     else:
+        import re
         output_dir = output_path or "."
-        safe_domain = domain.strip().lower().replace(" ", "_")
-        safe_area = area.strip().lower().replace(" ", "_")
-        filename = f"{safe_domain}_in_{safe_area}.csv"
+        safe_domain = re.sub(r'[^a-zA-Z0-9_\-]', '', domain.strip().replace(" ", "_"))[:50]
+        safe_area = re.sub(r'[^a-zA-Z0-9_\-]', '', area.strip().replace(" ", "_"))[:50]
+        safe_domain = safe_domain or "domain"
+        safe_area = safe_area or "area"
+        base_name = f"{safe_domain}_in_{safe_area}"
+        filename = f"{base_name}.csv"
         filepath = os.path.join(output_dir, filename)
+        suffix = 1
+        while os.path.exists(filepath):
+            filename = f"{base_name}_{suffix}.csv"
+            filepath = os.path.join(output_dir, filename)
+            suffix += 1
 
     headers = [FIELD_LABELS[f] for f in fields if f in FIELD_LABELS]
 

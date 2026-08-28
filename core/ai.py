@@ -43,8 +43,8 @@ from core.settings import ai_budget_left, get_secret, note_ai_tokens
 
 # OpenRouter attributes traffic to an app by these two headers and shows
 # "unknown app" without them. They are advertising, not authentication.
-_APP_NAME = "MapHarvest"
-_APP_URL = "https://mapharvest.app"
+_APP_NAME = "LeadForge"
+_APP_URL = "https://leadforge.app"
 
 _PROVIDERS: dict[str, dict] = {
     "groq": {

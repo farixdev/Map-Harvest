@@ -451,7 +451,7 @@ def test_every_keyword_the_contract_names_is_accepted(dark):
 
 
 def test_each_factory_returns_the_type_the_contract_declares(look):
-    assert isinstance(C.screen_header("MapHarvest"), QWidget)
+    assert isinstance(C.screen_header("LeadForge"), QWidget)
     assert isinstance(C.section_label("Leads"), QLabel)
     assert isinstance(C.card(title="Template"), QFrame)
     assert isinstance(C.divider(), QFrame)
@@ -507,7 +507,7 @@ def test_other_controls_take_their_height_from_a_token(look):
     assert _shown(C.status_pill("sent"), DEFAULT).height() == look.control["xs"]
     assert _shown(C.score_badge(72), DEFAULT).height() == look.control["xs"]
     assert _shown(C.chip("company"), DEFAULT).height() == look.control["xs"]
-    header = _shown(C.screen_header("MapHarvest"), DEFAULT)
+    header = _shown(C.screen_header("LeadForge"), DEFAULT)
     assert header.height() == look.control["header"]
 
 
@@ -1147,7 +1147,7 @@ def test_a_chip_can_be_clicked_and_taken_off(look):
 
 def test_the_header_drives_its_own_tabs(look):
     picked = []
-    header = _shown(C.screen_header("MapHarvest", subtitle="Outreach",
+    header = _shown(C.screen_header("LeadForge", subtitle="Outreach",
                                     tabs=("Leads", "Campaign", "Sending", "Stats"),
                                     on_tab=picked.append), DEFAULT)
     assert len(header.tab_buttons) == 4
@@ -1166,7 +1166,7 @@ def test_the_header_drives_its_own_tabs(look):
 def test_the_header_is_the_same_height_on_every_screen(look):
     """Four screens, four top bars: 70px, 50px and none."""
     heights = {_shown(C.screen_header(title), DEFAULT).height()
-               for title in ("MapHarvest", "Settings", "Results", "Outreach")}
+               for title in ("LeadForge", "Settings", "Results", "Outreach")}
     assert heights == {look.control["header"]}
 
 

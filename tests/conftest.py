@@ -40,7 +40,7 @@ import pytest
 import core.settings as _settings
 import core.templates as _templates
 
-_REAL_PROFILE = os.path.join(os.path.expanduser("~"), ".mapharvest")
+_REAL_PROFILE = os.path.join(os.path.expanduser("~"), ".leadforge")
 
 
 def _resolved() -> dict:

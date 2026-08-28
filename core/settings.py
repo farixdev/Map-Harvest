@@ -129,7 +129,16 @@ SMTP_ACCOUNT_DEFAULTS = {
 }
 
 MAX_SAVED_SEARCHES = 12
-SETTINGS_DIR = os.path.join(os.path.expanduser("~"), ".mapharvest")
+OLD_SETTINGS_DIR = os.path.join(os.path.expanduser("~"), ".mapharvest")
+SETTINGS_DIR = os.path.join(os.path.expanduser("~"), ".leadforge")
+
+if os.path.exists(OLD_SETTINGS_DIR) and not os.path.exists(SETTINGS_DIR):
+    import shutil
+    try:
+        shutil.copytree(OLD_SETTINGS_DIR, SETTINGS_DIR)
+    except Exception:
+        pass
+
 SETTINGS_PATH = os.path.join(SETTINGS_DIR, "settings.json")
 
 _SECRET_FIELDS = ("groq_api_key", "openrouter_api_key")

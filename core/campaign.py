@@ -662,12 +662,21 @@ def plan_campaign(conn, *, campaign_id: int, leads: list[dict], template_id: str
     lead list is minutes of crawling, and without this the thread can only be
     killed.
     """
+    conn = conn if conn is not None else _db.connect()
     plan = _blank_plan(campaign_id)
     try:
-        return _plan(conn, plan, leads or [], _text(template_id), profile or {},
-                     settings or {}, ai, progress, should_stop)
+        res = _plan(conn, plan, leads or [], _text(template_id), profile or {},
+                    settings or {}, ai, progress, should_stop)
+        if res.get("cancelled"):
+            _db.set_campaign_status(conn, campaign_id, "cancelled")
+        elif res.get("error") and not res.get("queued"):
+            _db.delete_campaign_messages(conn, campaign_id)
+            _db.set_campaign_status(conn, campaign_id, "failed")
+        return res
     except Exception as exc:
         plan["error"] = f"{type(exc).__name__}: {exc}"[:200]
+        _db.delete_campaign_messages(conn, campaign_id)
+        _db.set_campaign_status(conn, campaign_id, "failed")
         return plan
 
 

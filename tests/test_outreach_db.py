@@ -2,7 +2,7 @@
 
 Every test runs against a throwaway database in a temp directory, and
 `core.settings.SETTINGS_DIR` is redirected there too so that a stray default
-`connect()` can never touch a developer's real ~/.mapharvest/outreach.db.
+`connect()` can never touch a developer's real ~/.leadforge/outreach.db.
 
 Time is never slept on and never read from the clock where it matters: the
 quota tests pass explicit epoch timestamps, so the local-midnight boundary is

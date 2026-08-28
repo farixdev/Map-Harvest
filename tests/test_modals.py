@@ -747,6 +747,7 @@ COVERED = {
     ("ui/screen_outreach.py", "_show_views_menu"): "views_menu",
     ("ui/screen_outreach.py", "_on_start_clicked"): "send_for_real",
     ("ui/screen_outreach.py", "_on_send_now_clicked"): "send_now",
+    ("ui/screen_outreach.py", "_on_plan_ready"): "campaign_review",
     ("ui/screen_outreach.py", "_open_sent_message"): "sent_message",
     ("ui/screen_outreach.py", "_on_import_csv"): "native file picker, OS-owned",
     ("ui/screen_outreach.py", "_on_export_clicked"): "native file picker, OS-owned",
@@ -857,6 +858,12 @@ def test_send_now_asks_before_it_waives_the_schedule_and_can_be_refused():
 
     assert report["worker_started"] is False, "refusing still started a run"
     assert report["sending"] is False
+
+
+def test_campaign_review_dialog_shows_metrics_and_can_be_accepted():
+    report = _driven("campaign_review", click="Approve and Schedule")
+    assert report["seen"]["opened"] is True
+    assert report["seen"]["kind"] == "_CampaignReviewDialog"
 
 
 def test_every_modal_call_site_is_covered():
@@ -1069,7 +1076,7 @@ def _isolate() -> str:
     import core.ai as _ai
     import core.outreach_db as _outreach_db
 
-    real = os.path.join(os.path.expanduser("~"), ".mapharvest")
+    real = os.path.join(os.path.expanduser("~"), ".leadforge")
     for path in (_settings.SETTINGS_DIR, _settings.SETTINGS_PATH,
                  _templates.TEMPLATES_PATH, _outreach_db._default_path(),
                  _ai.cache_path()):
@@ -1451,7 +1458,7 @@ def _outreach(*, leads: int = 0, accounts: bool = False, profile: bool = False):
     screen = SO.OutreachScreen()
     screen.settings["smtp_accounts"] = [
         {"email": "rota@example.com", "display_name": "Sam Whitfield",
-         "enabled": True, "daily_cap": 10}] if accounts else []
+         "enabled": True, "imap_enabled": True, "app_password": "mock", "daily_cap": 10}] if accounts else []
     screen.settings["sender_profile"] = {
         "sender_name": "Sam Whitfield",
         "postal_address": "1 Example Rd, Toronto"} if profile else {}
@@ -1547,13 +1554,19 @@ def _case_suppress(args: dict) -> dict:
 
 @case("lead_menu")
 def _case_lead_menu(args: dict) -> dict:
-    """The menu Suppress is reached from, driven to a harmless entry.
-
-    Deliberately not to Suppress itself: triggering it opens a second modal
-    inside the first one's event loop, and one driver can only be waiting for
-    one dialog. The suppression dialog is covered from the method it calls.
-    """
     from PyQt5.QtWidgets import QApplication
+
+    class MockClipboard:
+        def __init__(self):
+            self._text = ""
+        def setText(self, text):
+            self._text = text
+        def text(self, *args, **kwargs):
+            return self._text
+
+    mock_board = MockClipboard()
+    original_clipboard = QApplication.clipboard
+    QApplication.clipboard = lambda: mock_board
 
     from core import outreach_db as DB
 
@@ -1566,7 +1579,8 @@ def _case_lead_menu(args: dict) -> dict:
                   then=args.get("then"))
     screen._show_lead_menu(pos)
     QApplication.processEvents()
-    return {"seen": seen, "clipboard": QApplication.clipboard().text(),
+    QApplication.clipboard = original_clipboard
+    return {"seen": seen, "clipboard": mock_board.text(),
             "suppressed_after": bool(DB.is_suppressed(screen.conn,
                                                       "lead0@example.com"))}
 
@@ -1651,11 +1665,25 @@ def _case_shell_dry_run(args: dict) -> dict:
             "on_disk": bool(ST.load_settings().get("dry_run", True))}
 
 
+@case("campaign_review")
+def _case_campaign_review(args: dict) -> dict:
+    screen = _outreach(leads=2, accounts=True, profile=True)
+    plan = {
+        "queued": 2, "skipped": 0, "generic": 0, "followup": 0,
+        "accounts": ["rota@example.com"], "days": 5, "warnings": []
+    }
+    screen._campaign_id = 123
+    seen = _drive(click=args.get("click", "Approve and Schedule"))
+    screen._on_plan_ready(plan)
+    return {"seen": seen}
+
+
 @case("send_for_real")
 def _case_send_for_real(args: dict) -> dict:
     screen = _outreach(leads=2, accounts=True, profile=True)
     _queued_campaign(screen, 2)
     screen.settings["dry_run"] = False
+    screen.settings["imap_monitor_enabled"] = True
     seen = _drive(click=args.get("click", ""), key=args.get("key", ""))
     screen._on_start_clicked()
     return {"seen": seen, "worker_started": screen.send_worker is not None,
@@ -1668,6 +1696,7 @@ def _case_send_now(args: dict) -> dict:
     screen = _outreach(leads=2, accounts=True, profile=True)
     _queued_campaign(screen, 2)
     screen.settings["dry_run"] = False
+    screen.settings["imap_monitor_enabled"] = True
     # A window that is shut and a gap that would hold everything: the whole
     # point of the button is that neither of these decides the answer.
     screen.settings["send_start_hour"] = 3
@@ -1705,6 +1734,18 @@ def _case_sent_message(args: dict) -> dict:
 def _case_results_menu(args: dict) -> dict:
     from PyQt5.QtWidgets import QApplication
 
+    class MockClipboard:
+        def __init__(self):
+            self._text = ""
+        def setText(self, text):
+            self._text = text
+        def text(self, *args, **kwargs):
+            return self._text
+
+    mock_board = MockClipboard()
+    original_clipboard = QApplication.clipboard
+    QApplication.clipboard = lambda: mock_board
+
     from ui.screen_results import ResultsScreen
 
     app = _child_app()
@@ -1721,7 +1762,8 @@ def _case_results_menu(args: dict) -> dict:
     seen = _drive(click=args.get("click", ""), key=args.get("key", ""))
     screen._show_row_menu(pos)
     QApplication.processEvents()
-    return {"seen": seen, "clipboard": app.clipboard().text()}
+    QApplication.clipboard = original_clipboard
+    return {"seen": seen, "clipboard": mock_board.text()}
 
 
 # ── Child cases: the settings screen ─────────────────────────────────────────

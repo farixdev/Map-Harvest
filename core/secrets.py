@@ -1,4 +1,4 @@
-"""Credential encryption at rest for ~/.mapharvest/settings.json.
+"""Credential encryption at rest for ~/.leadforge/settings.json.
 
 The settings file sits in the user's home directory in plain sight, and it now
 carries Gmail app passwords and AI API keys. Everything sensitive goes through
@@ -118,7 +118,7 @@ def _xor_key() -> bytes:
         host = os.environ.get("COMPUTERNAME") or socket.gethostname()
     except OSError:
         host = ""
-    return hashlib.sha256((host or "mapharvest").encode("utf-8", "replace")).digest()
+    return hashlib.sha256((host or "leadforge").encode("utf-8", "replace")).digest()
 
 
 def _xor(data: bytes) -> bytes:
@@ -172,3 +172,9 @@ def decrypt(token: str) -> str:
     else:
         return ""
     return raw.decode("utf-8", "replace") if raw else ""
+
+
+def is_secure_store_available() -> bool:
+    crypt32, _ = _load_dpapi()
+    return crypt32 is not None
+

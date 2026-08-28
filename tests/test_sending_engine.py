@@ -100,7 +100,7 @@ def temp_db():
         ST.SETTINGS_DIR = tmp
         ST.SETTINGS_PATH = os.path.join(tmp, "settings.json")
         assert not os.path.realpath(AI.cache_path()).startswith(
-            os.path.realpath(os.path.join(os.path.expanduser("~"), ".mapharvest")))
+            os.path.realpath(os.path.join(os.path.expanduser("~"), ".leadforge")))
         try:
             yield DB.connect(os.path.join(tmp, "outreach.db"))
         finally:
@@ -834,7 +834,7 @@ def test_the_reply_cache_never_resolves_under_the_real_profile():
     and nothing could redirect it afterwards. One personalised lead in the test
     suite then read and rewrote the real user's cache file.
     """
-    real = os.path.realpath(os.path.join(os.path.expanduser("~"), ".mapharvest"))
+    real = os.path.realpath(os.path.join(os.path.expanduser("~"), ".leadforge"))
     with temp_db() as _conn:
         redirected = os.path.realpath(AI.cache_path())
         assert not redirected.startswith(real), redirected

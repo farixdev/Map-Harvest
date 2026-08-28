@@ -19,7 +19,7 @@ Where an assertion is about a ratio rather than about a widget's wiring it runs
 against both palettes.
 
 `SETTINGS_DIR` is redirected into a temp directory before the screen is built,
-so constructing it can never read or write a developer's real ~/.mapharvest —
+so constructing it can never read or write a developer's real ~/.leadforge —
 `core.outreach_db` resolves its own path through it on every call, so the
 database goes to the same place.
 """
@@ -47,7 +47,7 @@ from ui import components as CO  # noqa: E402
 from ui import theme as TH  # noqa: E402
 from ui import screen_outreach as SO  # noqa: E402
 
-_TMP = tempfile.mkdtemp(prefix="mapharvest-outreach-ui-")
+_TMP = tempfile.mkdtemp(prefix="leadforge-outreach-ui-")
 _APP = None
 _SCREEN = None
 

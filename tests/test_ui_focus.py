@@ -32,7 +32,7 @@ fresh host per button.
 
 `tests/conftest.py` has already pointed `core.settings` and `core.templates` at a
 temp profile by the time this imports, so building a screen cannot read or write
-a real ~/.mapharvest — `core.outreach_db` resolves its own path through
+a real ~/.leadforge — `core.outreach_db` resolves its own path through
 `core.settings.SETTINGS_DIR` on every call and is redirected by the same fixture.
 """
 import contextlib

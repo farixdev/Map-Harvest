@@ -326,9 +326,9 @@ _WINDOW_KEEP = 120
 # the only way to send to the personalised half of a list and leave the rest.
 _STATUS_FILTERS = (
     ("All leads", ""), ("Not audited", "new"), ("Audited", "audited"),
-    ("Personalised", "~personal"), ("Generic email", "~generic"),
-    ("Queued", "queued"), ("Sent", "sent"), ("Replied", "replied"),
-    ("Bounced", "bounced"), ("Suppressed", "suppressed"),
+    ("Failed Audits", "~failed"), ("Personalised", "~personal"),
+    ("Generic email", "~generic"), ("Queued", "queued"), ("Sent", "sent"),
+    ("Replied", "replied"), ("Bounced", "bounced"), ("Suppressed", "suppressed"),
 )
 _STATUS_KEYS = [key for _label, key in _STATUS_FILTERS]
 
@@ -1228,6 +1228,49 @@ def _view_sentence(view: dict) -> str:
     return "every lead" if not parts else ", ".join(parts)
 
 
+class _CampaignReviewDialog(QDialog):
+    """Summarizes campaign preparation statistics before scheduling."""
+
+    def __init__(self, plan: dict, parent=None):
+        super().__init__(parent)
+        t = components.active_theme()
+        self.setWindowTitle("Review Campaign Plan")
+        self.setModal(True)
+        box = _rows(self, margin="4", spacing="3", t=t)
+        
+        box.addWidget(components.heading("Campaign Summary", level="h3"))
+        
+        stats_layout = _rows(margin="0", spacing="2", t=t)
+        
+        def add_stat(label, val):
+            row = _cols(margin="0", spacing="1", t=t)
+            row.addWidget(components.body_label(label + ":", max_chars=40))
+            row.addWidget(components.heading(str(val), level="h4"))
+            stats_layout.addLayout(row)
+            
+        add_stat("Queued Messages", plan.get("queued", 0))
+        add_stat("Follow-ups", plan.get("followups", 0))
+        add_stat("Skipped Leads", plan.get("skipped", 0))
+        add_stat("Generic Copies", plan.get("generic", 0))
+        
+        accounts_text = ", ".join(plan.get("accounts", [])) or "None"
+        add_stat("Accounts", accounts_text)
+        add_stat("Sending Days", plan.get("days", 0))
+        
+        box.addLayout(stats_layout)
+        
+        if plan.get("warnings"):
+            box.addWidget(components.heading("Warnings", level="h4"))
+            for w in plan.get("warnings", []):
+                box.addWidget(components.body_label("• " + w, tone="warning", max_chars=80))
+                
+        row = _cols(margin="0", spacing="2", t=t)
+        row.addStretch()
+        row.addWidget(components.button("Discard Plan", kind="secondary", on_click=self.reject))
+        row.addWidget(components.button("Approve and Schedule", kind="primary", on_click=self.accept))
+        box.addLayout(row)
+
+
 class _NameViewDialog(QDialog):
     """Ask for a name for the current filter. One field and two buttons.
 
@@ -1519,6 +1562,8 @@ class OutreachScreen(QWidget):
         self.send_worker = None
         self._auditing = False
         self._planning = False
+        self._leads_dirty = False
+        self._stats_dirty = False
 
         self._leads: list[dict] = []
         # lead id -> why that lead's email would be a form letter, "" when it
@@ -2022,6 +2067,11 @@ class OutreachScreen(QWidget):
                                              size="lg", icon="calendar",
                                              on_click=self._on_prepare_clicked)
         plan_card.body_layout.addWidget(self.prepare_btn)
+        self.cancel_prepare_btn = components.button("Cancel preparation", kind="secondary",
+                                                    size="lg", icon="x-circle",
+                                                    on_click=self._on_cancel_prepare_clicked)
+        self.cancel_prepare_btn.hide()
+        plan_card.body_layout.addWidget(self.cancel_prepare_btn)
         self.goto_sending_btn = components.button(
             "Open Sending", kind="secondary", size="lg", icon="chevron-right",
             on_click=lambda: self._goto_tab(2))
@@ -2726,6 +2776,8 @@ class OutreachScreen(QWidget):
         and costing a dictionary lookup.
         """
         table = self.lead_table
+        scroll_bar = table.verticalScrollBar()
+        scroll_val = scroll_bar.value()
         field, order = self._sort
         self._leads.sort(key=lambda lead: self._sort_key(lead, field),
                          reverse=order == Qt.DescendingOrder)
@@ -2762,6 +2814,7 @@ class OutreachScreen(QWidget):
         # — `relayout` sizes a `fit` column against the rows it can see, and
         # before the paint there are none.
         table.relayout()
+        scroll_bar.setValue(scroll_val)
 
     # ── Leads: the painted window ────────────────────────────────────────────
 
@@ -3059,8 +3112,13 @@ class OutreachScreen(QWidget):
     def _hidden_by(self, lead: dict, wanted: str) -> bool:
         """Would the filters as they stand hide this lead? One row's worth."""
         if wanted.startswith("~"):
-            generic = bool(self._generic.get(_int_of(lead.get("id"))))
-            hide = generic != (wanted == "~generic")
+            if wanted == "~failed":
+                audit = _loads(lead.get("audit_json"))
+                has_error = bool(audit and audit.get("error"))
+                hide = not has_error
+            else:
+                generic = bool(self._generic.get(_int_of(lead.get("id"))))
+                hide = generic != (wanted == "~generic")
         else:
             status = _text_of(lead.get("status")).strip() or "new"
             hide = bool(wanted) and status != wanted
@@ -4378,6 +4436,17 @@ class OutreachScreen(QWidget):
             return
 
         audit = _loads(lead.get("audit_json"))
+        if audit and audit.get("error"):
+            self.subject_label.setText("—")
+            self.subject_count.setText("audit error")
+            self.preview_meta.setText("To %s  ·  Website: %s" % (
+                _text_of(lead.get("name")).strip() or "there",
+                _text_of(lead.get("website")).strip() or "no website"))
+            self._show_paper(
+                "Audit failed for this lead's website:\n\n  %s\n\n"
+                "Please verify the website URL or check if the site is online."
+                % audit["error"])
+            return
         ai = _loads(lead.get("ai_json"))
         ctx = _campaign.apply_compliance(
             _templates.build_context(lead, audit, ai, self._profile(), self.settings),
@@ -4454,8 +4523,6 @@ class OutreachScreen(QWidget):
     def _paint_paper(self) -> None:
         _paint_paper(self.preview)
 
-    # ── Campaign: planning ───────────────────────────────────────────────────
-
     def _on_prepare_clicked(self) -> None:
         if self._planning or self._auditing or not self._retire(self.plan_worker):
             self._toast("A crawl is still running — this starts the moment it "
@@ -4483,7 +4550,7 @@ class OutreachScreen(QWidget):
         name = "%s · %s · %s" % (template.name, _plural(len(leads), "lead"),
                                  datetime.now().strftime("%d %b %H:%M"))
         campaign_id = _db.create_campaign(self.conn, name, template.id,
-                                          self._profile(), self.settings)
+                                          self._profile(), self.settings, status="preparing")
         if not campaign_id:
             self._toast("Could not create the campaign — the database is "
                         "unavailable.", tone="danger")
@@ -4492,6 +4559,10 @@ class OutreachScreen(QWidget):
         self._campaign_id = campaign_id
         self._planning = True
         self.prepare_btn.setEnabled(False)
+        self.prepare_btn.hide()
+        self.cancel_prepare_btn.setEnabled(True)
+        self.cancel_prepare_btn.setText("Cancel preparation")
+        self.cancel_prepare_btn.show()
         self.goto_sending_btn.hide()
         self.plan_progress.setRange(0, max(1, len(leads)))
         self.plan_progress.setValue(0)
@@ -4509,6 +4580,12 @@ class OutreachScreen(QWidget):
         worker.start()
         self._publish_state()
 
+    def _on_cancel_prepare_clicked(self) -> None:
+        if self.plan_worker and self.plan_worker.isRunning():
+            self.cancel_prepare_btn.setEnabled(False)
+            self.cancel_prepare_btn.setText("Cancelling...")
+            self.plan_worker.stop()
+
     def _on_plan_progress(self, done: int, total: int, message: str) -> None:
         self.plan_progress.setRange(0, max(1, total))
         self.plan_progress.setValue(done)
@@ -4517,13 +4594,36 @@ class OutreachScreen(QWidget):
     def _on_plan_ready(self, plan: dict) -> None:
         self._plan = plan if isinstance(plan, dict) else {}
         self.plan_progress.hide()
+        
+        if self._plan and not self._plan.get("error") and not self._plan.get("cancelled"):
+            dialog = _CampaignReviewDialog(self._plan, self)
+            try:
+                if dialog.exec_() != QDialog.Accepted:
+                    _db.delete_campaign_messages(self.conn, self._campaign_id)
+                    _db.set_campaign_status(self.conn, self._campaign_id, "failed")
+                    self._campaign_id = 0
+                    self._plan = {}
+                    self._toast("Campaign plan discarded.", tone="warning")
+            finally:
+                dialog.deleteLater()
+                
         self._refresh_plan_summary()
-        if _int_of(self._plan.get("queued")):
+        if self._plan and _int_of(self._plan.get("queued")):
             self.goto_sending_btn.show()
+        else:
+            self.goto_sending_btn.hide()
         self._refresh_campaigns()
-        self._reload_leads()
-        self._refresh_stats()
+        if self.pages.currentIndex() == 0:
+            self._reload_leads()
+            self._leads_dirty = False
+        else:
+            self._leads_dirty = True
 
+        if self.pages.currentIndex() == 3:
+            self._refresh_stats()
+            self._stats_dirty = False
+        else:
+            self._stats_dirty = True
     def _refresh_plan_summary(self) -> None:
         """What the card says about the schedule, at every stage it has one.
 
@@ -4593,6 +4693,8 @@ class OutreachScreen(QWidget):
     def _on_plan_finished(self) -> None:
         self._planning = False
         self.prepare_btn.setEnabled(True)
+        self.prepare_btn.show()
+        self.cancel_prepare_btn.hide()
         self._publish_state()
 
     # ── Sending ──────────────────────────────────────────────────────────────
@@ -4896,6 +4998,10 @@ class OutreachScreen(QWidget):
                           confirmed: bool = False) -> None:
         if self._sending:
             return
+        if self._planning:
+            self._toast("Cannot start sending while campaign preparation is active.",
+                        tone="warning")
+            return
         if not self._retire(self.send_worker):
             self._toast("The last run is still closing its connection. Press "
                         "Start again in a moment.", tone="warning")
@@ -4914,6 +5020,25 @@ class OutreachScreen(QWidget):
             return
 
         dry = bool(self.settings.get("dry_run", True))
+        if not dry:
+            warnings = _campaign.optout_warnings(self.settings, self._profile())
+            if warnings:
+                body = (
+                    "Live sending blocked: The following opt-out routes are not monitored, "
+                    "which violates compliance standards:\n\n"
+                    + "\n".join("• " + w for w in warnings)
+                    + "\n\nTo comply with opt-out safety, please enable IMAP for these accounts. "
+                    "If you are sure and wish to proceed anyway, confirm below."
+                )
+                if not components.confirm(
+                        self,
+                        title="Opt-out routes not monitored!",
+                        body=body,
+                        confirm_text="Override & Send anyway",
+                        danger=True,
+                        remember_key=""):
+                    return
+
         if not dry and not confirmed and not components.confirm(
                 self,
                 title="Mail %s to real businesses?" % _plural(queued, "message"),
@@ -5491,6 +5616,9 @@ class OutreachScreen(QWidget):
     def _on_tab_changed(self, index: int) -> None:
         if index == 0:
             self._refresh_lead_actions()
+            if self._leads_dirty:
+                self._reload_leads()
+                self._leads_dirty = False
         elif index == 1:
             self._refresh_templates()
             self._refresh_profile()
@@ -5499,7 +5627,11 @@ class OutreachScreen(QWidget):
             self._refresh_accounts()
             self._refresh_send_controls()
         elif index == 3:
-            self._refresh_stats()
+            if self._stats_dirty:
+                self._refresh_stats()
+                self._stats_dirty = False
+            else:
+                self._refresh_stats()
 
     def _toast(self, message: str, *, tone: str = "info", action=None,
                on_action=None):

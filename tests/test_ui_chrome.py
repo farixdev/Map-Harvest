@@ -2917,7 +2917,7 @@ def test_the_export_folder_is_filled_in_before_anyone_is_asked():
     screen = _screen("input")
     saved = screen.export_dir()
     assert saved, "the export folder is empty on a fresh screen again"
-    assert os.path.basename(saved) == "MapHarvest", \
+    assert os.path.basename(saved) == "LeadForge", \
         "the default export folder is %r" % saved
 
     wanted = os.path.join(_TMP, "exports", "first-run")
@@ -5008,7 +5008,7 @@ def test_nothing_the_chrome_remembers_reaches_a_real_profile():
     developer's own profile. It resolves through `core.settings.SETTINGS_DIR` on
     every call instead, which is what makes the redirect above reach it.
     """
-    real = os.path.join(os.path.expanduser("~"), ".mapharvest")
+    real = os.path.join(os.path.expanduser("~"), ".leadforge")
     assert os.path.abspath(APP.state_path()).lower().startswith(
         os.path.abspath(_TMP).lower()), \
         "the chrome remembers itself at %s" % APP.state_path()

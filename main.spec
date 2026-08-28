@@ -28,7 +28,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='MapHarvest',
+    name='LeadForge',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

@@ -3056,6 +3056,13 @@ class SettingsScreen(QWidget):
             "Several accounts spread the volume and keep any one mailbox under "
             "Gmail's limits. Verify each one before the first campaign."
         )))
+        from core.secrets import is_secure_store_available
+        status_text = (
+            "Credential storage: System Secure (Windows DPAPI)"
+            if is_secure_store_available() else
+            "Credential storage: Obfuscated Fallback (Linux/macOS)"
+        )
+        column.addLayout(_measured(_hint(status_text)))
         return page
 
     # ── Sending schedule ─────────────────────────────────────────────────────

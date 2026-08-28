@@ -332,7 +332,7 @@ def _default_export_dir() -> str:
     home = os.path.expanduser("~")
     documents = os.path.join(home, "Documents")
     base = documents if os.path.isdir(documents) else home
-    return os.path.join(base, "MapHarvest")
+    return os.path.join(base, "LeadForge")
 
 
 def _ensure_export_dir(path: str) -> str:

@@ -1,12 +1,12 @@
 @echo off
 setlocal EnableDelayedExpansion
 cd /d "%~dp0"
-title MapHarvest - Build EXE
+title LeadForge - Build EXE
 color 0A
 
 echo(
 echo ==================================================
-echo            MapHarvest  -  Build Windows EXE
+echo            LeadForge  -  Build Windows EXE
 echo ==================================================
 echo(
 
@@ -31,7 +31,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-set "APPNAME=MapHarvest"
+set "APPNAME=LeadForge"
 set "OUTNAME=!APPNAME!-!VERSION!"
 
 REM Optional 2nd arg "debug" -> build with a console window so startup errors
@@ -186,7 +186,7 @@ echo ==================================================
 echo   Scroll up for the PyInstaller error.
 echo(
 echo   Tips:
-echo     * Close the app / any running MapHarvest EXE and retry.
+echo     * Close the app / any running LeadForge EXE and retry.
 echo     * Your antivirus may block PyInstaller - allow it and retry.
 echo     * To see startup errors in a console window, build a debug
 echo       copy with:   BUILD_EXE.bat !VERSION! debug

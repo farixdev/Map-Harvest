@@ -321,7 +321,7 @@ class AppShell(QWidget):
     # bookkeeping the destination it reaches depends on.
     detour_requested = pyqtSignal(str)
 
-    def __init__(self, title: str = "MapHarvest", parent=None):
+    def __init__(self, title: str = "LeadForge", parent=None):
         super().__init__(parent)
         self._title = title
         self._theme = components.active_theme()
@@ -1054,7 +1054,7 @@ class AppShell(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("MapHarvest")
+        self.setWindowTitle("LeadForge")
         # Minimum, not fixed: the outreach and settings screens are dense enough
         # that a user with a big monitor should be able to maximise the window
         # and see a whole lead table at once.
@@ -1345,6 +1345,10 @@ class MainWindow(QMainWindow):
             self.shell.go(key)
 
     def on_settings(self):
+        outreach = self.shell.built(OUTREACH)
+        if outreach is not None and getattr(outreach, "_planning", False):
+            outreach._toast("Cannot change settings while campaign preparation is active.", tone="warning")
+            return
         if self.shell.current_key != SETTINGS:
             self._settings_return = self.shell.current_key or INPUT
         self.shell.go(SETTINGS)
