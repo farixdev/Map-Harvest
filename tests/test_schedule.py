@@ -1077,6 +1077,359 @@ def test_a_stopped_rehearsal_does_not_open_with_a_follow_up():
         print("a stopped rehearsal does not open with a follow-up: OK")
 
 
+# ── Send now ─────────────────────────────────────────────────────────────────
+
+# Saturday 14 March 2026, 22:00. No send day, and hours outside every window,
+# so anything that leaves here left because the clock was waived and not
+# because the schedule happened to allow it.
+SATURDAY_NIGHT = datetime(2026, 3, 14, 22, 0).timestamp()
+
+
+def test_send_now_does_not_release_a_chaser_before_its_first_touch():
+    """The measured symptom: five leads, fifteen messages, all in one second.
+
+    `release_now` brought every queued row forward in `scheduled_at` order, and
+    with follow-ups configured that is the whole sequence. Each stranger's
+    first three emails arrived together — the cold pitch, "bumping my last
+    email", and the closing note — which is the one thing the four-day gap in
+    the plan exists to prevent.
+    """
+    with temp_db() as conn:
+        _plan, campaign_id, settings = _plan_campaign(conn, 5, dry_run=False)
+        assert len(_messages(conn, campaign_id)) == 15
+
+        assert C.release_now(conn, campaign_id, 15) == 5, \
+            "a chaser was brought forward past the touch it chases"
+        now = time.time()
+        released = [row for row in _messages(conn, campaign_id)
+                    if row["scheduled_at"] <= now + 1]
+        assert {row["step"] for row in released} == {0}, \
+            sorted((row["step"], row["scheduled_at"]) for row in released)
+
+        # Pressing it again once the first touches have gone releases the next
+        # step, and only the next step: chasing now is then a decision the user
+        # takes having watched the first touch leave.
+        for row in released:
+            DB.mark_message(conn, row["id"], "sent", sent_at=now,
+                            message_id="<x%d@shop.test>" % row["id"])
+        assert C.release_now(conn, campaign_id, 15) == 5
+        again = [row for row in _messages(conn, campaign_id)
+                 if row["status"] == "queued" and row["scheduled_at"] <= time.time() + 1]
+        assert {row["step"] for row in again} == {1}, sorted(r["step"] for r in again)
+        print("send now does not release a chaser before its first touch: OK")
+
+
+def test_send_now_waives_the_clock_and_keeps_the_daily_cap():
+    """The window and the gap are the user's to waive. The daily cap is not.
+
+    The window and the random spacing exist to keep a mailbox looking like a
+    person typing, and somebody who has decided to go now can waive that for
+    themselves. The daily cap is what stands between them and a suspended
+    Gmail account, so nothing on this path can lift it — including a queue
+    that has been released past it, which is what this releases.
+    """
+    with temp_db() as conn:
+        with fake_clock(SATURDAY_NIGHT) as clock:
+            _plan, campaign_id, settings = _plan_campaign(
+                conn, 12, dry_run=False, followup_enabled=False,
+                daily_cap_per_account=4, send_min_gap_sec=600, send_max_gap_sec=900)
+            settings["smtp_accounts"][0]["daily_cap"] = 4
+            assert C.release_now(conn, campaign_id, 12) == 12
+
+            with stub_smtp() as (opened, wire), stub_imap():
+                worker = C.OutreachWorker(campaign_id, settings, dry_run=False,
+                                          ignore_schedule=True)
+                worker._nap = lambda seconds: worker.stop()
+                worker.run()
+
+            sent = [row for row in _messages(conn, campaign_id)
+                    if row["status"] == "sent"]
+            assert len(sent) == 4, \
+                "a cap of 4 a day let %d messages through" % len(sent)
+            assert len(wire) == 4 and opened, (len(wire), opened)
+
+            stamps = sorted(row["sent_at"] for row in sent)
+            assert stamps[-1] - stamps[0] < settings["send_min_gap_sec"], \
+                "send now sat out the pacing gap it was told to waive"
+            assert not any(C.in_send_window(ts, settings) for ts in stamps), \
+                "send now waited for the sending window"
+            # And the quota ledger the cap is read off agrees with the wire.
+            assert DB.sent_today(conn, "s0@shop.test", settings.get("send_timezone"),
+                                 now_ts=clock.now) == 4
+        print("send now waives the clock and keeps the daily cap: OK")
+
+
+def test_an_hourly_cap_does_not_send_a_send_now_run_into_next_week():
+    """The measured symptom: 30 of 40 messages held 35 hours by a one-hour cap.
+
+    An hourly cap holding the queue was treated exactly like a spent day: the
+    backlog went through `_replan`, which places into the next *window* open,
+    and on a Saturday evening that is Monday morning. A user who had just
+    pressed Send now watched ten messages leave and the rest go quiet for a day
+    and a half, under a line that said every account was at its cap for today
+    while 35 of each account's 40 a day were still unspent.
+    """
+    with temp_db() as conn:
+        with fake_clock(SATURDAY_NIGHT) as clock:
+            _plan, campaign_id, settings = _plan_campaign(
+                conn, 20, dry_run=False, followup_enabled=False,
+                hourly_cap_per_account=5, daily_cap_per_account=40)
+            assert C.release_now(conn, campaign_id, 20) == 20
+
+            said: list = []
+            with stub_smtp() as (_opened, wire), stub_imap():
+                worker = C.OutreachWorker(campaign_id, settings, dry_run=False,
+                                          ignore_schedule=True)
+                worker.log_signal.connect(lambda text, level: said.append(text))
+                worker._nap = lambda seconds: worker.stop()
+                worker.run()
+
+            rows = _messages(conn, campaign_id)
+            assert len([row for row in rows if row["status"] == "sent"]) == 5
+            held = [row for row in rows if row["status"] == "queued"]
+            assert len(held) == 15
+            assert all(row["scheduled_at"] <= SATURDAY_NIGHT + 1 for row in held), \
+                "the hourly cap pushed the queue into the next window"
+
+            hourly = [text for text in said if "hourly limit" in text]
+            assert len(hourly) == 1, said
+            assert C._clock(clock.now + C._HOUR_SEC) in hourly[0], hourly[0]
+            assert not any("allowance for today" in text for text in said), \
+                "an hourly hold was reported as the day's allowance being spent"
+        print("an hourly cap does not send a send-now run into next week: OK")
+
+
+# ── A held queue must never look like a dead button ──────────────────────────
+
+def test_a_queue_held_by_the_window_says_so():
+    """The commonest "glitch" report there is, and it was entirely silent.
+
+    A campaign prepared on a Saturday sends on Monday, which is correct. Press
+    Start and the button greys out, the counter sits at zero, and the log gets
+    nothing at all: measured before this, twenty passes of the send loop —
+    ten minutes of a user watching — wrote one line, and that line was
+    "Stopped", when they gave up.
+    """
+    with temp_db() as conn:
+        with fake_clock(SATURDAY_NIGHT) as clock:
+            _plan, campaign_id, settings = _plan_campaign(
+                conn, 8, dry_run=False, followup_enabled=False)
+
+            said: list = []
+            with stub_smtp() as (opened, wire), stub_imap():
+                worker = C.OutreachWorker(campaign_id, settings, dry_run=False)
+                worker.log_signal.connect(lambda text, level: said.append(text))
+                naps = [0]
+
+                def nap(seconds: float) -> None:
+                    naps[0] += 1
+                    clock.now += max(1.0, float(seconds))
+                    if naps[0] >= 20:
+                        worker.stop()
+
+                worker._nap = nap
+                worker.run()
+
+            assert wire == [] and opened == [], "the window did not hold the queue"
+            held = [text for text in said if "Outside the sending window" in text]
+            # Once, not once per nap: the hold lasts hours and the sends either
+            # side of it have to stay readable.
+            assert len(held) == 1, "%d hold lines in %d" % (len(held), len(said))
+            assert "8 message(s)" in held[0], held[0]
+            assert C._clock(C.next_window_open(SATURDAY_NIGHT, settings)) in held[0], \
+                held[0]
+        print("a queue held by the window says so: OK")
+
+
+def test_a_queue_that_can_never_go_out_ends_the_run():
+    """A crash inside `suppress` leaves a campaign that reads as busy for ever.
+
+    `suppress` writes the address and then cancels that lead's queued rows, and
+    the two are separate statements. Die in between and `campaign_stats` counts
+    a queue while `due_messages` — which refuses a suppressed lead — hands back
+    nothing, for ever. That ran here as a thirty-second nap repeated until the
+    app was closed, with nothing in the log and the screen saying "Sending".
+    """
+    with temp_db() as conn:
+        worker, _settings, _row = _queued_run(conn, 3)
+        campaign_id = worker.campaign_id
+        for lead in DB.list_leads(conn):
+            DB._write(conn, "INSERT INTO suppression (email, reason, added_at) "
+                            "VALUES (?, ?, ?)", (lead["email"], "unsubscribed",
+                                                 time.time()))
+
+        said: list = []
+        worker.log_signal.connect(lambda text, level: said.append(text))
+        naps = [0]
+
+        def nap(seconds: float) -> None:
+            naps[0] += 1
+            if naps[0] > 5:
+                worker.stop()
+
+        worker._nap = nap
+        with stub_smtp() as (opened, wire), stub_imap():
+            worker.run()
+
+        assert wire == [] and opened == [], "a message went to a suppressed address"
+        assert naps[0] == 0, "the loop napped %d times over a queue that can never go" \
+                             % naps[0]
+        assert any("can ever go out" in text for text in said), said
+        assert DB.get_campaign(conn, campaign_id)["status"] == "stopped"
+        assert {row["status"] for row in _messages(conn, campaign_id)} == {"queued"}, \
+            "the run rewrote a queue it had decided it could not send"
+        print("a queue that can never go out ends the run: OK")
+
+
+# ── Pause, resume, stop ──────────────────────────────────────────────────────
+
+def test_pause_holds_the_queue_and_resume_finishes_it():
+    """Pause has to land between messages and give the queue back untouched."""
+    with temp_db() as conn:
+        worker, _settings, _row = _queued_run(conn, 8, send_min_gap_sec=0,
+                                              send_max_gap_sec=0)
+        campaign_id = worker.campaign_id
+        sent: list = []
+        state = {"naps": 0, "at_pause": 0, "at_resume": 0, "while_paused": 0}
+
+        def note(row: dict) -> None:
+            sent.append(int(row["id"]))
+            if worker._paused:
+                state["while_paused"] += 1
+            elif len(sent) == 3 and not state["at_pause"]:
+                worker.pause()
+                state["at_pause"] = len(sent)
+
+        worker.message_sent_signal.connect(note)
+
+        def nap(seconds: float) -> None:
+            state["naps"] += 1
+            if worker._paused and state["naps"] >= 4:
+                state["at_resume"] = len(sent)
+                worker.resume()
+            if state["naps"] > 200:
+                worker.stop()
+
+        worker._nap = nap
+        with stub_smtp() as (_opened, wire), stub_imap():
+            worker.run()
+
+        assert (state["at_pause"], state["at_resume"]) == (3, 3), state
+        assert state["while_paused"] == 0, "a message left while the run was paused"
+        assert len(wire) == 8, "%d of 8 went out" % len(wire)
+        assert {row["status"] for row in _messages(conn, campaign_id)} == {"sent"}
+        assert DB.get_campaign(conn, campaign_id)["status"] == "done"
+        print("pause holds the queue and resume finishes it: OK")
+
+
+def test_stop_lands_promptly_and_leaves_the_queue_coherent():
+    """Stop finishes the message in flight; everything else stays queued.
+
+    Nothing may be left in `sending`: that status means "handed to a server,
+    outcome unknown", and the next run writes every one of those off as sent
+    rather than risk a second copy. A stop that produced them would cost the
+    campaign a message per press.
+    """
+    with temp_db() as conn:
+        worker, _settings, _row = _queued_run(conn, 9, send_min_gap_sec=0,
+                                              send_max_gap_sec=0)
+        campaign_id = worker.campaign_id
+        sent: list = []
+
+        def note(row: dict) -> None:
+            sent.append(int(row["id"]))
+            if len(sent) == 3:
+                worker.stop()
+
+        worker.message_sent_signal.connect(note)
+        worker._nap = lambda seconds: None
+        with stub_smtp() as (_opened, wire), stub_imap():
+            worker.run()
+
+        counts: dict = {}
+        for row in _messages(conn, campaign_id):
+            counts[row["status"]] = counts.get(row["status"], 0) + 1
+        assert len(wire) == 3, "%d messages left after Stop" % len(wire)
+        assert counts == {"sent": 3, "queued": 6}, counts
+        assert DB.get_campaign(conn, campaign_id)["status"] == "stopped"
+        print("stop lands promptly and leaves the queue coherent: OK")
+
+
+# ── Every SMTP error class ───────────────────────────────────────────────────
+
+def test_every_smtp_error_class_lands_on_the_right_outcome():
+    """AUTH and QUOTA bench the account, RECIPIENT drops the lead, CONN retries.
+
+    One table rather than five tests, because what matters is that no two of
+    them are handled the same way: benching an account over one dead address
+    stalls a campaign for a day, and skipping a lead over a quota error loses
+    it for good. `core.mailer` classifies; this is the half that acts on it.
+    """
+    outcomes = {
+        # error -> (message status, the account is benched, the lead is suppressed)
+        "AUTH: Gmail rejected the sign-in": ("queued", True, False),
+        "QUOTA: 550 5.4.5 Daily user sending limit exceeded": ("queued", True, False),
+        "RECIPIENT: 550 5.1.1 does not exist": ("failed", False, True),
+        "CONN: 421 4.7.0 try again later": ("queued", False, False),
+        "OTHER: 554 5.6.0 message rejected": ("failed", False, False),
+    }
+    for error, expected in outcomes.items():
+        with temp_db() as conn:
+            worker, settings, row = _queued_run(conn, 2)
+            worker._senders["s0@shop.test"] = _DeadSender(error)
+            now = time.time()
+
+            worker._send(conn, row, ST.smtp_accounts(settings)[0], now)
+
+            after = DB._one(conn, "SELECT * FROM messages WHERE id = ?", (row["id"],))
+            lead = DB.get_lead(conn, row["lead_id"])
+            got = (after["status"], bool(worker._stopped),
+                   DB.is_suppressed(conn, lead["email"]))
+            assert got == expected, (error, got, expected)
+            # Pacing and quota belong to the attempt, not to its outcome: a
+            # provider reads a refusal exactly as plainly as a delivery.
+            assert worker._next_ok.get("s0@shop.test", 0.0) > now, error
+            assert DB.sent_today(conn, "s0@shop.test", settings.get("send_timezone"),
+                                 now_ts=now) == 1, error
+    print("every SMTP error class lands on the right outcome: OK")
+
+
+def test_a_backlog_left_by_a_closed_app_replans_inside_the_caps():
+    """A week shut. Everything is overdue at once and must not go out at once."""
+    monday = datetime(2026, 3, 9, 9, 30).timestamp()
+    week_back = monday - 7 * 86400
+    with temp_db() as conn:
+        with fake_clock(week_back):
+            _plan, campaign_id, settings = _plan_campaign(
+                conn, 24, dry_run=False, followup_enabled=False,
+                daily_cap_per_account=5)
+        settings["smtp_accounts"][0]["daily_cap"] = 5
+        DB._write(conn, "UPDATE messages SET scheduled_at = ? WHERE campaign_id = ?",
+                  (week_back, campaign_id))
+
+        with fake_clock(monday) as clock, stub_smtp() as (_opened, wire), stub_imap():
+            worker = C.OutreachWorker(campaign_id, settings, dry_run=False)
+            _run_to_the_end(worker, conn, campaign_id, clock)
+
+        rows = _messages(conn, campaign_id)
+        assert {row["status"] for row in rows} == {"sent"}, \
+            sorted({row["status"] for row in rows})
+        assert len(wire) == 24, len(wire)
+
+        per_day: dict = {}
+        for row in rows:
+            assert C.in_send_window(row["sent_at"], settings), row["sent_at"]
+            day = datetime.fromtimestamp(row["sent_at"]).date()
+            per_day[day] = per_day.get(day, 0) + 1
+        assert max(per_day.values()) <= 5, sorted(per_day.items())
+
+        stamps = sorted(row["sent_at"] for row in rows)
+        gaps = [later - earlier for earlier, later in zip(stamps, stamps[1:])
+                if _day(earlier) == _day(later)]
+        assert min(gaps) >= settings["send_min_gap_sec"], min(gaps)
+        print("a backlog left by a closed app replans inside the caps: OK")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

@@ -43,6 +43,7 @@ import codecs
 import concurrent.futures
 import gzip
 import html as _htmlmod
+import http.client
 import io
 import json
 import re
@@ -249,11 +250,26 @@ def _decode_body(raw: bytes, content_type: str) -> str:
 
 
 def _short_error(exc: Exception) -> str:
-    """One lowercase word or two — this ends up in a GUI column, not a log."""
+    """One lowercase word or two — this ends up in a GUI column, not a log.
+
+    Every word here is read back by `core.audit.unreachable_reason`, which turns
+    it into the sentence the Leads table prints. "unreachable" used to swallow a
+    refused connection, a dropped one and a redirect loop alike, and the three
+    of them want three different things done about the lead: the first is a host
+    that is up and saying no, the second is worth one retry, the third is a site
+    whose new address the operator can go and find.
+    """
     if isinstance(exc, urllib.error.HTTPError):
+        # urllib raises this, not a URLError, when the redirect chain never ends.
+        if "redirect" in str(getattr(exc, "reason", "") or "").lower():
+            return "redirect loop"
         return "http %d" % exc.code
     if isinstance(exc, (socket.timeout, TimeoutError)):
         return "timeout"
+    if isinstance(exc, ConnectionRefusedError):
+        return "refused"
+    if isinstance(exc, (ConnectionResetError, ConnectionAbortedError)):
+        return "reset"
     if isinstance(exc, urllib.error.URLError):
         reason = getattr(exc, "reason", None)
         if isinstance(reason, socket.gaierror):
@@ -262,9 +278,15 @@ def _short_error(exc: Exception) -> str:
             return "timeout"
         if isinstance(reason, ssl.SSLError):
             return "ssl"
+        if isinstance(reason, ConnectionRefusedError):
+            return "refused"
+        if isinstance(reason, (ConnectionResetError, ConnectionAbortedError)):
+            return "reset"
         return "unreachable"
     if isinstance(exc, ssl.SSLError):
         return "ssl"
+    if isinstance(exc, http.client.HTTPException):
+        return "reset"
     return type(exc).__name__.lower()
 
 
@@ -1414,6 +1436,20 @@ def harvest_site(url: str, *, max_pages: int = 4, timeout: float = 8.0,
         return out
 
 
+def _status_of(error: str) -> int:
+    """The HTTP status inside an error string like "http 404", else 0.
+
+    `_fetch_page` reports a status as text because most of its failures have no
+    status at all -- a refused connection, an NXDOMAIN, a timeout. This reads
+    one back out when there is one.
+    """
+    text = str(error or "").strip().lower()
+    if not text.startswith("http "):
+        return 0
+    digits = text[5:].strip().split()[0] if text[5:].strip() else ""
+    return int(digits) if digits.isdigit() else 0
+
+
 def _harvest(out: dict, max_pages: int, timeout: float, workers: int,
              verify_dns: bool, accept_free_mail: bool) -> dict:
     start = _normalise_url(out["url"])
@@ -1430,6 +1466,18 @@ def _harvest(out: dict, max_pages: int, timeout: float, workers: int,
     if not html:
         out["final_url"] = final_url or start
         out["error"] = error or "unreachable"
+        return out
+
+    # An error page still carries a body, and a branded 404 reads like a website
+    # to every rule in the audit -- which is how "no way to capture a lead" got
+    # written from an expired domain's error page and mailed as an observation
+    # about the business. `if not html` never caught it because the body is
+    # real; the status is the only thing that knows. Expired and reclaimed
+    # domains serving a styled 404 are exactly what a scraped list is full of.
+    status = _status_of(error)
+    if status >= 400:
+        out["final_url"] = final_url or start
+        out["error"] = error
         return out
 
     final_url = final_url or start

@@ -99,10 +99,31 @@ GAP_CATALOGUE: dict[str, dict] = {
         "subject_phrase": "capturing leads from the site",
         "services": _svc("Lead Generation", "Lead Automation"),
     },
+    # The site does ask, and what it asks is "write to us". A published address
+    # is a lead route, so `no_lead_capture` is only half the story about it: the
+    # enquiries arrive, and they arrive as prose in a mailbox with nothing
+    # reading them. That is the one shape the catalogue answers by name.
+    "email_only_intake": {
+        "title": "an inbox doing the intake", "severity": 2,
+        # Not "how enquiries come in": the follow-up subject is "one more note
+        # on {phrase}", and `_clean_subject` strips a trailing preposition, so
+        # that phrase arrived in the inbox as "...on how enquiries come".
+        "subject_phrase": "where enquiries land",
+        "services": _svc("AI email processing", "AI lead qualification"),
+    },
     "no_live_chat": {
         "title": "no live chat", "severity": 2,
         "subject_phrase": "live chat",
         "services": _svc("AI customer-support agents", "AI lead qualification"),
+    },
+    # A green button that opens a phone. It is a real lead route and the reader
+    # is proud of it, so this is never phrased as a fault — it is the one gap in
+    # the table whose evidence describes something that already works, and the
+    # offer is to stop it needing a person on the other end at nine at night.
+    "whatsapp_manual": {
+        "title": "a WhatsApp button answered by hand", "severity": 2,
+        "subject_phrase": "the WhatsApp button",
+        "services": _svc("WhatsApp workflows", "AI customer-support agents"),
     },
     "quote_by_form": {
         "title": "quotes handled by hand", "severity": 2,
@@ -159,6 +180,15 @@ GAP_CATALOGUE: dict[str, dict] = {
         # score, and it never becomes the sentence an offer has to follow.
         "services": [],
     },
+    # Empty for the reason above: a certificate is hosting work. It earns a row
+    # anyway because `has_ssl` was already being measured and no rule read it,
+    # and because the operator sorting this list wants to know which of these
+    # sites a browser is putting a warning in front of.
+    "no_ssl": {
+        "title": "a site browsers mark as not secure", "severity": 2,
+        "subject_phrase": "how the site is served",
+        "services": [],
+    },
     "stale_blog": {
         "title": "a blog that has gone quiet", "severity": 1,
         "subject_phrase": "the blog",
@@ -168,6 +198,16 @@ GAP_CATALOGUE: dict[str, dict] = {
         "title": "no social profiles linked", "severity": 1,
         "subject_phrase": "social profiles",
         "services": _svc("social media workflows", "Marketing Automation"),
+    },
+    # Only for a site that already prints praise. "You have no reviews" is a
+    # guess about a Google listing this module has never seen; "the quotes on
+    # your own page were typed in by hand and nothing sends a finished customer
+    # to leave a real one" is a fact about the page, and the offer follows from
+    # it without anybody having to be told their reputation is thin.
+    "no_review_capture": {
+        "title": "reviews that never get asked for", "severity": 1,
+        "subject_phrase": "asking customers for reviews",
+        "services": _svc("automatic follow-ups", "Marketing Automation"),
     },
     "stale_site": {
         "title": "a site nobody has touched in years", "severity": 1,
@@ -234,9 +274,20 @@ _CMS_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
 # excused from `price_opaque`, because a storefront prints its prices next to
 # the buttons. A missing platform therefore costs two claims at once — the shop
 # is told nobody automates its orders, and told it publishes no prices.
+#
+# `woocommerce` is why the bare vendor name is gone from this table. It matched
+# a web agency's own services list — "WooCommerce development, Shopify theme
+# builds" — and the email told a business that builds shops for other people
+# that its own orders need picking and invoicing, then suppressed `price_opaque`
+# on the way past, because a shop is excused from publishing prices. One word in
+# a list cost two claims. What replaced it is what a shop actually emits: a cart
+# endpoint, the plugin's own asset path, the JS config object it writes.
 _ECOMMERCE_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("shopify", ("cdn.shopify.com", "shopify.theme", "myshopify.com", "/cdn/shop/")),
-    ("woocommerce", ("woocommerce", "wc-ajax", "/plugins/woocommerce", "wc-add-to-cart")),
+    ("shopify", ("cdn.shopify.com", "shopify.theme", "myshopify.com", "/cdn/shop/",
+                 "shopify-buy", "/cart/add")),
+    ("woocommerce", ("wc-ajax", "/plugins/woocommerce", "wc-add-to-cart",
+                     "woocommerce-page", "wc_add_to_cart_params", "woocommerce_params",
+                     "/woocommerce/assets/", "wc-blocks", "add-to-cart=")),
     ("bigcommerce", ("cdn11.bigcommerce.com", "bigcommerce.com/stencil", "bigcommerce.js")),
     ("magento", ("/static/version", "mage/cookies", "magento_", "/pub/static/frontend")),
     ("ecwid", ("app.ecwid.com", "ecwid.com/script.js", "ecwid_script", "ec-store")),
@@ -249,6 +300,21 @@ _ECOMMERCE_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("lightspeed", ("cdn.shoplightspeed.com", "shoplightspeed.com/assets")),
     ("shopware", ("shopware.com", "/bundles/storefront")),
     ("volusion", ("volusion.com", "/v/vspfiles/")),
+    ("snipcart", ("cdn.snipcart.com", "snipcart.js", "snipcart-add-item")),
+    ("foxycart", ("cdn.foxycart.com", "foxycart.com/cart")),
+    ("gumroad", ("gumroad.com/l/", "gumroad.js")),
+    ("podia", ("podia.com/embed", "assets.podia.com")),
+    ("sendowl", ("transactions.sendowl.com",)),
+    ("commercejs", ("assets.chec.io", "commercejs.com")),
+    ("swell", ("cdn.swell.store", "swell.js")),
+    ("shift4shop", ("shift4shop.com", "3dcart.com", "/assets/templates/")),
+    ("zencart", ("index.php?main_page=product_info", "includes/templates/")),
+    ("jtl", ("jtl-shop", "/asset/plugin/jtl_")),
+    ("oxid", ("oxid-esales", "/out/azure/src/")),
+    ("drupal_commerce", ("commerce_cart", "/commerce/cart-block")),
+    # Deliberately not a link to an Etsy or Amazon storefront. That is a shop,
+    # but it is somebody else's page: reading it as one here would excuse this
+    # site from `price_opaque` on the strength of prices it does not publish.
 )
 
 # Every table below ends where its list of vendors ends, and each of these rules
@@ -290,6 +356,28 @@ _ANALYTICS_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("simple_analytics", ("scripts.simpleanalyticscdn.com",)),
     ("goatcounter", ("gc.zgo.at/count.js",)),
     ("fathom", ("cdn.usefathom.com",)),
+    # A site behind Cloudflare gets a page-view counter whether it asked for one
+    # or not, and the WordPress plugins below inject Google's tag without ever
+    # printing a gtag call the old table could see. Both were read as a site
+    # nobody measures.
+    ("cloudflare_insights", ("static.cloudflareinsights.com", "cf-beacon")),
+    ("monsterinsights", ("monsterinsights", "/plugins/google-analytics-for-wordpress")),
+    ("site_kit", ("googlesitekit", "/plugins/google-site-kit")),
+    ("fullstory", ("fullstory.com/s/fs.js", "edge.fullstory.com")),
+    ("mouseflow", ("cdn.mouseflow.com",)),
+    ("smartlook", ("web-sdk.smartlook.com", "manager.smartlook.com")),
+    ("luckyorange", ("cdn.luckyorange.com", "luckyorange.net")),
+    ("posthog", ("posthog.com/static/array.js", "app.posthog.com", "posthog.init")),
+    ("pendo", ("cdn.pendo.io",)),
+    ("kissmetrics", ("scripts.kissmetrics.com", "kissmetrics.io")),
+    ("chartbeat", ("static.chartbeat.com",)),
+    ("quantcast", ("secure.quantserve.com", "quantcast.mgr")),
+    ("vercel_analytics", ("/_vercel/insights", "va.vercel-scripts.com")),
+    ("splitbee", ("cdn.splitbee.io",)),
+    ("panelbear", ("cdn.panelbear.com",)),
+    ("usermaven", ("t.usermaven.com",)),
+    ("wix_analytics", ("tag-manager-client", "wix-analytics")),
+    ("shopify_analytics", ("shopifycloud/web-pixels-manager", "trekkie.storefront")),
 )
 
 # Eleven vendors were missing here and every one of them draws a box in the
@@ -321,6 +409,37 @@ _CHAT_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("helpcrunch", ("widget.helpcrunch.com", "helpcrunch.com/sdk", "helpcrunchsettings")),
     ("salesforce_chat", ("salesforceliveagent", "service.force.com/embeddedservice",
                          "liveagent.js", "embeddedservice_bootstrap")),
+    # Round two of the same lesson. A site builder that ships its own chat is
+    # the worst case of all — the owner did not install anything, the box is
+    # simply there, and being told it is not is being told the writer never
+    # opened the page. Wix, Shopify and Squarespace all ship one.
+    ("wix_chat", ("wix-visitor-chat", "wixchat", "chat-widget-app")),
+    ("shopify_inbox", ("shopifycloud/chat", "shopify-chat", "chat.shopify.com")),
+    ("squarespace_chat", ("squarespace.com/api/chat", "sqs-chat")),
+    ("gohighlevel_chat", ("leadconnectorhq.com/chat-widget", "widgets.leadconnectorhq.com",
+                          "chat-widget/loader")),
+    ("helpscout", ("beacon-v2.helpscout.net", "beaconapi.helpscout", "window.beacon")),
+    ("gorgias", ("config.gorgias.chat", "gorgias.chat", "gorgias-chat")),
+    ("reamaze", ("cdn.reamaze.com", "reamaze.js")),
+    ("kustomer", ("cdn.kustomerapp.com", "kustomer.start")),
+    ("front", ("chat-assets.frontapp.com", "frontchat")),
+    ("trengo", ("static.widget.trengo.eu", "trengo.key")),
+    ("podium", ("connect.podium.com", "podium.com/widget", "podium-widget")),
+    ("birdeye", ("birdeye.com/embed", "cdn.birdeye.com", "birdeye-webchat")),
+    ("chaport", ("app.chaport.com", "chaport.com/javascripts")),
+    ("chatway", ("cdn.chatway.app", "chatway.app/widget")),
+    ("comm100", ("vue.comm100.com", "comm100.com/livechat")),
+    ("livehelpnow", ("livehelpnow.net", "lhnjquery")),
+    ("snapengage", ("snapengage.com",)),
+    ("gist", ("getgist.com",)),
+    ("manychat", ("mccdn.me", "manychat.com/widget")),
+    ("landbot", ("cdn.landbot.io", "landbot.io/v3")),
+    ("tars", ("tars.chat", "chatbot.tars")),
+    ("ada", ("static.ada.support", "ada.embed")),
+    ("verloop", ("cdn.verloop.io",)),
+    ("wati", ("wati-integration", "wati.io/widget")),
+    ("joinchat", ("joinchat", "creame.io/joinchat")),
+    ("getbutton", ("getbutton.io",)),
 )
 
 _BOOKING_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -357,13 +476,56 @@ _BOOKING_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("tock", ("exploretock.com",)),
     ("sevenrooms", ("sevenrooms.com",)),
     ("thefork", ("thefork.com", "lafourchette.com")),
+    # Everything below books a time in a market this list had never left. The
+    # cost of the omission is the catalogue's highest-severity gap going out to
+    # a practice whose home page has a Book button on it: `no_online_booking` is
+    # usually `gaps[0]`, and `gaps[0]` is the first sentence of the email.
+    ("doctolib", ("doctolib.fr", "doctolib.de", "doctolib.it", "doctolib.com")),
+    ("zocdoc", ("zocdoc.com",)),
+    ("nexhealth", ("nexhealth.com", "nexhealth.io")),
+    ("weave", ("getweave.com", "weavehelp.com")),
+    ("boulevard", ("boulevard.io", "joinblvd.com")),
+    ("glossgenius", ("glossgenius.com",)),
+    ("appointy", ("appointy.com",)),
+    ("bookeo", ("bookeo.com",)),
+    ("checkfront", ("checkfront.com",)),
+    ("fareharbor", ("fareharbor.com",)),
+    ("peek", ("peekpro.com", "book.peek.com")),
+    ("rezdy", ("rezdy.com",)),
+    ("xola", ("xola.com",)),
+    ("bookwhen", ("bookwhen.com",)),
+    ("tidycal", ("tidycal.com",)),
+    ("savvycal", ("savvycal.com",)),
+    ("oncehub", ("oncehub.com", "scheduleonce.com", "go.oncehub")),
+    ("picktime", ("picktime.com",)),
+    ("timify", ("timify.com",)),
+    ("terminland", ("terminland.de",)),
+    ("etermin", ("etermin.net",)),
+    ("jameda", ("jameda.de/termine", "jameda.de/booking")),
+    ("treatwell", ("treatwell.co.uk", "treatwell.nl", "treatwell.de")),
+    ("planity", ("planity.com",)),
+    ("shore", ("shore.com/book", "app.shore.com")),
+    ("salonized", ("salonized.com",)),
+    ("bokadirekt", ("bokadirekt.se",)),
+    ("resurva", ("resurva.com",)),
+    ("gohighlevel_booking", ("leadconnectorhq.com/widget/booking",
+                             "msgsndr.com/widget/booking")),
+    ("wix_bookings", ("wixbookings", "wix-bookings", "bookings.wixapps.net")),
+    ("quandoo", ("quandoo.com", "quandoo.de")),
+    ("formitable", ("formitable.com",)),
+    ("bookatable", ("bookatable.com", "bookatable.co.uk")),
 )
 
 _CRM_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("hubspot", ("js.hs-scripts.com", "js.hsforms.net", "hs-analytics.net",
                  "hubspot.com/cta", "js.hscollectedforms.net")),
+    # Not the bare "force.com": it is the tail of workforce.com, and an HR
+    # consultancy linking to a rota product was read as running Salesforce, so
+    # the true finding — nothing files the enquiries this form collects — never
+    # fired. `_present` now refuses a host-shaped marker glued to a longer
+    # label, and the marker is written the way it appears anyway.
     ("salesforce", ("pardot.com", "pi.pardot.com", "webto.salesforce.com",
-                    "salesforceliveagent", "force.com")),
+                    "salesforceliveagent", ".force.com", "//force.com")),
     ("zoho", ("salesiq.zoho", "zohopublic", "crm.zoho", "zohoforms")),
     ("pipedrive", ("pipedrive.com", "pipedriveassets.com", "leadbooster")),
     ("activecampaign", ("activehosted.com", "prism.app-us1.com", "activecampaign.com")),
@@ -384,6 +546,25 @@ _CRM_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("marketo", ("munchkin.js", "mktoresp.com", "marketo.net")),
     ("dynamics", ("crm.dynamics.com", "dynamics.com/uclick")),
     ("freshworks", ("freshsales.io", "freshworks.com/crm", "fwcrm")),
+    ("omnisend", ("omnisend.com", "omnisnippet")),
+    ("drip", ("getdrip.com", "dripstatic.com")),
+    ("campaignmonitor", ("createsend.com", "campaignmonitor.com")),
+    ("getresponse", ("getresponse.com", "gr-wcm")),
+    ("mailjet", ("mailjet.com", "mjt.lu")),
+    ("moosend", ("moosend.com",)),
+    ("emailoctopus", ("emailoctopus.com", "eocampaign1.com")),
+    ("sharpspring", ("sharpspring.com", "marketingautomation.services")),
+    ("ontraport", ("ontraport.com", "ontraport.net")),
+    ("close", ("close.com/forms",)),
+    ("copper", ("copper.com/forms",)),
+    ("insightly", ("insightly.com", "insight.ly")),
+    ("nutshell", ("nutshell.com/forms",)),
+    ("engagebay", ("engagebay.com",)),
+    ("agilecrm", ("agilecrm.com",)),
+    ("salesflare", ("salesflare.com",)),
+    ("teamleader", ("teamleader.eu", "teamleader.io")),
+    ("monday", ("monday.com/embeds", "forms.monday.com")),
+    ("zendesk_sell", ("getbase.com", "zendesk.com/sell")),
 )
 
 _FRAMEWORK_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -394,6 +575,57 @@ _FRAMEWORK_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("angular", ("ng-version", "angular.min.js", "ng-app=")),
     ("svelte", ("svelte-", "/_app/immutable")),
     ("jquery", ("jquery.min.js", "jquery-3", "jquery/1.", "jquery/2.")),
+)
+
+# What the page was assembled in. Two jobs: the digest says "wordpress+elementor"
+# instead of "wordpress", which is a truer sentence about who maintains the site;
+# and a builder is proof of its host CMS, so a WordPress install serving its
+# assets from a CDN — where `/wp-content/` never appears in the markup — stops
+# being reported as a hand-built site.
+_BUILDER_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("elementor", ("/plugins/elementor/", "elementor-page", "elementor-widget",
+                   "elementor-frontend")),
+    ("divi", ("/themes/divi/", "et_pb_", "et-core-", "divi-builder")),
+    ("wpbakery", ("js_composer", "vc_row", "wpb_wrapper")),
+    ("beaver", ("/plugins/bb-plugin/", "fl-builder")),
+    ("oxygen", ("/plugins/oxygen/", "ct-section", "oxy-header")),
+    ("bricks", ("/themes/bricks/", "brxe-")),
+    ("avada", ("/themes/avada/", "fusion-builder", "fusion-column")),
+    ("astra", ("/themes/astra/", "ast-container")),
+    ("kadence", ("/themes/kadence/", "kadence-blocks")),
+    ("enfold", ("/themes/enfold/", "avia-builder", "av_")),
+    ("brizy", ("/plugins/brizy/", "brz-")),
+    ("siteorigin", ("siteorigin-panels", "/plugins/so-widgets")),
+    ("thrive", ("/plugins/thrive-visual-editor/", "tve-leads")),
+    ("breakdance", ("/plugins/breakdance/", "breakdance-")),
+    ("gutenberg", ("wp-block-", "/css/dist/block-library")),
+)
+_WORDPRESS_BUILDERS = frozenset({
+    "elementor", "divi", "wpbakery", "beaver", "oxygen", "bricks", "avada", "astra",
+    "kadence", "enfold", "brizy", "siteorigin", "thrive", "breakdance", "gutenberg",
+})
+
+# Where a finished customer is sent to say so. Read for `no_review_capture`,
+# which only ever fires on a site that already prints praise: the claim is that
+# nothing on the page routes anyone to a live review, and one of these on the
+# page makes that claim false.
+_REVIEW_ROUTES: tuple[str, ...] = (
+    "g.page/r/", "/review?placeid", "search.google.com/local/writereview",
+    "google.com/maps/place", "goo.gl/maps", "maps.app.goo.gl",
+    "trustpilot.com", "widget.trustpilot.com", "yelp.com/biz", "yelp.ca/biz",
+    "birdeye.com", "podium.com", "nicejob.com",
+    "trustindex.io", "reviews.io", "feefo.com", "yotpo.com", "judge.me",
+    "stamped.io", "shopperapproved.com", "bazaarvoice.com", "provenexpert.com",
+    "trustedshops.com", "kiyoh.com", "avis-verifies.com", "tripadvisor.com",
+    "checkatrade.com", "trustatrader.com", "houzz.com/professionals",
+)
+
+# A green button that opens WhatsApp. Only the click-to-chat endpoints, never
+# the bare brand: "follow us on WhatsApp" in a footer is not a button, and the
+# gap's whole claim is that there is one and a person is behind it.
+_WHATSAPP_ROUTES: tuple[str, ...] = (
+    "wa.me/", "api.whatsapp.com/send", "web.whatsapp.com/send",
+    "chat.whatsapp.com", "whatsapp://send",
 )
 
 # Form embeds that render no <form> of their own but are still a lead route.
@@ -466,6 +698,9 @@ _HEAD_RE = re.compile(r"(?is)<h([1-3])\b[^>]*>(.*?)</h\1\s*>")
 _TITLE_RE = re.compile(r"(?is)<title\b[^>]*>(.*?)</title\s*>")
 _META_RE = re.compile(r"(?is)<meta\b[^>]*>")
 _ATTR_RE = re.compile(r"""(?is)([a-z0-9_:\-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""")
+_SCHEMA_TYPE_RE = re.compile(r'(?is)"@type"\s*:\s*"([^"]{2,40})"')
+_ITEMTYPE_RE = re.compile(r"""(?is)itemtype\s*=\s*["'][^"']*schema\.org/([A-Za-z]+)""")
+_VIEWPORT_RE = re.compile(r"""(?is)<meta[^>]+name\s*=\s*["']viewport["'][^>]*>""")
 _FORM_RE = re.compile(r"(?is)<form\b.*?</form\s*>")
 _FORM_OPEN_RE = re.compile(r"(?i)<form\b")
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
@@ -484,6 +719,13 @@ _PHONE_RES = (
     # Grouped in twos and threes — `920 55 10 40`. Later groups are held to two
     # or three digits so a run of years (`2026 2025 2024`) cannot qualify.
     re.compile(r"\b\d{2,4}(?:[\s.\-]\d{2,3}){2,4}\b"),
+    # A bracketed trunk or country code, which is how most of the world outside
+    # North America prints an area code: `(07) 3555 0177`, `(0161) 555 0134`.
+    # None of the four patterns above survives the bracket — the first wants a
+    # three-digit code inside it, and the loose two run into the `)` and stop —
+    # so an Australian vet printing its number in the footer was read as a site
+    # with no number on it, and `contact_form_only` told it "no number to tap".
+    re.compile(r"\(\+?\d{1,5}\)[\s.\-]?\d{1,4}(?:[\s.\-]?\d{2,4}){1,3}"),
 )
 _DIGIT_RE = re.compile(r"\d")
 # Nine digits is the shortest national number in use and fifteen is the E.164
@@ -522,6 +764,12 @@ _MONTHS = {
     "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
     "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
 }
+_DATETIME_ATTR_RE = re.compile(r'(?is)datetime\s*=\s*["\']([^"\']{4,40})["\']')
+_DATE_JSON_RE = re.compile(
+    r'(?is)"date(?:published|modified|created)"\s*:\s*"([^"]{4,40})"')
+_ARTICLE_TIME_RE = re.compile(
+    r'(?is)<meta[^>]+article:(?:published|modified)_time[^>]+'
+    r'content\s*=\s*["\']([^"\']+)["\']')
 _ISO_DATE_RE = re.compile(r"\b(20\d{2})-(\d{1,2})-(\d{1,2})\b")
 _MDY_RE = re.compile(
     r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(20\d{2})\b",
@@ -616,9 +864,16 @@ _NO_APPOINTMENT_PHRASES = (
 # the word: a tattoo studio, an osteopath, an estate agent showing a house. Not
 # "class", "course" or "tour", which are inside "first class postage", "golf
 # course" and "contour", and would put the headline gap on a courier.
+#
+# Not the bare "servicing" any more. It is a whole word in "site servicing",
+# which is a civil contractor laying pipe and drainage — nobody books a time for
+# it — and that one word put the catalogue's headline gap, the first sentence of
+# the email, on a concrete company. The trades that genuinely book a service
+# already reach this list through "repair", "install", "inspection" and
+# "maintenance", which is how their own pages word it.
 _BOOKABLE_WORDS = (
     "appointment", "consultation", "consult", "treatment", "therapy", "massage",
-    "cleaning", "repair", "install", "inspection", "servicing", "service call",
+    "cleaning", "repair", "install", "inspection", "service call",
     "maintenance", "checkup", "check up", "exam", "grooming", "detailing",
     "haircut", "styling", "manicure", "pedicure", "facial", "tune up",
     "test drive", "fitting", "lesson", "tutoring", "valuation", "assessment",
@@ -634,6 +889,13 @@ _APPOINTMENT_SCHEMA_TYPES = (
     "dentist", "medicalbusiness", "medicalclinic", "physician", "veterinarycare",
     "healthandbeautybusiness", "beautysalon", "hairsalon", "spa", "autorepair",
     "childcare", "daycare", "restaurant", "lodgingbusiness",
+    # A trade whose own markup names it, in the languages this crawl meets. The
+    # words a German optician writes on the page — Sehtest, Brillenanpassung —
+    # are in no phrase list here and never will be; the schema type is the same
+    # fact said in a way that does not need translating.
+    "optician", "opticalstore", "physiotherapy", "physiotherapist", "psychologist",
+    "dayspa", "nailsalon", "tattooparlor", "hospital", "emergencyservice",
+    "healthclub", "sportsactivitylocation", "drivingschool", "hairdresser",
 )
 
 _QUOTE_PHRASES = (
@@ -692,6 +954,8 @@ _SERVICE_HEADINGS = ("service", "servic", "what we do", "our work", "treatment",
                      "leistungen", "angebot", "unsere arbeit",
                      "compétences", "competences", "prestations", "nos produits",
                      "productos", "nuestros servicios", "que hacemos")
+_SERVICE_PATH_RE = re.compile(
+    r"(?i)/(?:services|service|treatments|solutions|what-we-do)/[a-z0-9\-]{3,}")
 _LIST_RE = re.compile(r"(?is)<(?:ul|ol)\b[^>]*>(.*?)</(?:ul|ol)\s*>")
 _LI_RE = re.compile(r"(?is)<li\b[^>]*>(.*?)</li\s*>")
 
@@ -727,6 +991,12 @@ _BOOKING_PATH_WORDS = frozenset({
     "book", "booking", "bookings", "schedule", "scheduling", "appointment",
     "appointments", "reserve", "reservation", "reservations",
     "buchen", "terminbuchung", "terminvereinbarung", "reserver", "reservar",
+    # Dutch, Italian and Portuguese, on the same rule the German and Spanish
+    # entries follow: the verb for arranging a time, never the noun for the
+    # appointment itself. `/afspraak-maken/` is the plainest Dutch booking path
+    # there is and no spelling in this set came close to it.
+    "afspraak", "afspraken", "reserveren", "prenota", "prenotazione",
+    "agendar", "agendamento",
 })
 # And the words that turn a booking word into the small print about one. This is
 # the whole reason the segment is read as words: "booking-terms" and "booking"
@@ -747,11 +1017,12 @@ _BOOKING_PATH_STOP = frozenset({
 _BOOKING_VERBS = frozenset({
     "book", "booking", "bookings", "schedule", "reserve", "reservation",
     "reservations", "buchen", "reserver", "réserver", "reservar",
+    "afspraak", "reserveren", "prenota", "agendar",
 })
 _BOOKING_OBJECTS = frozenset({
     "online", "now", "today", "appointment", "appointments", "table", "visit",
     "time", "times", "slot", "consultation", "session", "here", "us", "in",
-    "a", "an", "your", "my", "the", "ligne", "termin",
+    "a", "an", "your", "my", "the", "ligne", "termin", "maken", "ora", "hora",
 })
 _BOOKING_LEADS = frozenset({"make", "request", "online", "instant", "easy",
                             "quick", "click", "to", "termin"})
@@ -835,9 +1106,17 @@ def _path(url: str) -> str:
 
 
 class _Page:
-    """One fetched page, pre-chewed into the four views detection needs."""
+    """One fetched page, pre-chewed into the views detection needs.
 
-    __slots__ = ("url", "path", "html", "low", "text", "links")
+    `heads` and `listed` are here because they were being recomputed. `_HEAD_RE`
+    ran over every page three times — once in `_headings`, once in `_services`,
+    once inside `_listed_services` — and `_listed_services` itself ran twice per
+    page, because `_signals` wants the site's own list of what it sells and
+    `_services` wants the same list filtered. Both are lazy: a page whose
+    headings nobody asks for never pays for them.
+    """
+
+    __slots__ = ("url", "path", "html", "low", "text", "links", "_heads", "_listed")
 
     def __init__(self, url: str, html: str) -> None:
         self.url = url
@@ -847,10 +1126,59 @@ class _Page:
         self.text = _visible_text(self.html)
         self.links = [(href.strip(), _clean_text(label)[:80])
                       for href, label in _A_RE.findall(self.html)]
+        self._heads = None
+        self._listed = None
+
+    @property
+    def heads(self) -> list:
+        """[(level, cleaned text)] for every h1-h3 on the page, in order."""
+        if self._heads is None:
+            self._heads = [(level, _clean_text(body))
+                           for level, body in _HEAD_RE.findall(self.html)]
+        return self._heads
+
+
+# A marker that opens with a host label — `force.com`, `resy.com`, `clarity.ms`.
+# Everything else in the tables is a path, an attribute or a JavaScript
+# identifier, and those are matched plainly.
+_HOSTISH_RE = re.compile(r"[a-z0-9][a-z0-9\-]*\.")
+
+
+def _present(low: str, marker: str) -> bool:
+    """Is `marker` on the page, as itself rather than as the tail of a word?
+
+    The tables are read as structural facts and then reported as absences, so
+    both directions of a wrong answer end up in a live email. The shape that
+    kept biting is a host-shaped marker landing inside a longer host:
+    `force.com` inside `workforce.com` said Salesforce, `resy.com` would say
+    Resy inside `pressy.com`, and each one silently deleted a true finding. So a
+    marker that begins with a host label has to begin where a host begins —
+    after a slash, a dot, a quote, an equals sign, anything that is not another
+    label character. A path or an identifier marker is unaffected.
+    """
+    # The search runs first and the shape test only on a hit. Six hundred
+    # markers are checked against every crawl and all but a dozen of them are
+    # absent, so the miss path is the hot one and it now costs exactly what the
+    # plain `in` it replaced cost: one `find` that returns -1.
+    at = low.find(marker)
+    if at < 0:
+        return False
+    if not _HOSTISH_RE.match(marker):
+        return True
+    while at != -1:
+        before = low[at - 1] if at else ""
+        if not (before.isalnum() or before == "-"):
+            return True
+        at = low.find(marker, at + 1)
+    return False
 
 
 def _hit(low: str, markers) -> int:
-    return sum(1 for m in markers if m in low)
+    return sum(1 for m in markers if _present(low, m))
+
+
+def _any_hit(low: str, markers) -> bool:
+    return any(_present(low, m) for m in markers)
 
 
 def _best_vendor(low: str, table) -> str:
@@ -864,7 +1192,208 @@ def _best_vendor(low: str, table) -> str:
 
 
 def _all_vendors(low: str, table) -> list[str]:
-    return [name for name, markers in table if _hit(low, markers)]
+    # `any`, not a tally: nothing reads how *many* markers a vendor matched, and
+    # the absent case — the one that becomes a sentence — costs the same either
+    # way. Only the vendors that are there get to stop early, which is most of
+    # the scanning on a site that runs a normal stack.
+    return [name for name, markers in table if _any_hit(low, markers)]
+
+
+# ── Why a site has nothing to say ──
+
+# The operator asked the plain question — which site is not reachable? — and the
+# audit's answer was a boolean with the reason thrown away, so a lead that had
+# moved to a new domain, one whose certificate expired on Sunday and one that
+# simply times out all read the same and none of them could be acted on. Each
+# sentence here is written for the person looking at the Leads table, says what
+# went wrong in their words, and is short enough for a column.
+UNREACHABLE_REASONS: dict[str, str] = {
+    "no_url": "there is no website on the record",
+    "dns": "the domain name does not resolve",
+    "refused": "the server refused the connection",
+    "timeout": "the server did not answer in time",
+    "tls": "the security certificate could not be verified",
+    "reset": "the server dropped the connection",
+    "redirect_loop": "the address redirects in a loop",
+    "http_401": "the site asks for a password",
+    "http_403": "the server turned the request away",
+    "http_404": "the home page is gone",
+    "http_410": "the home page has been taken down",
+    "http_429": "the server is turning away requests for now",
+    "http_500": "the site is returning a server error",
+    "http_503": "the site is temporarily unavailable",
+    "http_error": "the server answered with an error",
+    "not_html": "the address does not serve a web page",
+    "empty": "the page came back empty",
+    "parked": "the domain is parked and has no site on it",
+    "under_construction": "the site is a coming-soon placeholder",
+    "challenge": "a bot check stands in front of the site",
+    "cookie_wall": "a cookie notice stands in front of the site",
+    "js_only": "the page carries no readable text without JavaScript",
+    "unreachable": "the site could not be reached",
+}
+
+_HTTP_REASONS: dict[int, str] = {
+    401: "http_401", 403: "http_403", 404: "http_404", 410: "http_410",
+    429: "http_429", 500: "http_500", 502: "http_500", 503: "http_503",
+    504: "timeout",
+}
+
+# Read against whatever a fetcher put in `error`. `core.enrich._short_error`
+# writes one lowercase word, `_fetch` below writes an exception class name, and
+# both land here rather than each growing its own vocabulary.
+_ERROR_WORDS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("no url",), "no_url"),
+    (("gaierror", "getaddrinfo", "name or service", "nodename", "dns"), "dns"),
+    (("timed out", "timeout"), "timeout"),
+    (("certificate", "sslcert", "sslerror", "ssl", "tls"), "tls"),
+    (("refused",), "refused"),
+    (("reset", "remotedisconnected", "incompleteread", "badstatusline"), "reset"),
+    (("redirect", "infinite loop"), "redirect_loop"),
+    (("content-type", "not html"), "not_html"),
+    (("empty response", "empty"), "empty"),
+)
+
+
+def unreachable_reason(error: str = "", status: int = 0) -> str:
+    """A `UNREACHABLE_REASONS` code for a failed fetch. "" when nothing failed.
+
+    Never raises and never invents: an error nobody has a word for comes back
+    as "unreachable", which is exactly what the audit used to say about all of
+    them.
+    """
+    text = str(error or "").strip().lower()
+    match = re.search(r"http\D{0,3}(\d{3})", text)
+    code = int(match.group(1)) if match else int(status or 0)
+    if code >= 400:
+        return _HTTP_REASONS.get(code, "http_error")
+    for words, reason in _ERROR_WORDS:
+        if any(word in text for word in words):
+            return reason
+    return "unreachable" if text else ""
+
+
+def unreachable_detail(reason: str) -> str:
+    """`reason` as the sentence the Leads table shows. Unknown codes read blank."""
+    return UNREACHABLE_REASONS.get(str(reason or ""), "")
+
+
+# A page can answer with 200 and still tell you nothing: a bot check, a consent
+# wall, a parked domain, a coming-soon splash, a framework shell that renders
+# everything after the crawler has gone. Every rule in the catalogue asks "is
+# there a chat script / a form / any markup here", so all five answer "no" to
+# all of it, and a lead whose site was never actually read gets an email listing
+# seven things wrong with it. That is the worst output this module can produce,
+# and it produced it on six of thirty-six real page shapes.
+_CHALLENGE_MARKERS: tuple[str, ...] = (
+    "cdn-cgi/challenge-platform", "cf-browser-verification", "cf_chl_", "__cf_chl",
+    "just a moment", "checking your browser", "verifying you are human",
+    "attention required! | cloudflare", "ddos protection by cloudflare",
+    "_incapsula_resource", "incapsula incident", "distil_r_captcha",
+    "perimeterx", "px-captcha", "/_sec/cp_challenge",
+    "enable javascript and cookies to continue", "please verify you are a human",
+)
+_PARKED_MARKERS: tuple[str, ...] = (
+    "parkingcrew.net", "sedoparking.com", "bodis.com", "afternic.com",
+    "hugedomains.com", "domainmarket.com", "undeveloped.com", "above.com/park",
+    "parklogic",
+)
+_PARKED_PHRASES: tuple[str, ...] = (
+    "this domain is for sale", "buy this domain", "domain is for sale",
+    "the domain is parked", "this domain name is for sale",
+    "future home of something quite cool", "welcome to nginx",
+    "apache2 ubuntu default page", "index of",
+)
+_CONSTRUCTION_PHRASES: tuple[str, ...] = (
+    "coming soon", "under construction", "launching soon", "opening soon",
+    "new website coming", "we are working on", "en construction",
+    "im aufbau", "demnächst", "próximamente", "proximamente", "en construcción",
+    "binnenkort online", "in aanbouw",
+)
+_CONSENT_PHRASES: tuple[str, ...] = (
+    "we use cookies", "this website uses cookies", "this site uses cookies",
+    "accept all cookies", "accept cookies", "cookie settings", "manage cookies",
+    "cookie policy", "cookie preferences",
+    "deze website gebruikt cookies", "wij gebruiken cookies", "alles accepteren",
+    "diese website verwendet cookies", "wir verwenden cookies", "alle akzeptieren",
+    "ce site utilise des cookies", "nous utilisons des cookies", "tout accepter",
+    "este sitio utiliza cookies", "utilizamos cookies", "aceptar todo",
+)
+_SHELL_MARKERS: tuple[str, ...] = (
+    "__next_data__", "/_next/static", "__nuxt__", "/_nuxt/", "/_app/immutable",
+    'id="root"', "id='root'", 'id="app"', "id='app'", "ng-app", "ng-version",
+    "data-reactroot", "window.__initial_state__", "__remix_context__",
+    "ember-app", "gatsby-focus-wrapper",
+)
+
+# Two thresholds about how much a person could read off the page: a splash is
+# short, and a consent wall is shorter. The third is deliberately not a length
+# on its own — see `_has_substance`.
+_SPLASH_MAX = 1500
+_WALL_MAX = 900
+_MIN_READABLE = 400
+
+
+def _has_substance(pages, low: str) -> bool:
+    """Does the crawl carry structure a person could read, however few words?
+
+    Length alone was the first attempt at this and it was wrong in the
+    expensive direction: a one-page brochure for a solicitor is a heading, three
+    services and a phone number, and it can be under two hundred characters of
+    visible text while being a completely real site. Treating it as an empty
+    shell threw away every finding on it. What separates a real page from a
+    framework's leftovers is not how much it says but that it says anything at
+    all in a structure — a heading, a way to get in touch, a menu.
+    """
+    if any(body.strip() for page in pages for _level, body in page.heads):
+        return True
+    if "mailto:" in low or "tel:" in low or _FORM_OPEN_RE.search(low):
+        return True
+    if sum(1 for page in pages for _href, label in page.links
+           if len(label.strip()) > 2) >= 3:
+        return True
+    # A printed number or a street address is the whole content of plenty of
+    # small sites, and it is the part a person would act on.
+    text = " ".join(page.text for page in pages)
+    return _phone_present(text) or any(p.search(text) for p in _POSTAL_RES)
+
+
+def _headline(pages) -> str:
+    """The home page's title and its top headings, flattened for phrase matching.
+
+    "Coming soon" belongs in the title or over the page. Half way down a real
+    site it is a note about a new location opening, and reading that as a dead
+    site would drop a live lead.
+    """
+    if not pages:
+        return ""
+    match = _TITLE_RE.search(pages[0].html)
+    parts = [_clean_text(match.group(1))] if match else []
+    parts.extend(body for _level, body in pages[0].heads[:4])
+    return _phrase_text(" ".join(parts))
+
+
+def _unreadable(pages, low: str, text: str) -> str:
+    """"" when the crawl carries a page worth auditing, else why it does not."""
+    if not pages:
+        return "empty"
+    size = len(text.strip())
+    flat = _phrase_text(text)
+
+    if size < _SPLASH_MAX and _any_hit(low, _CHALLENGE_MARKERS):
+        return "challenge"
+    if _any_hit(low, _PARKED_MARKERS) or (size < _SPLASH_MAX
+                                          and _says(flat, _PARKED_PHRASES)):
+        return "parked"
+    if size < _SPLASH_MAX and _says(_headline(pages), _CONSTRUCTION_PHRASES):
+        return "under_construction"
+    if (size < _WALL_MAX and _says(flat, _CONSENT_PHRASES)
+            and "mailto:" not in low and "tel:" not in low
+            and not _FORM_OPEN_RE.search(low)):
+        return "cookie_wall"
+    if size < _MIN_READABLE and not _has_substance(pages, low):
+        return "js_only" if _any_hit(low, _SHELL_MARKERS) else "empty"
+    return ""
 
 
 # ── Dates ──
@@ -901,12 +1430,9 @@ def _latest_content_date(pages, today: datetime.date):
     """
     dates: list[datetime.date] = []
     for page in pages:
-        machine = " ".join(re.findall(r'(?is)datetime\s*=\s*["\']([^"\']{4,40})["\']', page.html))
-        machine += " " + " ".join(re.findall(
-            r'(?is)"date(?:published|modified|created)"\s*:\s*"([^"]{4,40})"', page.html))
-        machine += " " + " ".join(re.findall(
-            r'(?is)<meta[^>]+article:(?:published|modified)_time[^>]+content\s*=\s*["\']([^"\']+)["\']',
-            page.html))
+        machine = " ".join(_DATETIME_ATTR_RE.findall(page.html))
+        machine += " " + " ".join(_DATE_JSON_RE.findall(page.html))
+        machine += " " + " ".join(_ARTICLE_TIME_RE.findall(page.html))
         dates.extend(_parse_dates(machine, today))
 
         article_like = bool(_BLOG_HREF_RE.search(page.path)) or "<article" in page.low
@@ -918,11 +1444,19 @@ def _latest_content_date(pages, today: datetime.date):
 # ── Forms ──
 
 
+# "search" where a word starts, not wherever the five letters land. The plain
+# substring is inside "research", so a form posting to `/research-request` was
+# thrown away as the site's search box — and a site whose only form is thrown
+# away is told that nothing on it asks a visitor for a name. Bounded on the left
+# only, because `searchform` and `search-form` are both the box this rejects.
+_SEARCHY_RE = re.compile(r"(?<![a-z])search")
+
+
 def _is_contact_form(block: str) -> bool:
     """A form a prospect writes to, as opposed to the site's search box."""
     low = block.lower()
     opening = low[:low.find(">") + 1] if ">" in low else low
-    if "search" in opening or 'role="search"' in low:
+    if _SEARCHY_RE.search(opening) or 'role="search"' in low:
         return False
     if 'type="search"' in low or "type='search'" in low:
         return False
@@ -968,21 +1502,31 @@ def _lead_forms(page) -> int:
 # ── Technology ──
 
 
-def _tech(pages) -> dict:
-    low = "\n".join(p.low for p in pages)
+def _tech(pages, low: str) -> dict:
+    """The stack, read from one lowercased copy of the crawl.
 
+    `low` is passed in rather than joined here: `_signals` needs the same string
+    and used to build its own, which walked every byte of every page a second
+    time to produce a value already sitting in memory.
+    """
     forms = sum(_lead_forms(p) for p in pages)
 
     cms = _best_vendor(low, _CMS_MARKERS)
     ecommerce = _best_vendor(low, _ECOMMERCE_MARKERS)
+    builder = _best_vendor(low, _BUILDER_MARKERS)
     # A Shopify storefront is its own CMS; a WooCommerce shop is still WordPress.
     if not cms and ecommerce == "shopify":
         cms = "shopify"
+    # And a page built in Elementor is a WordPress page whatever the markup says
+    # about where its assets are served from.
+    if not cms and builder in _WORDPRESS_BUILDERS:
+        cms = "wordpress"
     if not cms and pages:
         cms = "custom"
 
     return {
         "cms": cms,
+        "builder": builder,
         "ecommerce": ecommerce,
         "analytics": _all_vendors(low, _ANALYTICS_MARKERS),
         "chat": _best_vendor(low, _CHAT_MARKERS),
@@ -1022,11 +1566,8 @@ def _document_name(label: str, href: str) -> str:
 
 def _headings(pages) -> list[str]:
     """Every h1-h3 the site prints, cleaned down to the words in it."""
-    out: list[str] = []
-    for page in pages:
-        for _level, body in _HEAD_RE.findall(page.html):
-            out.append(_clean_text(body).lower().strip(" :·•-–—"))
-    return out
+    return [body.lower().strip(" :·•-–—")
+            for page in pages for _level, body in page.heads]
 
 
 def _bookable(services) -> bool:
@@ -1132,10 +1673,15 @@ def _offer_shaped(text: str, start: int, end: int) -> bool:
                 or _DISCOUNT_TRAIL_RE.match(text[end:end + 24]))
 
 
+def _price_spans(text: str) -> list:
+    """(figure, start, end) for money on the page, offers taken back out."""
+    return [(m.group(0), m.start(), m.end()) for m in _MONEY_RE.finditer(text)
+            if not _offer_shaped(text, m.start(), m.end())]
+
+
 def _real_prices(text: str) -> list[str]:
     """Money on the page with the offers taken back out of it."""
-    return [m.group(0) for m in _MONEY_RE.finditer(text)
-            if not _offer_shaped(text, m.start(), m.end())]
+    return [figure for figure, _start, _end in _price_spans(text)]
 
 
 def _price_heading(headings) -> bool:
@@ -1152,8 +1698,12 @@ def _publishes_prices(text: str, html: str, headings, pricing_link: bool) -> boo
     """True when the site puts a figure next to something a customer can buy."""
     if pricing_link:
         return True
-    priced = _real_prices(text)
-    if not priced:
+    # One pass over the text, not two. The old shape walked every character of
+    # the crawl with `_MONEY_RE` to collect the figures and then walked it again
+    # to look at their surroundings, and on a six-page crawl that is the single
+    # most expensive regex in the module run twice for one answer.
+    spans = _price_spans(text)
+    if not spans:
         return False
     if _price_heading(headings):
         return True
@@ -1161,12 +1711,11 @@ def _publishes_prices(text: str, html: str, headings, pricing_link: bool) -> boo
         cell = _clean_text(body)
         if cell and _real_prices(cell):
             return True
-    for match in _MONEY_RE.finditer(text):
-        if _offer_shaped(text, match.start(), match.end()):
-            continue
-        if (_PRICE_LEAD_RE.search(text[max(0, match.start() - 40):match.start()])
-                or _PRICE_TRAIL_RE.match(text[match.end():match.end() + 24])):
+    for _figure, start, end in spans:
+        if (_PRICE_LEAD_RE.search(text[max(0, start - 40):start])
+                or _PRICE_TRAIL_RE.match(text[end:end + 24])):
             return True
+    priced = [figure for figure, _s, _e in spans]
     # The loose arm the rule started as, kept at its old threshold so nothing
     # that used to read as a price list stops reading as one: three *different*
     # figures, none of them an offer. Counting repeats let one price printed
@@ -1191,6 +1740,20 @@ def _social_links(pages) -> list[str]:
     return out
 
 
+_ADDRESS_TAG_RE = re.compile(r"(?i)<address\b")
+# The branch list a chain publishes for Google, in the one place it is written
+# down as data. The printed patterns above are Canada, the US and the UK and
+# nothing else, so a four-branch optician in Berlin and a Dutch chain read as
+# single-site businesses and `multi_location` — a gap about a message arriving
+# for one branch and having to be walked to it — could not fire outside three
+# countries. A postal code inside a PostalAddress needs no country pattern: the
+# markup has already said what it is.
+_SCHEMA_POSTCODE_RE = re.compile(
+    r'(?is)"postal_?code"\s*:\s*"([^"]{2,12})"'
+    r"""|itemprop\s*=\s*["']postalCode["'][^>]*>\s*([^<]{2,12})""")
+_SCHEMA_STREET_RE = re.compile(r'(?is)"street_?address"\s*:\s*"([^"]{4,90})"')
+
+
 def _location_count(pages) -> int:
     codes: set[str] = set()
     for page in pages:
@@ -1198,10 +1761,22 @@ def _location_count(pages) -> int:
         for pattern in _POSTAL_RES:
             for match in pattern.findall(text):
                 codes.add(re.sub(r"[\s\-]", "", match).upper())
+        for first, second in _SCHEMA_POSTCODE_RE.findall(page.html):
+            code = (first or second).strip()
+            if code:
+                codes.add(re.sub(r"[\s\-]", "", code).upper())
     if len(codes) >= 2:
         return len(codes)
-    addresses = sum(len(re.findall(r"(?i)<address\b", p.html)) for p in pages)
-    return max(addresses, 1 if codes else 0)
+
+    streets = set()
+    for page in pages:
+        streets.update(_WS_RE.sub(" ", s).strip().lower()
+                       for s in _SCHEMA_STREET_RE.findall(page.html))
+    if len(streets) >= 2:
+        return len(streets)
+
+    addresses = sum(len(_ADDRESS_TAG_RE.findall(p.html)) for p in pages)
+    return max(addresses, 1 if (codes or streets) else 0)
 
 
 def _copyright_year(pages, today: datetime.date) -> int:
@@ -1219,15 +1794,16 @@ def _copyright_year(pages, today: datetime.date) -> int:
     return best
 
 
-def _signals(pages, tech: dict, base_url: str, load_ms: int) -> tuple[dict, dict]:
-    """Every boolean the gap table reads, plus the evidence bits it quotes."""
+def _signals(pages, tech: dict, base_url: str, load_ms: int,
+             low: str, text: str) -> tuple[dict, dict]:
+    """Every boolean the gap table reads, plus the evidence bits it quotes.
+
+    `low` and `text` arrive from `_audit`, which already built them for the
+    stack scan and the readability check. Rebuilding them here joined every page
+    twice more per lead for two strings that were sitting in the caller's frame.
+    """
     today = datetime.date.today()
     html_all = "\n".join(p.html for p in pages)
-    # `_Page` already holds each page lowercased, and joining those is the same
-    # string as lowering the join. Calling `.lower()` here again re-walked every
-    # byte of every page a second time for nothing.
-    low = "\n".join(p.low for p in pages)
-    text = " ".join(p.text for p in pages)
     text_low = text.lower()
     # The same text with the page's typography flattened out of it, which is what
     # every phrase list below is matched against. See `_phrase_text`.
@@ -1260,7 +1836,7 @@ def _signals(pages, tech: dict, base_url: str, load_ms: int) -> tuple[dict, dict
     # or the mailing tool's own script. The word by itself is a promise in a
     # paragraph — "ask us to add you when you call" — and reading it as capture
     # hid the finding on sites that have no form at all.
-    newsletter = any(m in low for m in _MAILING_LIST_MARKERS) or (
+    newsletter = _any_hit(low, _MAILING_LIST_MARKERS) or (
         any(w in text_low for w in ("newsletter", "mailing list", "subscribe to our"))
         and bool(_EMAIL_FIELD_RE.search(html_all)))
 
@@ -1323,17 +1899,28 @@ def _signals(pages, tech: dict, base_url: str, load_ms: int) -> tuple[dict, dict
                   for href, label in hrefs)
     gallery = gallery or any(w in low for w in ("fancybox", "photoswipe", "lightbox"))
 
+    # Click-to-chat endpoints only, read off the hrefs. A business that put a
+    # green button on its site is proud of it and answers it personally, which
+    # is the whole finding — not that WhatsApp is missing, that a person is
+    # behind it at nine at night.
+    whatsapp = any(_present(href, route) for href, _label in hrefs
+                   for route in _WHATSAPP_ROUTES)
+    # Read against the whole page rather than the hrefs, because half of these
+    # are a script that draws the stars and never renders an anchor at all. A
+    # Trustpilot widget on the page makes "nothing points a customer at a review"
+    # false whether or not the markup contains a link to trustpilot.com.
+    review_route = _any_hit(low, _REVIEW_ROUTES)
+
     locations = _location_count(pages)
 
     # ── schema ──
     has_schema = "application/ld+json" in low or "schema.org" in low
-    schema_types = " ".join(re.findall(r'(?is)"@type"\s*:\s*"([^"]{2,40})"', html_all)).lower()
-    schema_types += " " + " ".join(re.findall(
-        r"""(?is)itemtype\s*=\s*["'][^"']*schema\.org/([A-Za-z]+)""", html_all)).lower()
+    schema_types = " ".join(_SCHEMA_TYPE_RE.findall(html_all)).lower()
+    schema_types += " " + " ".join(_ITEMTYPE_RE.findall(html_all)).lower()
     has_local_schema = any(t in schema_types for t in _LOCALBUSINESS_TYPES)
     facts["appointment_trade"] = any(t in schema_types for t in _APPOINTMENT_SCHEMA_TYPES)
 
-    viewport = bool(re.search(r"""(?is)<meta[^>]+name\s*=\s*["']viewport["'][^>]*>""", html_all))
+    viewport = bool(_VIEWPORT_RE.search(html_all))
     copyright_year = _copyright_year(pages, today)
 
     total_kb = sum(len(p.html) for p in pages) // 1024
@@ -1362,11 +1949,18 @@ def _signals(pages, tech: dict, base_url: str, load_ms: int) -> tuple[dict, dict
         "has_multiple_locations": locations >= 2,
         "location_count": locations,
         "has_quote_form": has_quote_form,
+        "has_whatsapp": whatsapp,
+        "has_review_route": review_route,
         "copyright_year": copyright_year,
         "stale_copyright": bool(copyright_year and copyright_year < today.year - 1),
         "avg_page_kb": avg_kb,
         "slow": load_ms > 3000,
     }
+    # Not "not has_ssl": `audit_from_html` is handed whatever key the caller
+    # used, and a page dict keyed by a bare domain would have every lead told
+    # its site is insecure. The claim is made only where the site itself said
+    # so, by being served over plain http.
+    facts["plain_http"] = str(base_url or "").lower().startswith("http://")
     facts["appointment_shaped"] = bool(_says(flat, _APPOINTMENT_WORDS))
     facts["takes_no_appointments"] = bool(_says(flat, _NO_APPOINTMENT_PHRASES))
     # The site's own list of what it sells, before `_services` filters it down to
@@ -1381,7 +1975,13 @@ def _signals(pages, tech: dict, base_url: str, load_ms: int) -> tuple[dict, dict
 
 
 def _listed_services(page) -> list[str]:
-    """Items of the list a services heading introduces, in the site's own words."""
+    """Items of the list a services heading introduces, in the site's own words.
+
+    Cached on the page: `_signals` reads the raw list to decide whether the
+    business books times, and `_services` reads it again to build the brief.
+    """
+    if page._listed is not None:
+        return page._listed
     out: list[str] = []
     for heading in _HEAD_RE.finditer(page.html):
         if heading.group(1) == "1":
@@ -1397,6 +1997,7 @@ def _listed_services(page) -> list[str]:
         listing = _LIST_RE.search(tail)
         if listing:
             out.extend(_clean_text(item) for item in _LI_RE.findall(listing.group(1)))
+    page._listed = out
     return out
 
 
@@ -1425,8 +2026,7 @@ def _services(pages, title: str, brand: str) -> list[str]:
             _add(label)
     for page in pages:
         for href, label in page.links:
-            if re.search(r"/(?:services|service|treatments|solutions|what-we-do)/[a-z0-9\-]{3,}",
-                         href, re.I):
+            if _SERVICE_PATH_RE.search(href):
                 _add(label)
     for page in pages:
         for href, label in page.links:
@@ -1434,10 +2034,9 @@ def _services(pages, title: str, brand: str) -> list[str]:
             if any(w in low for w in _SERVICE_WORDS) and not href.lower().startswith(("mailto:", "tel:")):
                 _add(label)
     for page in pages:
-        for level, body in _HEAD_RE.findall(page.html):
+        for level, label in page.heads:
             if level == "1":
                 continue
-            label = _clean_text(body)
             if any(w in label.lower() for w in _SERVICE_WORDS):
                 _add(label)
     if len(out) < 3 and title:
@@ -1468,9 +2067,9 @@ def _meta(pages, base_url: str) -> tuple[str, str, str, str]:
             site_name = content[:80]
 
     h1 = ""
-    for level, body in _HEAD_RE.findall(home.html):
+    for level, body in home.heads:
         if level == "1":
-            h1 = _clean_text(body)[:160]
+            h1 = body[:160]
             break
 
     brand = site_name
@@ -1544,12 +2143,28 @@ def _gaps(tech: dict, signals: dict, facts: dict) -> list[dict]:
             and not signals["has_online_booking"] and not signals["has_phone"]):
         fired.append(_gap("contact_form_only",
                           "the form is the only way in: no chat, no booking, no number to tap"))
-    if not signals["has_contact_form"] and not signals["has_newsletter"]:
+    # A checkout asks for a name, an email and a card, so a storefront is never
+    # a site where "nothing asks a visitor for a name". The gap fired on a wine
+    # merchant whose whole home page is an Ecwid store.
+    if (not signals["has_contact_form"] and not signals["has_newsletter"]
+            and not tech["ecommerce"]):
         fired.append(_gap("no_lead_capture",
                           "nothing on the site asks a visitor for a name or an email"))
+    # The address is a lead route, so this is not the same finding as the one
+    # above and both are true of a brochure site at once: one says nobody is
+    # collecting anything, the other says what happens to what does arrive.
+    if (not signals["has_contact_form"] and not signals["has_online_booking"]
+            and signals["has_email"]):
+        fired.append(_gap("email_only_intake",
+                          "every enquiry arrives as an email that somebody opens, reads "
+                          "and answers by hand"))
     if not tech["chat"]:
         fired.append(_gap("no_live_chat",
                           "no chat box on the site, so a question waits for the phone or a form"))
+    if signals["has_whatsapp"]:
+        fired.append(_gap("whatsapp_manual",
+                          "every message that comes in through WhatsApp waits for "
+                          "somebody to pick up the phone"))
     if signals["has_quote_form"]:
         fired.append(_gap("quote_by_form",
                           f'"{facts.get("quote_phrase", "request a quote")}" on the site '
@@ -1575,12 +2190,20 @@ def _gaps(tech: dict, signals: dict, facts: dict) -> list[dict]:
     if not signals["mobile_viewport"]:
         fired.append(_gap("no_mobile",
                           "open the site on a phone and it loads the full desktop layout"))
+    if facts.get("plain_http"):
+        fired.append(_gap("no_ssl",
+                          "browsers put a Not secure warning next to the address before "
+                          "the page opens"))
     if signals["has_blog"] and signals["blog_stale"]:
         fired.append(_gap("stale_blog",
                           f"the newest post on the blog is dated {facts.get('latest_date', '')}"))
     if not signals["has_social"]:
         fired.append(_gap("no_social_presence",
                           "nothing on the site links out to Facebook, Instagram or LinkedIn"))
+    if signals["has_testimonials"] and not signals["has_review_route"]:
+        fired.append(_gap("no_review_capture",
+                          "nothing on the site points a happy customer at a page where "
+                          "they can leave a review"))
     if signals["stale_copyright"]:
         fired.append(_gap("stale_site", f"the footer still reads {signals['copyright_year']}"))
     if signals["slow"]:
@@ -1639,13 +2262,14 @@ def _score(gaps, reachable: bool, has_email: bool) -> int:
 # ── Result shape ──
 
 
-def _blank(url: str, error: str = "") -> dict:
+def _blank(url: str, error: str = "", *, status: int = 0, reason: str = "") -> dict:
+    reason = reason or unreachable_reason(error, status)
     return {
         "url": url, "final_url": "", "reachable": False, "status": 0,
         "load_ms": 0, "pages": [], "page_count": 0,
         "title": "", "description": "", "h1": "", "brand": "",
-        "tech": {"cms": "", "ecommerce": "", "analytics": [], "chat": "", "booking": "",
-                 "crm": "", "forms": 0, "frameworks": []},
+        "tech": {"cms": "", "builder": "", "ecommerce": "", "analytics": [], "chat": "",
+                 "booking": "", "crm": "", "forms": 0, "frameworks": []},
         "services": [],
         "signals": {
             "has_ssl": False, "mobile_viewport": False, "has_schema": False,
@@ -1655,10 +2279,16 @@ def _blank(url: str, error: str = "") -> dict:
             "has_social": False, "has_pricing": False, "has_testimonials": False,
             "has_gallery": False, "has_careers": False, "has_newsletter": False,
             "has_pdf_forms": False, "has_multiple_locations": False, "location_count": 0,
-            "has_quote_form": False, "copyright_year": 0, "stale_copyright": False,
+            "has_quote_form": False, "has_whatsapp": False, "has_review_route": False,
+            "copyright_year": 0, "stale_copyright": False,
             "avg_page_kb": 0, "slow": False,
         },
         "gaps": [], "opportunity_score": 0, "error": error,
+        # The two keys the UI reads to answer "which site is not reachable, and
+        # why". Always present and always a pair: a code to branch on and the
+        # sentence to print. Both are "" exactly when `reachable` is True.
+        "unreachable_reason": reason,
+        "unreachable_detail": unreachable_detail(reason),
     }
 
 
@@ -1687,17 +2317,41 @@ def _audit(pages: dict, base_url: str, *, final_url: str = "", status: int = 0,
            load_ms: int = 0, error: str = "") -> dict:
     """The whole audit. Both public entry points land here."""
     ordered = _order_pages(pages, base_url)
-    result = _blank(base_url, error)
+    result = _blank(base_url, error, status=status)
     if not ordered:
         result["final_url"] = final_url or base_url
         result["status"] = status
         return result
 
     home_url = final_url or ordered[0].url or base_url
-    tech = _tech(ordered)
+    # Built once, here, and handed down. `_tech`, `_unreadable` and `_signals`
+    # each used to join the whole crawl for itself.
+    low = "\n".join(p.low for p in ordered)
+    text = " ".join(p.text for p in ordered)
+
+    tech = _tech(ordered, low)
     title, description, h1, brand = _meta(ordered, home_url)
+
+    # Before a single absence is claimed: was there anything here to look at?
+    #
+    # `tech` survives and the signals do not, and the difference between them is
+    # the whole point. A marker on the page is a positive fact — this shell does
+    # load Intercom — and stays true however little the page rendered. Every
+    # signal below is the other kind: "no chat", "no form", "nothing asks for a
+    # name", each of them an absence, and an absence is only a fact when there
+    # was somewhere to look.
+    state = _unreadable(ordered, low, text)
+    if state:
+        result.update({
+            "url": base_url, "final_url": home_url, "status": status or 200,
+            "load_ms": load_ms, "pages": [p.url for p in ordered],
+            "page_count": len(ordered), "title": title, "brand": brand,
+            "tech": tech,
+            "unreachable_reason": state, "unreachable_detail": unreachable_detail(state),
+        })
+        return result
     services = _services(ordered, title, brand)
-    signals, facts = _signals(ordered, tech, home_url, load_ms)
+    signals, facts = _signals(ordered, tech, home_url, load_ms, low, text)
     facts["bookable_services"] = (_bookable(services)
                                   or _bookable(facts.pop("service_listing", ())))
     gaps = _gaps(tech, signals, facts)
@@ -1735,6 +2389,21 @@ def audit_from_html(pages: dict, base_url: str) -> dict:
         return _blank(base_url or "", f"{type(exc).__name__}: {exc}"[:200])
 
 
+def unreachable_audit(url: str, error: str = "", *, final_url: str = "",
+                      status: int = 0) -> dict:
+    """The audit for a site nobody could read, with the reason kept.
+
+    The caller that has already paid the connection timeout — `core.campaign`
+    does, twice, for an https host it retried over plain http — builds its
+    result through here instead of through `audit_from_html({}, url)`, which
+    threw the reason away and left the operator with a boolean.
+    """
+    result = _blank(str(url or ""), str(error or ""), status=int(status or 0))
+    result["final_url"] = str(final_url or url or "")
+    result["status"] = int(status or 0)
+    return result
+
+
 def audit_site(url: str, *, max_pages: int = 6, timeout: float = 8.0,
                prefetched: dict | None = None) -> dict:
     """Audit a live site, reusing `prefetched` HTML from `harvest_site` if given.
@@ -1759,7 +2428,10 @@ def audit_site(url: str, *, max_pages: int = 6, timeout: float = 8.0,
         home_html, final_url, status, error = _fetch(url, timeout)
         load_ms = int((time.perf_counter() - started) * 1000)
         if not home_html:
-            return _blank(url, error or "empty response")
+            dead = _blank(url, error or "empty response", status=status)
+            dead["final_url"] = final_url or url
+            dead["status"] = status
+            return dead
 
         pages = {final_url: home_html}
         targets = _crawl_targets(home_html, final_url, max(0, max_pages - 1))
@@ -1920,6 +2592,18 @@ def _digest_lines(audit: dict, services: int, signals: int, gaps: int) -> list[s
     brand = str(audit.get("brand") or audit.get("title") or "").strip()
 
     lines = ["SITE: " + " | ".join(p for p in (domain, brand[:60]) if p)]
+
+    # A site nobody could read has no stack and no signals, and the lines below
+    # would invent both: `tech` is empty on a dead host, so "no chat | no
+    # booking | no crm | no analytics" went to the model as four facts about a
+    # business whose home page never answered. The model then wrote an opener
+    # around them. One line, and it says what is actually known.
+    if not audit.get("reachable"):
+        detail = (str(audit.get("unreachable_detail") or "").strip()
+                  or unreachable_detail(str(audit.get("unreachable_reason") or ""))
+                  or "the site could not be read")
+        lines.append("UNREADABLE: " + detail)
+        return lines
 
     offered = [str(s).strip() for s in (audit.get("services") or []) if str(s).strip()]
     if offered and services > 0:

@@ -1,5 +1,5 @@
 @echo off
-REM MapHarvest launcher.
+REM LeadForge launcher.
 REM
 REM Prefers the bundled venv, because that is where the app's dependencies live
 REM and a system Python will start and then fail on the first import. Falls back

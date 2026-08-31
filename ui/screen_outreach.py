@@ -162,6 +162,95 @@ second copy of one, and each closes something measured here:
   * every control that does something carries the drawing for it from
     `ui/icons.py` — the leads toolbar, the bulk row, the send controls and the
     row menu — and not one of them holds a pixmap or a colour of its own.
+
+This pass is about the one thing left over from all of that: the screen knew
+things it would not say. Two complaints, one cause.
+
+"Which site is not reachable?" had no answer on the screen that was hiding it.
+Four leads whose sites had timed out, answered 403, had no DNS record and
+carried a dead certificate all painted the same cell — "form letter — the site
+could not be reached" — and the one place the real line surfaced was the
+campaign preview, one tab and two clicks away, as `URLError: <urlopen error
+[Errno 11001] getaddrinfo failed>`. So:
+
+  * `_site_failure` reads `unreachable_reason` and `unreachable_detail` off the
+    lead's `audit_json`. Those are the crawl's own keys — `core.audit` fills
+    them, `core.enrich` writes the words they are derived from — and reading
+    them rather than the `error` line is what keeps this screen from being a
+    third dialect for one fact. It also catches what no error string could: a
+    page that answered 200 and still told the crawl nothing, a bot check, a
+    parked domain, a cookie wall, a shell that renders nothing without
+    JavaScript. All of those are `reachable: False` with pages in the blob and
+    no error at all. A blob from before those keys existed goes back through
+    `core.audit.unreachable_reason`, the same function that filled them, so an
+    old store reads exactly like a new one; a blob that says nothing about
+    `reachable` and carries no error is not read as a failure at all, because
+    silence is not evidence.
+  * the one thing kept here is the register a column needs. The crawl's detail
+    is a clause — "the domain name does not resolve" — which is what the
+    tooltip, the preview and the Headline gap print; `_SITE_WORDS` is four
+    words per code for the cell that gets scanned down forty rows. A code this
+    build has never heard of is spelled out rather than flattened back into
+    "unreachable".
+  * `Site` is a column. Blank for every site that was read, which is what makes
+    it scannable — the only rows carrying a word are the ones nothing was
+    learned from. It sorts, it exports with the raw line beside the words, and
+    the filter box reads both, so `timed out` finds every lead the crawl gave
+    up on that way.
+  * the "Failed Audits" filter is "Unreachable sites", which is what it always
+    selected. Its key stays `~failed`, because that key is written into every
+    saved view on disk and renaming it would drop a user's view back to All
+    leads on the first run after the upgrade. It reads the same cached answer
+    the column paints rather than decoding the blob once per row per keystroke.
+  * a column added after a view was written is not one the user switched off —
+    they were never offered it — so `lead_views.json` now records the keys it
+    was written by and `_fields_wanted` turns anything newer on. Without it,
+    adding Site would have hidden it from everyone who has ever opened this tab.
+  * the row menu retries the crawl on exactly the rows under the pointer, and
+    every crawl now reports what it changed. "Audit finished" was true of every
+    run and said nothing about any of them; a retry that comes back with the
+    same four failures leaves the table looking identical, which is the one
+    outcome that must never read as success.
+  * the Campaign card counts the form letters *before* Prepare is pressed, and
+    the review dialog says which of four reasons produced them instead of
+    printing "Generic Copies: 31".
+
+The Sending tab could look dead in states it knew about. Eighteen were driven
+one at a time and read off the screen; three were lying and three said nothing:
+
+  * a run with no Gmail account configured at all reported "Every account has
+    hit today's cap" — a sentence about a cap on an empty set.
+  * an account the run had benched for the day after an AUTH or QUOTA failure
+    was counted as one with room, so the screen read "Sending — 0 of 3" over a
+    queue with nothing left to send from. `_benched_today` reads the
+    `account_stopped` events the worker writes, which is the store's own record
+    of the same fact and outlives the run.
+  * a campaign the run had stopped for that reason read "Not sending — press
+    Start sending", which starts a run that stops again immediately.
+  * "Stopping — finishing the message in flight" lived for under a second:
+    `_on_tick` repaints the line every second and put "Sending" back, and
+    re-enabled the Stop button it had just disabled.
+  * a run waiting out the pacing gap said only "Sending", with no clock on it,
+    for as long as the gap lasted.
+  * a queue scheduled past the year `_next_due_ts` looks over was reported as
+    "every queued message is addressed to a suppressed address" — the one cause
+    the branch could think of, asserted without counting a single one. It is
+    counted now, and there is a third answer for when it is neither.
+  * Send now was the one control on the tab nothing ever disabled. It sat lit
+    over a campaign that did not exist, and the shell's context line — visible
+    from every screen — counted `sent`, which a rehearsal never writes.
+
+The cost of asking those questions, measured on this machine as the median of
+25 calls with a 2,000-row event log: one second's `_refresh_send_controls` went
+0.09ms -> 0.37ms, and the event-log read behind it is memoised for two seconds
+because three things on the line want the same answer (1.81ms a read, three
+reads a tick without it). The leads tab pays nothing: the form-letter tally is
+counted on the way into the Campaign tab, where it is read, rather than on
+every selection change on the Leads tab, where it is not. Counted the other way
+it cost +42ms on a Ctrl+A over 5,000 rows and +8ms on every keystroke in the
+filter box; counted this way, at 5,000 leads, `_apply_filters`, `_fill_table`,
+a keystroke and a Ctrl+A all measure inside the noise of the same screen
+without any of it, and one visit to the Campaign tab costs 12ms.
 """
 
 from __future__ import annotations
@@ -187,6 +276,7 @@ from PyQt5.QtWidgets import (
     QStyledItemDelegate, QTableWidgetItem, QTextBrowser, QVBoxLayout, QWidget,
 )
 
+from core import audit as _audit
 from core import campaign as _campaign
 from core import mailer as _mailer
 from core import outreach_db as _db
@@ -245,15 +335,19 @@ _LEAD_COLUMNS = (
     Column("Email", "stretch", weight=3, min_ch=16, max_ch=52),
     Column("City", "fit", min_ch=8, max_ch=20, sample="Scarborough"),
     Column("Category", "fit", min_ch=8, max_ch=22, sample="Roofing contractor"),
+    # Blank for every site the crawl read, which is what makes it scannable:
+    # the only rows carrying a word here are the ones nothing could be learned
+    # about. See `_SITE_WORDS` for why it is four words and not the raw line.
+    Column("Site", "fit", min_ch=10, max_ch=22, sample="rate-limited (429)"),
     Column("Score", "fit", min_ch=13, max_ch=16, sample="88 · moderate"),
     Column("Headline gap", "stretch", weight=5, min_ch=16, max_ch=80),
     Column("Status", "fit", min_ch=12, max_ch=16, sample="⊘ suppressed"),
 )
 
-(_COL_NAME, _COL_EMAIL, _COL_CITY, _COL_CATEGORY, _COL_SCORE, _COL_GAP,
- _COL_STATUS) = range(len(_LEAD_COLUMNS))
+(_COL_NAME, _COL_EMAIL, _COL_CITY, _COL_CATEGORY, _COL_SITE, _COL_SCORE,
+ _COL_GAP, _COL_STATUS) = range(len(_LEAD_COLUMNS))
 
-# The seven names above are *fields*, not table columns, and that is the whole
+# The eight names above are *fields*, not table columns, and that is the whole
 # of the column-visibility change. A field is a thing a lead has; a column is a
 # place on screen where one of them happens to be painted today. `_col_of` on
 # the screen maps the first onto the second, and a hidden field simply has no
@@ -269,8 +363,19 @@ _FIXED_FIELDS = (_COL_NAME,)
 # What each field is called in the file that remembers the choice. Names and
 # not indices: a column added to the spec above must not silently renumber a
 # saved view written last month.
-_FIELD_KEYS = ("name", "email", "city", "category", "score", "gap", "status")
+_FIELD_KEYS = ("name", "email", "city", "category", "site", "score", "gap",
+               "status")
 _FIELD_OF_KEY = {key: index for index, key in enumerate(_FIELD_KEYS)}
+
+# The keys a stored column list could name before `site` existed. An entry that
+# does not say which keys it was written by was written by that build, and a
+# field it never names is one the user was never offered — so it arrives
+# switched on rather than hidden. Without this, adding a column would leave it
+# off for every user who has ever opened the Leads tab, which is all of them:
+# `lead_views.json` stores the columns that are *shown*, so a file listing the
+# seven names below and no eighth is indistinguishable from a user who turned
+# the eighth off.
+_KNOWN_BEFORE = ("name", "email", "city", "category", "score", "gap", "status")
 
 # Which lead field each column sorts and searches on. The two badge columns
 # sort on the value behind the badge — an em dash compares greater than any
@@ -299,7 +404,9 @@ _SEARCH_HELP = (
     "the roofers in Toronto. Put a field in front of the colon to look in one "
     "place — city:toronto, category:roofing, status:sent, email:gmail — and "
     "quote a phrase to keep it whole. Name, email, city, category, phone, "
-    "website, source, headline gap, score band and status are all read.")
+    "website, source, headline gap, score band, status and why a site could "
+    "not be read are all read — «timed out» finds every lead the crawl gave "
+    "up on for that reason.")
 
 # The badge a cell paints, and the value it sorts on. `+ 1` and `+ 2` belong to
 # `components` (the untruncated text and the sort key), so this starts at `+ 3`.
@@ -321,12 +428,20 @@ _ALIGNMENT = {"left": Qt.AlignLeft, "right": Qt.AlignRight,
 _WINDOW_PAD = 24
 _WINDOW_KEEP = 120
 
-# Keys are lead statuses, except the two prefixed "~": those filter on whether
-# the lead's email would say anything about them, which is not a status and is
-# the only way to send to the personalised half of a list and leave the rest.
+# Keys are lead statuses, except the three prefixed "~": those filter on
+# something the crawl found rather than on where the lead is in the campaign,
+# which is not a status and is the only way to send to the personalised half of
+# a list and leave the rest.
+#
+# `~failed` is the key and "Unreachable sites" is the label, and the two
+# deliberately disagree. What it selects has always been "the crawl could not
+# read this site" — the word "audit" was never the failure, the site was — but
+# the key is written into `lead_views.json` by every saved view, and renaming
+# it would silently drop a user's saved view back to All leads on the first
+# run after the upgrade.
 _STATUS_FILTERS = (
     ("All leads", ""), ("Not audited", "new"), ("Audited", "audited"),
-    ("Failed Audits", "~failed"), ("Personalised", "~personal"),
+    ("Unreachable sites", "~failed"), ("Personalised", "~personal"),
     ("Generic email", "~generic"), ("Queued", "queued"), ("Sent", "sent"),
     ("Replied", "replied"), ("Bounced", "bounced"), ("Suppressed", "suppressed"),
 )
@@ -388,6 +503,22 @@ _DELETE_BATCH = 500
 _TOKEN_RE = re.compile(r"\{\{[^{}]*\}\}")
 
 _LOG_LIMIT = 400
+
+# How far back the "which accounts are out of action today" question reads the
+# event log. Every send writes an event, so a busy day is thousands of rows and
+# the answer is only ever in the last few hundred: the scan stops at the first
+# row older than local midnight, and this is the ceiling on how long it can run
+# before it gets there.
+_BENCH_SCAN = 400
+
+# How long that answer is reused for. The status line is repainted once a
+# second and three of the things on it want the same set, so without this the
+# tick reads the event log three times: measured at 1.81ms a read over a
+# 2,000-row log, which is 5.4ms of GUI thread every second for a fact that
+# changes when an SMTP server refuses a password. Two seconds is inside the
+# tick and far inside a human's idea of "at once".
+_BENCH_TTL = 2.0
+
 _DAY_SEC = 86400.0
 _DAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
@@ -600,6 +731,90 @@ def _reason_list(counts, limit: int = _NAMED_IN_SUMMARY) -> str:
     return ", ".join(named)
 
 
+# ── Why a site could not be read ─────────────────────────────────────────────
+# `core.audit` answers this now and this screen does not second-guess it. The
+# crawl writes two keys on the lead beside `reachable`: `unreachable_reason`,
+# one of the codes in `core.audit.UNREACHABLE_REASONS`, and
+# `unreachable_detail`, the same code as the sentence a person reads. Both are
+# "" exactly when the site was read.
+#
+# Reading the code rather than the raw `error` string matters twice over. A
+# page that answered 200 and still told the crawl nothing — a bot check, a
+# parked domain, a cookie wall, a shell that renders nothing without
+# JavaScript — is `reachable: False` with pages in the blob and no `error` at
+# all, so anything keyed on the error line would call it readable and let the
+# email claim seven things are missing from a site nobody has seen. And the
+# vocabulary is shared: `core.enrich._short_error` writes the words that
+# `core.audit.unreachable_reason` reads, so a third table here would be a
+# third dialect for one fact.
+#
+# What is *not* in `core.audit` is the register a column needs. The detail is a
+# clause — "the domain name does not resolve" — which is what a tooltip and a
+# preview want and what a cell scanned down forty rows cannot be. So the one
+# thing kept here is four words per code, and an unknown code is printed rather
+# than guessed at, because a new code from the crawl is more use spelled out
+# than flattened into "unreachable".
+
+_SITE_WORDS = {
+    "no_url": "no website", "dns": "no DNS record", "refused": "refused",
+    "timeout": "timed out", "tls": "bad certificate", "reset": "dropped",
+    "redirect_loop": "redirect loop", "http_401": "login wall (401)",
+    "http_403": "blocked (403)", "http_404": "dead page (404)",
+    "http_410": "gone (410)", "http_429": "rate-limited (429)",
+    "http_500": "server error", "http_503": "unavailable (503)",
+    "http_error": "server error", "not_html": "not a web page",
+    "empty": "empty reply", "parked": "parked domain",
+    "under_construction": "coming soon", "challenge": "bot check",
+    "cookie_wall": "cookie wall", "js_only": "needs JavaScript",
+    "unreachable": "unreachable",
+}
+
+
+def _site_failure(audit) -> tuple:
+    """(four words, the crawl's sentence, the line it recorded) for one audit.
+
+    All three blank for a site that was read, and for a lead nobody has crawled
+    yet — a site nothing has been tried on has not failed, and saying it has is
+    the same guess-dressed-as-a-fact `_generic_reason` refuses to make.
+
+    A blob written before the crawl carried the two keys is put through
+    `core.audit.unreachable_reason`, which is the same function that filled
+    them, so a store crawled last month reads exactly as one crawled today
+    rather than going blank or being classified by a second opinion.
+    """
+    if not isinstance(audit, dict) or not audit:
+        return "", "", ""
+    raw = _text_of(audit.get("error")).strip()
+    if "unreachable_reason" in audit:
+        reason = _text_of(audit.get("unreachable_reason")).strip()
+    elif audit.get("reachable"):
+        return "", "", raw
+    else:
+        # No key at all. A hand-written blob, or one from a build before the
+        # crawl recorded the reason. Its silence about `reachable` is not
+        # evidence of a failure; only a recorded error is.
+        if audit.get("reachable") is None and not raw:
+            return "", "", raw
+        reason = _audit.unreachable_reason(raw, _int_of(audit.get("status")))
+    if not reason:
+        return "", "", raw
+    detail = _audit.unreachable_detail(reason) or "the site could not be read"
+    return _SITE_WORDS.get(reason, reason.replace("_", " ")), detail, raw
+
+
+def _site_tally(counts, limit: int = _NAMED_IN_SUMMARY) -> str:
+    """"2 timed out, 1 blocked (403)" — a run's failures, biggest cause first."""
+    ranked = sorted(((_text_of(words), _int_of(count))
+                     for words, count in (counts or {}).items() if words),
+                    key=lambda item: (-item[1], item[0]))
+    if not ranked:
+        return ""
+    named = ["%d %s" % (count, words) for words, count in ranked[:limit]]
+    if len(ranked) > limit:
+        named.append("%d for other reasons" % sum(c for _w, c in ranked[limit:]))
+    return ", ".join(named)
+
+
 def _norm_key(key: str) -> str:
     return re.sub(r"_+", "_", re.sub(r"[^a-z0-9]+", "_", _text_of(key).strip().lower())).strip("_")
 
@@ -634,6 +849,25 @@ def _names_of(leads, limit: int = _NAMED_IN_SUMMARY) -> str:
     """`_named` for a caller that is already holding the whole list."""
     leads = list(leads)
     return _named(len(leads), leads, limit)
+
+
+def _listed(items, limit: int = _NAMED_IN_SUMMARY) -> str:
+    """"a@x, b@y and 2 more" — a handful of plain strings, as English.
+
+    `_named` reads a business name off a lead record; this is for the places
+    that are already holding the strings, which is every sentence about
+    sending accounts.
+    """
+    named = [_text_of(item).strip() for item in list(items)[:limit]
+             if _text_of(item).strip()]
+    rest = len(list(items)) - len(named)
+    if not named:
+        return "nothing"
+    if rest > 0:
+        named.append("%d more" % rest)
+    if len(named) == 1:
+        return named[0]
+    return "%s and %s" % (", ".join(named[:-1]), named[-1])
 
 
 _STAMPED = ("status", "opportunity_score", "audit_json", "ai_json", "name",
@@ -695,6 +929,27 @@ def _fields_from_keys(keys, fallback) -> tuple:
     return tuple(field for field in range(len(_LEAD_COLUMNS)) if field in wanted)
 
 
+def _fields_wanted(entry: dict, fallback) -> tuple:
+    """The columns one stored entry asked for, plus any field it predates.
+
+    A column added after the entry was written is not a column the user
+    switched off — they were never offered it — so it arrives on. `known` is
+    the key list the entry was saved by; an entry without one was saved before
+    that was recorded, and `_KNOWN_BEFORE` is what it could have named.
+
+    Read off the entry rather than off a bare key list because both callers
+    have the whole dict, and the two halves have to be read together: a
+    `columns` from one build and a `known` from another describe nothing.
+    """
+    entry = entry if isinstance(entry, dict) else {}
+    wanted = set(_fields_from_keys(entry.get("columns"), fallback))
+    seen = {key for key in (entry.get("known") or _KNOWN_BEFORE)
+            if isinstance(key, str)}
+    wanted.update(index for index, key in enumerate(_FIELD_KEYS)
+                  if key not in seen)
+    return tuple(field for field in range(len(_LEAD_COLUMNS)) if field in wanted)
+
+
 def _keys_of_fields(fields) -> list:
     return [_FIELD_KEYS[field] for field in fields
             if 0 <= field < len(_FIELD_KEYS)]
@@ -718,6 +973,7 @@ def _read_views() -> dict:
              if isinstance(view, dict) and _text_of(view.get("name")).strip()]
     return {
         "columns": list(data.get("columns") or []),
+        "known": list(data.get("known") or []),
         "views": views[:_MAX_VIEWS],
         "current": _text_of(data.get("current")),
         "search": _text_of(data.get("search")),
@@ -1229,7 +1485,16 @@ def _view_sentence(view: dict) -> str:
 
 
 class _CampaignReviewDialog(QDialog):
-    """Summarizes campaign preparation statistics before scheduling."""
+    """The last look at a campaign before it is committed to the queue.
+
+    This is the gate, not a receipt: rejecting it deletes every message the
+    plan wrote. So the number that decides the answer has to be readable here
+    and not only afterwards on the Campaign card — "Generic Copies: 31" is a
+    figure nobody can act on, because it says neither what a generic copy is
+    nor which of four things went wrong to produce one. `_generic_sentence`
+    reads the plan's own per-reason tally, which is where `core.campaign`
+    counts them, and the same words appear on the card underneath.
+    """
 
     def __init__(self, plan: dict, parent=None):
         super().__init__(parent)
@@ -1248,17 +1513,39 @@ class _CampaignReviewDialog(QDialog):
             row.addWidget(components.heading(str(val), level="h4"))
             stats_layout.addLayout(row)
             
-        add_stat("Queued Messages", plan.get("queued", 0))
+        queued = _int_of(plan.get("queued"))
+        generic = _int_of(plan.get("generic"))
+        add_stat("Queued Messages", queued)
         add_stat("Follow-ups", plan.get("followups", 0))
         add_stat("Skipped Leads", plan.get("skipped", 0))
-        add_stat("Generic Copies", plan.get("generic", 0))
-        
+        add_stat("Form letters", generic)
+
         accounts_text = ", ".join(plan.get("accounts", [])) or "None"
         add_stat("Accounts", accounts_text)
         add_stat("Sending Days", plan.get("days", 0))
-        
+
         box.addLayout(stats_layout)
-        
+
+        if generic:
+            # The one line that changes the answer. A form letter is not a
+            # smaller email, it is one that says nothing about the business it
+            # is addressed to — and a user who can see that 31 of 40 are that
+            # before approving can go back and crawl the sites again.
+            box.addWidget(components.body_label(
+                "%d of %s will say nothing about the business they are "
+                "addressed to — %s. Discard this plan if you would rather fix "
+                "those first."
+                % (generic, _plural(queued, "email"),
+                   _generic_sentence(plan.get("generic_reasons"))),
+                tone="warning", max_chars=80))
+        if _int_of(plan.get("skipped")):
+            box.addWidget(components.body_label(
+                "%d lead%s left out — %s."
+                % (_int_of(plan.get("skipped")),
+                   "" if _int_of(plan.get("skipped")) == 1 else "s",
+                   _reason_list(plan.get("skip_reasons"))),
+                tone="secondary", max_chars=80))
+
         if plan.get("warnings"):
             box.addWidget(components.heading("Warnings", level="h4"))
             for w in plan.get("warnings", []):
@@ -1564,6 +1851,25 @@ class OutreachScreen(QWidget):
         self._planning = False
         self._leads_dirty = False
         self._stats_dirty = False
+        # lead id -> the Site words it carried when the crawl now running was
+        # started, and whether that crawl was a retry. Kept because "did that
+        # do anything?" can only be answered against the state before it ran,
+        # and after `_reload_leads` that state is gone.
+        self._audit_before: dict[int, str] = {}
+        self._audit_retry = False
+        # The second line under "Queues N leads", carried rather than
+        # recomputed: working it out is a walk of the target and the label it
+        # sits in is rewritten once per audited lead.
+        self._form_letter_note = ""
+        # Set between Stop being pressed and the worker actually unwinding. The
+        # one-second tick repaints the status line, so without this the
+        # sentence Stop writes lives for under a second and the user is left
+        # watching a run that says it is still sending.
+        self._stopping = False
+        # Which accounts the run has taken out of service today, and when that
+        # was last read off the event log. See `_benched_today`.
+        self._benched: set = set()
+        self._benched_at = 0.0
 
         self._leads: list[dict] = []
         # lead id -> why that lead's email would be a form letter, "" when it
@@ -1614,8 +1920,7 @@ class OutreachScreen(QWidget):
         # What the leads tab remembered from last time: the chosen columns, the
         # named views, and the filter that was live when the app last closed.
         self._stored = _read_views()
-        self._fields = _fields_from_keys(self._stored.get("columns"),
-                                         range(len(_LEAD_COLUMNS)))
+        self._fields = _fields_wanted(self._stored, range(len(_LEAD_COLUMNS)))
         self._col_of: dict[int, int] = {}
         self._views: list = list(self._stored.get("views") or [])
         self._view_name = _text_of(self._stored.get("current"))
@@ -1753,12 +2058,14 @@ class OutreachScreen(QWidget):
         """
         line = ""
         if self._sending:
-            stats = self._stats()
-            line = "Paused after %d of %d" % (_int_of(stats.get("sent")),
-                                              _int_of(stats.get("total"))) \
-                if self._paused else \
-                "Sending — %d of %d" % (_int_of(stats.get("sent")),
-                                        _int_of(stats.get("total")))
+            # The headline the Sending tab is showing, and not a second opinion
+            # about the same run. This used to count `sent`, which a rehearsal
+            # never writes, so a dry run reported "Sending — 0 of 500" on the
+            # one bar that is visible from every screen — the same frozen
+            # number `_send_health` was fixed for, one level up. It also said
+            # "Sending" while the loop was holding outside the window, which is
+            # the sentence this whole pass exists to stop printing.
+            line = self._send_health()[0]
         elif self._auditing:
             line = "Auditing sites"
         elif self._planning:
@@ -2940,6 +3247,11 @@ class OutreachScreen(QWidget):
             return _int_of(lead.get("opportunity_score"))
         if field == _COL_GAP:
             return self._gap_text(lead)[0].lower()
+        if field == _COL_SITE:
+            # Blank is what a site that was read says, so ascending puts the
+            # readable ones first and one click brings every failure to the
+            # top, grouped by the way it failed.
+            return self._site_text(lead)[0].lower()
         return _text_of(lead.get(_COL_KEYS.get(field, "name"))).strip().lower()
 
     def _on_header_clicked(self, column: int) -> None:
@@ -2956,13 +3268,19 @@ class OutreachScreen(QWidget):
         self._forget_view()
 
     def _gap_text(self, lead: dict, audit=None) -> tuple:
-        """(what the Headline gap column says, and whether it is a form letter).
+        """(Headline gap, form letter?, Site words, the crawl's sentence, its line).
 
-        Cached against the lead's id, because working it out is a JSON decode
-        and a `core.templates.personalisation` call and four separate passes
-        wanted the same answer for the same lead: the sort key, the row, the
-        filter box and the tooltip. `audit` is the already-decoded blob when a
-        caller has one, so the row build does not decode it twice.
+        Five answers out of one decode, and cached against the lead's id,
+        because working them out is a JSON decode and a
+        `core.templates.personalisation` call and every pass over the table
+        wanted some of them: the sort key, the row, the filter box and the
+        tooltip. `audit` is the already-decoded blob when a caller has one, so
+        the row build does not decode it twice.
+
+        The last three ride here rather than in a cache of their own for the
+        same reason: `_hidden_by` asks whether a lead's site could be read once
+        per row on every filter pass, and a second `json.loads` per row per
+        keystroke is the cost this cache exists to refuse.
         """
         lead_id = _int_of(lead.get("id"))
         answer = self._gaps.get(lead_id)
@@ -2970,17 +3288,27 @@ class OutreachScreen(QWidget):
             audit = _loads(lead.get("audit_json")) if audit is None else audit
             gaps = [g for g in (audit.get("gaps") or []) if isinstance(g, dict)]
             reason = self._generic_reason(lead, audit)
+            site, phrase, raw = _site_failure(audit)
             gap = _text_of(gaps[0].get("title")).strip() if gaps else ""
             if not gap and reason:
                 # This lead's email is three paragraphs that could have been
                 # written before the crawl. That is what the column has to say,
                 # because "no clear gap" reads as a thin prospect rather than
-                # as a form letter.
-                gap = "form letter — " + _templates.generic_reason(reason)
+                # as a form letter — and when the crawl knows which way the
+                # site failed, it says that rather than "could not be reached",
+                # which is the difference between a row the user can act on and
+                # a row they have to open something to understand.
+                gap = "form letter — " + (
+                    phrase if phrase and reason == "unreachable"
+                    else _templates.generic_reason(reason))
             answer = (gap or ("not audited yet" if not audit else "no clear gap"),
-                      bool(reason))
+                      bool(reason), site, phrase, raw)
             self._gaps[lead_id] = answer
         return answer
+
+    def _site_text(self, lead: dict) -> tuple:
+        """(four words, the crawl's sentence, its own line) for one lead."""
+        return self._gap_text(lead)[2:]
 
     def _forget_lead(self, lead_id: int) -> None:
         """Drop everything derived from one lead's record, after it changed."""
@@ -2993,7 +3321,7 @@ class OutreachScreen(QWidget):
         """One lead as `components.Cell`s, in the order the columns stand in.
 
         The whole spec is built and then cut down to the shown fields rather
-        than being built per field, because five of the seven cost nothing and
+        than being built per field, because six of the eight cost nothing and
         the two that do — the Headline gap and the score's gap count — are
         cached against the lead anyway.
 
@@ -3006,7 +3334,7 @@ class OutreachScreen(QWidget):
         status = _text_of(lead.get("status")).strip() or "new"
         audit = _loads(lead.get("audit_json"))
         gaps = [g for g in (audit.get("gaps") or []) if isinstance(g, dict)]
-        gap, generic = self._gap_text(lead, audit)
+        gap, generic, site, phrase, raw = self._gap_text(lead, audit)
 
         every = (
             Cell(text=_text_of(lead.get("name")).strip() or "—",
@@ -3014,11 +3342,21 @@ class OutreachScreen(QWidget):
             Cell(text=_text_of(lead.get("email")).strip()),
             Cell(text=_text_of(lead.get("city")).strip()),
             Cell(text=_text_of(lead.get("category")).strip()),
+            Cell(text=site, sort=site,
+                 tip=self._site_tip(lead, phrase, raw)),
             Cell(text="", sort=score,
                  tip="Opportunity %d of 100 — %s, %s" % (
                      score, components.score_band(score)[1],
                      _plural(len(gaps), "gap"))
-                 if score > 0 else "Not audited yet"),
+                 if score > 0 else
+                 # A lead whose site could not be read *was* audited. Saying
+                 # "not audited yet" over its zero is the badge and the
+                 # tooltip agreeing on something that did not happen, and it
+                 # sends the user back to press Audit on a row that has
+                 # already been crawled twice.
+                 "Crawled, but %s — there is nothing to score until the "
+                 "site can be read." % phrase if site
+                 else "Not audited yet"),
             Cell(text=gap,
                  tip="Nothing is known about this business, so the email says "
                      "nothing about it. Filter to Generic email to review or "
@@ -3026,6 +3364,26 @@ class OutreachScreen(QWidget):
             Cell(text="", sort=status, tip=self._status_tip(status)),
         )
         return tuple(every[field] for field in self._fields)
+
+    def _site_tip(self, lead: dict, phrase: str, raw: str) -> str:
+        """What the Site cell says on hover: the address, the line, the cost.
+
+        The raw line the crawl recorded is kept whole and shown here and
+        nowhere else. Four words is what a column of forty rows can be scanned
+        for; `URLError: <urlopen error [Errno 11001] getaddrinfo failed>` is
+        what somebody chasing one site actually needs, and throwing it away to
+        keep the cell short would mean the app knows something it will not say.
+        """
+        if not phrase:
+            return ""
+        where = _text_of(lead.get("website")).strip()
+        lines = ["The crawl could not read %s — %s."
+                 % (where or "this lead's site", phrase)]
+        if raw and raw.lower() != phrase.lower():
+            lines.append("It recorded: %s" % _clip(raw, 160))
+        lines.append("Its email will say nothing about the business. Right-click "
+                     "to retry the crawl, open the site, or take the lead out.")
+        return "\n".join(lines)
 
     def _set_badge(self, row: int, field: int, key) -> None:
         """Put the value a badge column paints onto its cell.
@@ -3110,12 +3468,24 @@ class OutreachScreen(QWidget):
         return _STATUS_FILTERS[max(0, self.status_filter.currentIndex())][1]
 
     def _hidden_by(self, lead: dict, wanted: str) -> bool:
-        """Would the filters as they stand hide this lead? One row's worth."""
+        """Would the filters as they stand hide this lead? One row's worth.
+
+        `~failed` reads the same cached answer the Site column paints, and that
+        is the whole of its change. It used to decode the audit blob per row
+        per pass and ask only whether `error` was non-empty — one `json.loads`
+        a row on every keystroke, and a predicate that missed a site marked
+        unreachable with nothing written in `error`. `_gap_text` has already
+        decoded the blob for the table; this asks it.
+        """
         if wanted.startswith("~"):
             if wanted == "~failed":
-                audit = _loads(lead.get("audit_json"))
-                has_error = bool(audit and audit.get("error"))
-                hide = not has_error
+                # Straight off the cache rather than through `_site_text`,
+                # which is a call and a tuple slice per row. This runs once per
+                # row on every keystroke: measured over 5,000 leads with this
+                # filter on, a pass costs 6.1ms read this way and 27.3ms read
+                # through the accessor.
+                answer = self._gaps.get(_int_of(lead.get("id")))
+                hide = not (answer[2] if answer else self._site_text(lead)[0])
             else:
                 generic = bool(self._generic.get(_int_of(lead.get("id"))))
                 hide = generic != (wanted == "~generic")
@@ -3212,6 +3582,12 @@ class OutreachScreen(QWidget):
                      for field in ("name", "email", "city", "category", "phone",
                                    "website", "status", "source")]
             parts.append(self._gap_text(lead)[0])
+            # Both registers of the crawl's failure: "timed out" is what the
+            # column shows and what a user types, and the line underneath is
+            # what they paste out of a bug report.
+            site, _phrase, raw = self._site_text(lead)
+            parts.append(site)
+            parts.append(raw)
             parts.append(components.score_band(
                 _int_of(lead.get("opportunity_score")))[1])
             blob = "\n".join(part for part in parts if part).lower()
@@ -3285,6 +3661,12 @@ class OutreachScreen(QWidget):
     def _selected_leads(self) -> list[dict]:
         return [self._lead_at(row) for row in self._selected_rows()]
 
+    def _shown_leads(self) -> list[dict]:
+        """Every lead the filters are leaving on screen, selection ignored."""
+        table = self.lead_table
+        return [self._lead_at(row) for row in range(table.rowCount())
+                if not table.isRowHidden(row)]
+
     def _target_leads(self) -> list[dict]:
         """Selection if there is one, otherwise everything the filters show.
 
@@ -3293,11 +3675,8 @@ class OutreachScreen(QWidget):
         which is the same answer without materialising five thousand records.
         """
         rows = self._selected_rows()
-        if rows:
-            return [self._lead_at(row) for row in rows]
-        table = self.lead_table
-        return [self._lead_at(row) for row in range(table.rowCount())
-                if not table.isRowHidden(row)]
+        return [self._lead_at(row) for row in rows] if rows \
+            else self._shown_leads()
 
     def _target_head(self, limit: int = _NAMED_IN_SUMMARY) -> tuple:
         """(how many an action would touch, the first few of them, from a pick?)
@@ -3417,9 +3796,74 @@ class OutreachScreen(QWidget):
             "There is nothing on screen to export")
 
         if hasattr(self, "plan_targets"):
-            self.plan_targets.setText(self._target_sentence("Queues", target))
+            self.plan_targets.setText(self._target_sentence("Queues", target)
+                                      + self._form_letter_warning())
             self.prepare_btn.setText("Prepare campaign (%d)" % targets
                                      if targets else "Prepare campaign")
+
+    def _form_letter_warning(self) -> str:
+        """How much of what Prepare is about to queue would be a form letter.
+
+        The number existed already — the plan reports it — but only after the
+        campaign had been built, which is after the decision. A user who can
+        see "31 of these have a site nothing could read" before pressing
+        Prepare can narrow the filter, retry the crawl or take the rows out;
+        the same sentence afterwards is an explanation of something that has
+        already happened.
+
+        Worked out only while the card is the page in front of the user, and
+        that is the whole of what keeps it free. The label lives on the
+        Campaign tab; the selection and the filter it describes are changed on
+        the Leads tab, where nobody can see it. Counting on every one of those
+        changes cost a walk of the target for a string on a hidden page —
+        measured at 5,000 leads, +42ms on a Ctrl+A (55ms -> 97ms) and +8ms on
+        every keystroke in the filter box. Counted on the way into the tab
+        instead it is one walk per visit, 11.5-15.5ms at 5,000 leads over four
+        runs, and the number is fresh at the only moment it is read.
+
+        Not recomputed while a crawl is running either. `_refresh_lead_actions`
+        is called once per audited lead, so a walk here is the O(N²) this
+        screen spent a whole pass closing; `_on_audit_done` asks for it once
+        when the run ends, which is when it changed.
+        """
+        if not hasattr(self, "lead_table") or self._auditing:
+            return self._form_letter_note
+        if self.pages.currentIndex() != 1:
+            return self._form_letter_note
+        unreadable, generic = self._form_letter_counts(
+            self._selected_leads() if self._selected_count()
+            else self._shown_leads())
+        note = ""
+        if unreadable:
+            note = ("\n%d of them have a site nothing could read, so %s go out "
+                    "as a form letter."
+                    % (unreadable, "that one" if unreadable == 1 else "those"))
+            if generic:
+                note += (" %d more say nothing about the business for other "
+                         "reasons." % generic)
+        elif generic:
+            note = ("\n%d of them would go out as a form letter — the crawl "
+                    "found nothing to say about the business." % generic)
+        self._form_letter_note = note
+        return note
+
+    def _form_letter_counts(self, leads) -> tuple:
+        """(sites nothing could read, other form letters) over `leads`.
+
+        Five thousand shown rows land here on every visit to the Campaign tab,
+        so it is two dictionary reads a lead and no function calls inside the
+        loop.
+        """
+        gaps, known = self._gaps, self._generic
+        unreadable = generic = 0
+        for lead in leads:
+            lead_id = _int_of(lead.get("id"))
+            answer = gaps.get(lead_id)
+            if (answer[2] if answer else self._site_text(lead)[0]):
+                unreadable += 1
+            elif known.get(lead_id):
+                generic += 1
+        return unreadable, generic
 
     def _on_lead_double_clicked(self, row: int, _column: int) -> None:
         lead = self._lead_at(row)
@@ -3467,6 +3911,24 @@ class OutreachScreen(QWidget):
                            lambda: self._copy(_text_of(lead.get("name"))))
         menu.addAction(_icons.icon("eye"), "Preview this email",
                        lambda: self._preview_lead(lead))
+        menu.addSeparator()
+        # The crawl, again, on exactly these rows. It is the same worker the
+        # Audit button starts and deliberately not a second path: what is
+        # different is that it says what it changed, and that it is reachable
+        # from the row the user is pointing at rather than only from a button
+        # that acts on the whole filter. The label names which of the two it
+        # is, because "audit" over a row that has already been crawled twice
+        # reads as a no-op.
+        failing = [row for row in chosen if self._site_text(row)[0]]
+        retrying = bool(failing) and len(failing) == len(chosen)
+        again = menu.addAction(
+            _icons.icon("search"),
+            "Retry the crawl on %s" % _plural(len(chosen), "site") if retrying
+            else "Crawl %s again" % _plural(len(chosen), "site"),
+            lambda: self._on_audit_clicked(chosen, retry=retrying))
+        again.setEnabled(not self._auditing)
+        if self._auditing:
+            again.setToolTip("A crawl is already running")
         menu.addSeparator()
         menu.addAction(_icons.icon("minus"),
                        "Suppress %s (never contact)" % _plural(len(chosen), "lead"),
@@ -3699,6 +4161,17 @@ class OutreachScreen(QWidget):
             return str(_int_of(lead.get("opportunity_score")))
         if field == _COL_GAP:
             return self._gap_text(lead)[0]
+        if field == _COL_SITE:
+            # The words and the line, in one cell: a spreadsheet is where a
+            # user sorts forty unreachable sites into "fix the URL" and "the
+            # business is gone", and four words cannot tell them apart. The
+            # line is left off when it says the same thing twice — a crawl
+            # whose error is literally "timed out" must not export
+            # "timed out — timed out".
+            site, phrase, raw = self._site_text(lead)
+            if not site or not raw or raw.lower() in (site.lower(), phrase.lower()):
+                return site
+            return "%s — %s" % (site, raw)
         if field == _COL_STATUS:
             return _text_of(lead.get("status")).strip() or "new"
         return _text_of(lead.get(_COL_KEYS.get(field, "name"))).strip()
@@ -3820,6 +4293,7 @@ class OutreachScreen(QWidget):
             "sort": [_FIELD_KEYS[self._sort[0]],
                      "desc" if self._sort[1] == Qt.DescendingOrder else "asc"],
             "columns": _keys_of_fields(self._fields),
+            "known": list(_FIELD_KEYS),
         }
 
     def _on_save_view(self) -> None:
@@ -3874,7 +4348,8 @@ class OutreachScreen(QWidget):
     def _clear_view(self) -> None:
         self._set_view({"search": "", "status": "",
                         "sort": ["score", "desc"],
-                        "columns": _keys_of_fields(self._fields)})
+                        "columns": _keys_of_fields(self._fields),
+                        "known": list(_FIELD_KEYS)})
         self._view_name = ""
         self._save_view_state(now=True)
         self._refresh_view_button()
@@ -3889,7 +4364,7 @@ class OutreachScreen(QWidget):
         reason: the sort and the terms are in place before the single
         `_fill_table` or `_rebuild_table` that reads them.
         """
-        fields = _fields_from_keys(view.get("columns"), self._fields)
+        fields = _fields_wanted(view, self._fields)
         sort = list(view.get("sort") or [])
         field = _FIELD_OF_KEY.get(sort[0] if sort else "", _COL_SCORE)
         order = Qt.AscendingOrder if len(sort) > 1 and sort[1] == "asc" \
@@ -3988,6 +4463,10 @@ class OutreachScreen(QWidget):
         """
         self._stored = {
             "columns": _keys_of_fields(self._fields),
+            # Which keys this build could have named. `_fields_wanted` reads it
+            # back to tell a column the user switched off from one that did not
+            # exist when they chose.
+            "known": list(_FIELD_KEYS),
             "views": self._views,
             "current": self._view_name,
             "search": self._search,
@@ -4007,25 +4486,45 @@ class OutreachScreen(QWidget):
 
     # ── Leads: auditing ──────────────────────────────────────────────────────
 
-    def _on_audit_clicked(self) -> None:
+    def _on_audit_clicked(self, leads=None, *, retry: bool = False) -> None:
+        """Crawl the target, and remember enough to say what changed.
+
+        `leads` is the rows a caller has already chosen — the row menu's Retry
+        hands it the unreachable ones — and `None` means the button's own
+        target: the selection when there is one, everything the filter shows
+        when there is not.
+
+        The Site words every one of them carries *now* are kept before the
+        worker starts, because that is the only moment they exist. Without them
+        `_on_audit_done` can say "Audit finished" and nothing else, and a retry
+        that changed nothing at all looks exactly like one that fixed
+        everything — which is the worse of the two, because the user goes on
+        to send four hundred form letters believing the crawl worked.
+        """
         if self._auditing:
             return
         if not self._retire(self.audit_worker):
             self._toast("The last crawl is still finishing. Press Audit again "
                         "in a moment.", tone="warning")
             return
-        leads = self._target_leads()
+        leads = self._target_leads() if leads is None else [
+            lead for lead in leads if lead]
         if not leads:
             self._toast("There are no leads to audit yet. Import a CSV, or "
                         "scrape a city on the Scrape screen.", tone="warning")
             return
 
         self._auditing = True
+        self._audit_retry = bool(retry)
+        self._audit_before = {_int_of(lead.get("id")): self._site_text(lead)[0]
+                              for lead in leads}
         self.audit_btn.setEnabled(False)
         self.lead_progress.setRange(0, max(1, len(leads)))
         self.lead_progress.setValue(0)
         self.lead_progress.show()
-        self.lead_status.setText("Auditing %s…" % _plural(len(leads), "site"))
+        self.lead_status.setText(
+            "Retrying %s…" % _plural(len(leads), "site") if retry else
+            "Auditing %s…" % _plural(len(leads), "site"))
 
         worker = AuditWorker(leads, self.settings, self._template_id())
         worker.progress_signal.connect(self._on_audit_progress)
@@ -4098,11 +4597,71 @@ class OutreachScreen(QWidget):
     def _on_audit_done(self) -> None:
         self._auditing = False
         self.lead_progress.hide()
-        self.lead_status.setText("Audit finished")
         self._reload_leads()
+        # After the reload, so every answer below is read off the records the
+        # run actually wrote rather than off the ones it started from.
+        self.lead_status.setText(self._audit_report())
         self._refresh_lead_actions()
         self._refresh_preview()
         self._publish_state()
+
+    def _audit_report(self) -> str:
+        """What the crawl that has just finished actually changed.
+
+        "Audit finished" was true of every run and told the user nothing about
+        any of them. Three questions it could not answer and this does: how
+        many sites could not be read, which way they failed, and — for a
+        retry — whether pressing it moved anything at all.
+
+        A retry that changed nothing says so in its own sentence and puts it in
+        a warning toast, because that is the one outcome the user has to act
+        on: the sites are not coming back, and the leads behind them are going
+        to be mailed a form letter or taken out.
+        """
+        asked = dict(self._audit_before)
+        self._audit_before = {}
+        retry, self._audit_retry = self._audit_retry, False
+        if not asked:
+            return "Audit finished"
+
+        by_id = {_int_of(lead.get("id")): lead for lead in self._leads}
+        fixed, broke, still = 0, 0, {}
+        for lead_id, was in asked.items():
+            lead = by_id.get(lead_id)
+            now = self._site_text(lead)[0] if lead else ""
+            if now:
+                still[now] = still.get(now, 0) + 1
+                if not was:
+                    broke += 1
+            elif was:
+                fixed += 1
+
+        total = len(asked)
+        failing = sum(still.values())
+        if retry:
+            if not failing:
+                return ("Retried %s — every one of them answered this time."
+                        % _plural(total, "site"))
+            if not fixed:
+                self._toast(
+                    "Retried %s and not one of them answered — %s. Those leads "
+                    "will be sent a form letter unless you take them out."
+                    % (_plural(total, "site"), _site_tally(still)),
+                    tone="warning")
+                return ("Retried %s — nothing changed (%s)."
+                        % (_plural(total, "site"), _site_tally(still)))
+            return ("Retried %s — %d answered this time, %d still unreachable "
+                    "(%s)." % (_plural(total, "site"), fixed, failing,
+                               _site_tally(still)))
+
+        if not failing:
+            return "Audited %s — every site was read." % _plural(total, "site")
+        line = ("Audited %s — %d could not be read (%s)."
+                % (_plural(total, "site"), failing, _site_tally(still)))
+        if broke:
+            line += " %s that worked before did not this time." % _plural(
+                broke, "site").capitalize()
+        return line
 
     # ── Campaign: profile and preview ────────────────────────────────────────
 
@@ -4436,16 +4995,26 @@ class OutreachScreen(QWidget):
             return
 
         audit = _loads(lead.get("audit_json"))
-        if audit and audit.get("error"):
+        site, phrase, raw = _site_failure(audit)
+        if site:
+            # Not "audit error". The audit ran; the site is what failed, and
+            # the difference decides what the user does next — there is no
+            # audit to re-run against a domain that does not resolve. The
+            # consequence is on screen with it, because this pane is where the
+            # user is deciding whether the message is worth sending.
             self.subject_label.setText("—")
-            self.subject_count.setText("audit error")
+            self.subject_count.setText(site)
             self.preview_meta.setText("To %s  ·  Website: %s" % (
                 _text_of(lead.get("name")).strip() or "there",
                 _text_of(lead.get("website")).strip() or "no website"))
             self._show_paper(
-                "Audit failed for this lead's website:\n\n  %s\n\n"
-                "Please verify the website URL or check if the site is online."
-                % audit["error"])
+                "There is no message to preview: the crawl could not read this "
+                "site — %s.\n\n%s\n"
+                "This lead would still be mailed, but with a form letter that "
+                "says nothing about the business. Retry the crawl from the "
+                "row's right-click menu, correct the address in the record, or "
+                "take the lead out before you prepare the campaign."
+                % (phrase, ("The crawl recorded: %s\n" % raw) if raw else ""))
             return
         ai = _loads(lead.get("ai_json"))
         ctx = _campaign.apply_compliance(
@@ -4592,10 +5161,23 @@ class OutreachScreen(QWidget):
         self.plan_summary.setText("%d of %d — %s" % (done, total, message))
 
     def _on_plan_ready(self, plan: dict) -> None:
+        """The plan came back. Show it, and let the user refuse it.
+
+        The review is a gate rather than a receipt — refusing it deletes the
+        messages the plan wrote — so it opens before anything on this screen
+        starts describing the campaign as prepared.
+
+        A plan with nothing in it does not open one. A dialog whose whole
+        content is six zeros is a click the user has to make to get back to the
+        screen that would have told them the same thing, and `plan_warning`
+        already carries the reason.
+        """
         self._plan = plan if isinstance(plan, dict) else {}
         self.plan_progress.hide()
-        
-        if self._plan and not self._plan.get("error") and not self._plan.get("cancelled"):
+
+        if (self._plan and _int_of(self._plan.get("queued"))
+                and not self._plan.get("error")
+                and not self._plan.get("cancelled")):
             dialog = _CampaignReviewDialog(self._plan, self)
             try:
                 if dialog.exec_() != QDialog.Accepted:
@@ -4603,10 +5185,11 @@ class OutreachScreen(QWidget):
                     _db.set_campaign_status(self.conn, self._campaign_id, "failed")
                     self._campaign_id = 0
                     self._plan = {}
-                    self._toast("Campaign plan discarded.", tone="warning")
+                    self._toast("Campaign plan discarded. Nothing is queued and "
+                                "no lead was changed.", tone="warning")
             finally:
                 dialog.deleteLater()
-                
+
         self._refresh_plan_summary()
         if self._plan and _int_of(self._plan.get("queued")):
             self.goto_sending_btn.show()
@@ -4624,6 +5207,7 @@ class OutreachScreen(QWidget):
             self._stats_dirty = False
         else:
             self._stats_dirty = True
+
     def _refresh_plan_summary(self) -> None:
         """What the card says about the schedule, at every stage it has one.
 
@@ -4781,24 +5365,79 @@ class OutreachScreen(QWidget):
         self._refresh_stats()
         self._refresh_send_controls()
 
-    def _spent_accounts(self) -> tuple:
-        """(accounts that have room today, accounts that have not)."""
+    def _ramp_start(self):
+        """The warm-up origin the send loop is using for this campaign, or None.
+
+        Asked for in one place because three callers needed it and one of them
+        was not asking: `_room_today` computed a cap with no ramp while the
+        account partition computed one with it, so Send now offered room on a
+        day-one account that the loop would refuse.
+        """
+        if not self._campaign_id:
+            return None
+        try:
+            return _campaign.campaign_start_day(self.conn, self._campaign_id,
+                                                self.settings)
+        except Exception:
+            return None
+
+    def _benched_today(self) -> set:
+        """Accounts the run took out of service today, lowercased.
+
+        A quota or auth failure retires an account for the calendar day, and
+        the worker keeps that in a dict of its own that this screen has no
+        business reaching into — but it also writes an `account_stopped` event
+        before it does, which is the store's own record of the same fact and
+        survives the worker, the run and the app being closed.
+
+        Without this the screen counted a benched account as one with room and
+        said "Sending" over a queue that could not move: the loop had nothing
+        left to send from and the Accounts card showed 3 / 40 today, which
+        reads as plenty.
+        """
+        now = time.time()
+        if now - self._benched_at < _BENCH_TTL:
+            return self._benched
+        if self.conn is None:
+            return set()
+        try:
+            midnight = _db._day_start(now, self.settings.get("send_timezone"))
+            events = _db.recent_events(self.conn, limit=_BENCH_SCAN)
+        except Exception:
+            return set()
+        benched = set()
+        for event in events:
+            if _float_of(event.get("ts")) < midnight:
+                break
+            if _text_of(event.get("kind")).strip() != "account_stopped":
+                continue
+            benched.add(_text_of(event.get("detail")).split(":", 1)[0]
+                        .strip().lower())
+        self._benched = {email for email in benched if email}
+        self._benched_at = now
+        return self._benched
+
+    def _account_room(self) -> tuple:
+        """(with room today, at their cap, benched by the run) — all lowercased.
+
+        Three buckets and not two, because "no account can take this" has three
+        causes and they need three different sentences: raise the cap, wait for
+        midnight, or go and fix a password.
+        """
         zone = self.settings.get("send_timezone")
-        ramp = None
-        if self._campaign_id:
-            try:
-                ramp = _campaign.campaign_start_day(self.conn, self._campaign_id,
-                                                    self.settings)
-            except Exception:
-                ramp = None
-        free, spent = [], []
+        ramp = self._ramp_start()
+        benched_today = self._benched_today()
+        free, spent, benched = [], [], []
         for account in self._accounts():
-            email = _text_of(account.get("email"))
+            email = _text_of(account.get("email")).strip()
+            if email.lower() in benched_today:
+                benched.append(email)
+                continue
             cap = max(1, _campaign.account_daily_cap(account, self.settings,
                                                      ramp_start=ramp))
             used = _db.sent_today(self.conn, email, zone)
             (spent if used >= cap else free).append(email)
-        return free, spent
+        return free, spent, benched
 
     def _rehearsing(self) -> bool:
         """Whether what is running (or about to) is a dry run.
@@ -4818,7 +5457,31 @@ class OutreachScreen(QWidget):
         reported itself as "N messages ready to send" while the queue sat
         frozen, so the screen's most reassuring sentence was printed at exactly
         the moment nothing was going to happen. Every branch below either
-        describes movement or names what is stopping it.
+        describes movement or names what is stopping it, and every one of them
+        also says *when it changes*, because "held" with no clock on it is a
+        second way of saying nothing.
+
+        The states, driven one at a time and each checked against what the
+        screen paints (see the handover for the measurements):
+
+          no campaign · stopping · paused · running and holding outside the
+          window · running with every account at its cap · running with every
+          account benched · running with no account at all · running and
+          waiting on the pacing gap · running normally · stopped by the run
+          itself · nothing queued · queued with no account configured · queued
+          with every account benched · queued but nothing due · queued and due
+          later · queued and overdue outside the window · queued and overdue
+          with every account at its cap · queued, overdue and only waiting to
+          be started.
+
+        Three of them are new and each closes a measured lie. With no Gmail
+        account set up at all a running campaign read "Every account has hit
+        today's cap", which is a sentence about a set that is empty. An account
+        the run had benched for the day after an AUTH failure was counted as
+        one with room, so the screen said "Sending — 0 of 3" over a queue with
+        nothing left to send from. And a campaign the run had stopped for that
+        reason read "Not sending — press Start sending", which starts a run
+        that stops again immediately.
 
         `stats` is the tally the caller already has. `_refresh_send_controls`
         reads it and then asked for it again through here, so every second of
@@ -4834,13 +5497,18 @@ class OutreachScreen(QWidget):
         rehearsing = self._rehearsing()
         verb, past = ("Rehearsing", "built") if rehearsing else ("Sending", "done")
         sent = _int_of(stats.get("rehearsed" if rehearsing else "sent"))
+        done = "%d of %d %s" % (sent, total, past)
 
         if not self._campaign_id:
             return "No campaign yet", ("Prepare one on the Campaign tab and it "
                                        "appears here.")
         if self._sending:
+            if self._stopping:
+                return ("Stopping — %s" % done,
+                        "Finishing the message in flight. Whatever is still "
+                        "queued stays queued and keeps its times.")
             if self._paused:
-                return ("Paused after %d of %d %s" % (sent, total, past),
+                return ("Paused after %s" % done,
                         "The queue keeps its times. Press Resume to carry on.")
             # A running worker is not the same as a moving queue. Outside the
             # window the loop naps and the log says so exactly once, so the
@@ -4849,34 +5517,59 @@ class OutreachScreen(QWidget):
             # close, one branch further in.
             now = time.time()
             if not _campaign.in_send_window(now, self.settings):
-                return ("Holding — %d of %d %s" % (sent, total, past),
+                return ("Holding — %s" % done,
                         "Outside your sending window. The queue restarts at %s; "
                         "widen the window in Settings if that is too late."
                         % _clock(_campaign.next_window_open(now, self.settings)))
-            free, _spent = self._spent_accounts()
+            free, spent, benched = self._account_room()
             if not free:
-                return ("Holding — %d of %d %s" % (sent, total, past),
-                        "Every account has hit today's cap. Sending resumes "
-                        "tomorrow, or raise the cap in Settings.")
-            return "%s — %d of %d %s" % (verb, sent, total, past), ""
+                return ("Holding — %s" % done, self._no_account_reason(
+                    spent, benched, "This run cannot send another message "
+                                    "until that changes."))
+            due = self._next_due_ts()
+            if due > now:
+                # The pacing gap. The loop is awake and the account is free;
+                # what is holding the queue is the random wait that keeps the
+                # mailbox looking like a person typing. Saying only "Sending"
+                # over a five-minute gap is how a working run gets stopped.
+                return ("%s — %s, next at %s" % (verb, done, _clock(due)),
+                        "Waiting out the gap between messages. Send now drops "
+                        "the gap and the window; the daily caps stay.")
+            return "%s — %s" % (verb, done), ""
+
         if queued <= 0:
+            if _text_of(self._campaign_status()) == "failed":
+                # Discarded at the review, or abandoned by a plan that threw.
+                # It is still in the picker because the record of it is worth
+                # keeping, but "nothing left in this campaign's queue" reads as
+                # a campaign that finished, and this one never started.
+                return ("This campaign was discarded — nothing was queued "
+                        "from it",
+                        "Prepare a new one on the Campaign tab. The leads it "
+                        "would have gone to are untouched.")
             return ("Nothing left in this campaign's queue",
                     "Prepare another campaign on the Campaign tab to queue more.")
 
-        free, spent = self._spent_accounts()
-        if not free and not spent:
-            return ("Stalled — %s queued and no account to send from"
-                    % _plural(queued, "message"),
-                    "Add a Gmail account and an app password in Settings; until "
-                    "then nothing in this queue can leave.")
+        free, spent, benched = self._account_room()
+        if not free:
+            return (self._no_account_headline(queued, spent, benched),
+                    self._no_account_reason(
+                        spent, benched,
+                        "Until then nothing in this queue can leave."))
+
+        if _text_of(self._campaign_status()) == "stopped":
+            # The run took itself down — `_handle_failure` does that when the
+            # last account is benched. Pressing Start again from here does the
+            # same thing again, so the button is not the answer and the screen
+            # must not imply it is.
+            return ("Stopped — %s still queued" % _plural(queued, "message"),
+                    "The run stopped itself because it had no account left to "
+                    "send from. Fix the account in Settings, then press Start "
+                    "sending; the queue kept its place.")
 
         due = self._next_due_ts()
         if not due:
-            return ("Stalled — %s queued, none of it can go out"
-                    % _plural(queued, "message"),
-                    "Every queued message is addressed to a suppressed address, "
-                    "so the send loop skips all of them. Prepare a new campaign "
-                    "from the leads you can still contact.")
+            return self._nothing_due(queued)
 
         now = time.time()
         if due > now:
@@ -4890,15 +5583,102 @@ class OutreachScreen(QWidget):
                     "The window reopens %s. Widen the days or the hours in "
                     "Settings to send sooner."
                     % _clock(_campaign.next_window_open(now, self.settings)))
-        if not free:
-            return ("Held — every account has hit today's cap",
-                    "%s stays queued until tomorrow. Raise the daily cap, or "
-                    "add another account, in Settings."
-                    % _plural(queued, "message"))
         return ("Not sending — %s overdue since %s"
                 % (_plural(queued, "message"), _clock(due)),
                 "The window is open and there is room on the account. Nothing "
                 "will leave until you press Start sending.")
+
+    def _no_account_headline(self, queued: int, spent, benched) -> str:
+        """The three ways "no account can take this" reads on one line.
+
+        One headline used to cover all three and it named the rarest: a user
+        whose single account had simply hit its cap was told there was "no
+        account to send from", which sends them to Settings to add a second
+        Gmail rather than to wait until midnight or raise a number.
+        """
+        if not spent and not benched:
+            return ("Stalled — %s queued and no account to send from"
+                    % _plural(queued, "message"))
+        if benched and not spent:
+            return ("Stalled — %s queued, %s out of action today"
+                    % (_plural(queued, "message"),
+                       "every account is" if len(benched) > 1
+                       else "the account is"))
+        if benched:
+            return "Held — no account has room left today"
+        return "Held — every account has hit today's cap"
+
+    def _no_account_reason(self, spent, benched, tail: str) -> str:
+        """Why nothing can send, when nothing can — by which of three it is.
+
+        One sentence used to cover all three and it was written for the middle
+        one, so a user with no Gmail account at all was told that "every
+        account has hit today's cap" and a user whose password had just been
+        rejected was told to raise the cap.
+        """
+        if benched and not spent:
+            return ("%s stopped for today after the server refused it — an app "
+                    "password or a quota. Fix it in Settings and start again. %s"
+                    % (_listed(benched), tail))
+        if benched:
+            return ("%s is at today's cap and %s stopped after the server "
+                    "refused it. Sending resumes at midnight, or sooner if you "
+                    "raise the cap and fix the account in Settings. %s"
+                    % (_plural(len(spent), "account").capitalize(),
+                       _listed(benched), tail))
+        if spent:
+            return ("Every account has hit today's cap. Sending resumes at "
+                    "midnight, or raise the cap in Settings. %s" % tail)
+        return ("There is no Gmail account set up to send from. Add one, with "
+                "a Google App Password, in Settings. %s" % tail)
+
+    def _campaign_status(self) -> str:
+        """What the store says this campaign is doing, or "" if it cannot say."""
+        if not self._campaign_id or self.conn is None:
+            return ""
+        try:
+            return _text_of(_db.get_campaign(self.conn,
+                                             self._campaign_id).get("status"))
+        except Exception:
+            return ""
+
+    def _nothing_due(self, queued: int) -> tuple:
+        """Queued, with an account free, and `due_messages` returns nothing.
+
+        Verified rather than asserted, and that is the change. The old branch
+        said "every queued message is addressed to a suppressed address" — the
+        one cause it could think of — without ever counting them, so a queue
+        scheduled past the year `_next_due_ts` looks ahead was reported as a
+        list of unsubscribes. Both causes are now counted, and a third answer
+        exists for the case where it is neither.
+        """
+        suppressed = 0
+        if self.conn is not None:
+            try:
+                suppressed = _db._scalar(
+                    self.conn,
+                    "SELECT COUNT(*) FROM messages "
+                    "JOIN leads ON leads.id = messages.lead_id "
+                    "JOIN suppression ON suppression.email = LOWER(leads.email) "
+                    "WHERE messages.campaign_id = ? AND messages.status = 'queued'",
+                    (self._campaign_id,))
+            except Exception:
+                suppressed = 0
+        head = ("Stalled — %s queued, none of it can go out"
+                % _plural(queued, "message"))
+        if suppressed >= queued:
+            return head, ("Every queued message is addressed to a suppressed "
+                          "address, so the send loop skips all of them. Prepare "
+                          "a new campaign from the leads you can still contact.")
+        if suppressed:
+            return head, ("%d of them are addressed to suppressed addresses; "
+                          "the rest are scheduled further out than a year, "
+                          "which the send loop will not reach. Prepare a "
+                          "smaller campaign." % suppressed)
+        return head, ("Nothing in the queue is due inside the next year — the "
+                      "schedule has spread it further than the run will look. "
+                      "Raise the daily cap in Settings, or prepare a smaller "
+                      "campaign.")
 
     def _refresh_send_controls(self) -> None:
         stats = self._stats()
@@ -4922,16 +5702,49 @@ class OutreachScreen(QWidget):
             if self.settings.get("dry_run", True) else
             "Mail this campaign's queue to real businesses, on the schedule in "
             "Settings. You will be asked to confirm."))
-        self.pause_btn.setEnabled(self._sending)
-        self.pause_btn.setToolTip("Hold the run where it is; the queue keeps its times"
-                                  if self._sending else "Nothing is running")
-        self.stop_btn.setEnabled(self._sending)
+        # Neither survives Stop being pressed, and that is not cosmetic:
+        # this runs on a one-second timer, so `_on_stop_clicked` disabling them
+        # was undone within a second and the user could press Stop again on a
+        # run that was already stopping.
+        stopping = self._sending and self._stopping
+        self.pause_btn.setEnabled(self._sending and not stopping)
+        self.pause_btn.setToolTip(
+            "The run is already stopping" if stopping else
+            "Hold the run where it is; the queue keeps its times"
+            if self._sending else "Nothing is running")
+        self.stop_btn.setEnabled(self._sending and not stopping)
         self.stop_btn.setToolTip(
+            "Already stopping — it ends when the message in flight is done"
+            if stopping else
             "Finish the message in flight and stop; whatever is queued stays queued"
             if self._sending else "Nothing is running")
         self.campaign_combo.setEnabled(not self._sending)
         self.campaign_combo.setToolTip(
             "Stop the run to switch campaigns" if self._sending else "")
+
+        # Send now was the one control on this tab nothing ever disabled. It
+        # sat lit with a tooltip promising to ignore the sending window over a
+        # campaign that did not exist, and answered the press with a toast —
+        # so the screen's answer to "why did nothing happen" arrived only after
+        # the click, and only for the six seconds a toast lives.
+        room = self._room_today() if self._campaign_id else 0
+        if self._sending:
+            waived = "The run is already going — Pause or Stop it first"
+        elif not self._campaign_id:
+            waived = "There is no campaign to send. Prepare one on the Campaign tab"
+        elif queued <= 0:
+            waived = "Nothing is queued — prepare a campaign first"
+        elif room <= 0:
+            waived = ("Every account has already sent its allowance for today. "
+                      "The caps are what keep Google from closing the account, "
+                      "so this cannot waive them")
+        else:
+            waived = ""
+        self.send_now_btn.setEnabled(not waived)
+        self.send_now_btn.setToolTip(waived or (
+            "Ignore the sending window and the gap between messages, and send "
+            "the next %s now. Daily caps still apply."
+            % _plural(min(room, queued), "message")))
 
         self.send_progress.setRange(0, max(1, total))
         self.send_progress.setValue(total - queued if total else 0)
@@ -4978,17 +5791,40 @@ class OutreachScreen(QWidget):
             self._toast("Nothing moved forward. The queue may have just emptied.",
                         tone="warning")
             return
-        self._toast("Sending %s now." % _plural(moved, "message"), tone="info")
+        # The claim comes after the run, not before it. `_on_start_clicked` has
+        # a gate of its own — the sender profile — and a user who answered it
+        # with Open Settings used to be told "Sending 40 messages now" over a
+        # run that never started, with forty rows already pulled forward.
         self._on_start_clicked(ignore_schedule=True, confirmed=True)
+        if self._sending:
+            self._toast("Sending %s now." % _plural(moved, "message"), tone="info")
+        else:
+            self._toast("%s moved to the front of the queue, but the run did "
+                        "not start. Press Start sending when you are ready."
+                        % _plural(moved, "message").capitalize(), tone="warning")
 
     def _room_today(self) -> int:
-        """How many this campaign could still send today across every account."""
+        """How many this campaign could still send today across every account.
+
+        The same three things `_send_health` reads, and that is the fix: this
+        computed a cap with no warm-up ramp while `_account_room` computed one
+        with it, and it counted an account the run had benched for the day as
+        one with room. Both made Send now offer a number the loop would not
+        honour — on a day-one account with `warmup_started` unset the cap is 10
+        rather than 40, so "Sending 40 messages now" moved forty rows forward
+        and thirty of them sat there.
+        """
+        ramp = self._ramp_start()
+        zone = _campaign._zone(self.settings)
+        benched = self._benched_today()
         total = 0
         for account in self._accounts():
+            email = _text_of(account.get("email")).strip()
+            if email.lower() in benched:
+                continue
             try:
-                cap = account_daily_cap(account, self.settings)
-                used = _db.sent_today(self.conn, _text_of(account.get("email")),
-                                      _campaign._zone(self.settings))
+                cap = account_daily_cap(account, self.settings, ramp_start=ramp)
+                used = _db.sent_today(self.conn, email, zone)
                 total += max(0, _int_of(cap) - _int_of(used))
             except Exception:
                 continue
@@ -5053,6 +5889,7 @@ class OutreachScreen(QWidget):
 
         self._clear_log()
         self._rehearsed.clear()
+        self._stopping = False
         worker = OutreachWorker(self._campaign_id, self.settings, dry_run=dry,
                                 ignore_schedule=bool(ignore_schedule))
         worker.log_signal.connect(self._append_log)
@@ -5085,12 +5922,21 @@ class OutreachScreen(QWidget):
         self._publish_state()
 
     def _on_stop_clicked(self) -> None:
+        """Ask the run to finish what it is holding and come back.
+
+        The flag rather than only the label, because the label did not survive:
+        `_on_tick` repaints the status line every second off `_send_health`, so
+        the sentence this used to write lived for under a second and the screen
+        went back to saying "Sending" over a run that was on its way down. A
+        stop can take as long as an SMTP hand-off, and for the whole of it the
+        screen has to say so.
+        """
         if self.send_worker is None or not self._sending:
             return
+        self._stopping = True
         self.send_worker.stop()
-        self.stop_btn.setEnabled(False)
-        self.pause_btn.setEnabled(False)
-        self.send_status.setText("Stopping — finishing the message in flight…")
+        self._refresh_send_controls()
+        self._publish_state()
 
     def _on_send_progress(self, done: int, total: int) -> None:
         self.send_progress.setRange(0, max(1, total))
@@ -5125,6 +5971,7 @@ class OutreachScreen(QWidget):
     def _on_send_done(self) -> None:
         self._sending = False
         self._paused = False
+        self._stopping = False
         self.pause_btn.setText("Pause")
         self._reload_leads()
         self._refresh_stats()
@@ -5157,13 +6004,22 @@ class OutreachScreen(QWidget):
         that arrived keeps that line where it was; at the top, which is where
         the panel sits unless it has been scrolled, nothing moves at all.
         """
+        level = _text_of(level)
+        if level == "error":
+            # An account benched by an AUTH or QUOTA refusal arrives here, and
+            # `_benched_today` is memoised for two seconds so the once-a-second
+            # status line does not read the event log three times. Spending the
+            # memo on the one signal that can change it means the Accounts card
+            # and the status line say "stopped for today" on the same tick the
+            # log does, rather than a second or two behind it.
+            self._benched_at = 0.0
         line = "%s  %s" % (datetime.now().strftime(components.STAMP),
                            _text_of(message))
-        self._log_lines.insert(0, (line, _text_of(level), _int_of(message_id)))
+        self._log_lines.insert(0, (line, level, _int_of(message_id)))
         del self._log_lines[_LOG_LIMIT:]
         bar = self.log_list.verticalScrollBar()
         held = bar.value()
-        self._push_log(line, _text_of(level), _int_of(message_id))
+        self._push_log(line, level, _int_of(message_id))
         if held > 0:
             first = self.log_list.item(0)
             bar.setValue(held + (self.log_list.visualItemRect(first).height()
@@ -5237,18 +6093,15 @@ class OutreachScreen(QWidget):
         # The same warm-up origin the send loop uses. Without it an account with
         # no `warmup_started` would be shown its first-day cap on day nine of the
         # campaign, and the counter would read as stuck.
-        ramp = None
-        if self._campaign_id:
-            try:
-                ramp = _campaign.campaign_start_day(self.conn, self._campaign_id, self.settings)
-            except Exception:
-                ramp = None
+        ramp = self._ramp_start()
+        benched = self._benched_today()
 
         for account in accounts:
             email = _text_of(account.get("email"))
             used = _db.sent_today(self.conn, email, zone)
             rehearsed = self._rehearsed.get(email.strip().lower(), 0)
             cap = max(1, _campaign.account_daily_cap(account, self.settings, ramp_start=ramp))
+            out = email.strip().lower() in benched
 
             holder = QWidget()
             row = _rows(holder, margin="0", spacing="1", t=t)
@@ -5260,7 +6113,7 @@ class OutreachScreen(QWidget):
             # this account's real quota and the card must not imply that it has.
             counter = components.body_label(
                 "%d / %d today" % (used, cap),
-                tone="danger" if used >= cap else "secondary")
+                tone="danger" if out or used >= cap else "secondary")
             counter.setWordWrap(False)
             tip = "Daily cap for this account, warm-up included"
             if rehearsed:
@@ -5268,6 +6121,15 @@ class OutreachScreen(QWidget):
                                 % (rehearsed, used, cap))
                 tip += ".  %s rehearsed in this dry run — no real quota spent." \
                     % _plural(rehearsed, "message")
+            if out:
+                # An account with quota left that the run will not use is the
+                # card's worst reading: "3 / 40 today" says there is plenty of
+                # room on an address the server has already refused, which is
+                # exactly the screen looking healthy while the queue is dead.
+                counter.setText("stopped for today")
+                tip = ("The server refused this account today — an app password "
+                       "or a quota — so the run will not use it again until "
+                       "midnight. Fix it in Settings and start again.")
             counter.setToolTip(tip)
             head.addWidget(counter)
             row.addLayout(head)
@@ -5275,8 +6137,11 @@ class OutreachScreen(QWidget):
             bar = _thin_bar(t)
             bar.setRange(0, cap)
             # The rehearsal moves the bar because the bar is what the user
-            # watches while the run goes; `used` is what governs the cap.
-            bar.setValue(min(used + rehearsed, cap))
+            # watches while the run goes; `used` is what governs the cap. A
+            # benched account's bar is full whatever its count says, because
+            # what it measures is how much of this account is available and the
+            # answer is none of it.
+            bar.setValue(cap if out else min(used + rehearsed, cap))
             row.addWidget(bar)
             self.accounts_holder.addWidget(holder)
 
@@ -5299,12 +6164,23 @@ class OutreachScreen(QWidget):
         return _float_of(rows[0].get("scheduled_at")) if rows else 0.0
 
     def _on_tick(self) -> None:
+        """The clock on the right of the progress line, once a second.
+
+        Every branch names a time, because this label is the only thing on the
+        screen that counts down and a queue with no clock on it is a queue the
+        user has no way to distinguish from a broken one. The two that used to
+        say nothing are the two the brief asked about: a run that is stopping,
+        and a queue with nothing due at all.
+        """
         if self.pages.currentIndex() != 2 and not self._sending:
             return
         due = self._next_due_ts()
         now = time.time()
-        if not due:
-            self.next_send_label.setText("")
+        if self._sending and self._stopping:
+            self.next_send_label.setText("Stopping…")
+        elif not due:
+            self.next_send_label.setText(
+                "Nothing due" if self._campaign_id else "")
         elif self._paused:
             self.next_send_label.setText("Paused · next was due %s" % _clock(due))
         elif due > now:
@@ -5623,6 +6499,10 @@ class OutreachScreen(QWidget):
             self._refresh_templates()
             self._refresh_profile()
             self._refresh_preview()
+            # The one place "how many of these would be a form letter" is
+            # counted, because this is the one place it is read. See
+            # `_form_letter_warning`.
+            self._refresh_lead_actions()
         elif index == 2:
             self._refresh_accounts()
             self._refresh_send_controls()

@@ -12,6 +12,7 @@ lead).
 """
 
 import datetime
+import json
 import os
 import re
 import sys
@@ -165,12 +166,19 @@ def _codes(result: dict) -> list[str]:
 
 
 def test_catalogue_services_are_real():
-    # `slow_site` and `no_mobile` are the two the catalogue has no answer for —
-    # page speed and a mobile layout are front-end work and the seller does not
-    # sell it. They carry no services here and no entry in `T.GAP_SERVICES`, and
-    # every other code has to be in both tables.
+    # `slow_site`, `no_mobile` and `no_ssl` are the three the catalogue has no
+    # answer for — page speed, a mobile layout and a certificate are hosting and
+    # front-end work and the seller does not sell any of it. They carry no
+    # services here and no entry in `T.GAP_SERVICES`, and every other code has
+    # to be in both tables.
+    #
+    # (Superseded: this set read `{"slow_site", "no_mobile"}` until `no_ssl` was
+    # added. It is a third piece of evidence with no offer behind it, not a
+    # weakening — `_gaps` still sorts every offerless gap behind every gap that
+    # carries one, so none of the three can become the sentence an offer has to
+    # follow.)
     no_offer = {code for code, entry in A.GAP_CATALOGUE.items() if not entry["services"]}
-    assert no_offer == {"slow_site", "no_mobile"}, no_offer
+    assert no_offer == {"slow_site", "no_mobile", "no_ssl"}, no_offer
     assert list(A.GAP_CATALOGUE)
     assert set(A.GAP_CATALOGUE) - no_offer == set(T.GAP_SERVICES), (
         (set(A.GAP_CATALOGUE) - no_offer) ^ set(T.GAP_SERVICES))
@@ -636,13 +644,18 @@ def _fire_every_gap() -> dict:
                    has_contact_form=True, has_quote_form=True, has_careers=True,
                    has_pdf_forms=True, has_multiple_locations=True, location_count=4,
                    has_blog=True, blog_stale=True, stale_copyright=True,
-                   copyright_year=2019, slow=True)
+                   copyright_year=2019, slow=True, has_whatsapp=True,
+                   has_testimonials=True)
     facts = {"quote_phrase": "request a quote", "latest_date": "March 2022",
              "pdf_form": "the employment application form",
-             "appointment_shaped": True, "call_cta": False}
+             "appointment_shaped": True, "call_cta": False, "plain_http": True}
     fired = A._gaps(tech, signals, facts)
+    # `email_only_intake` needs the second pass too: it is what happens to the
+    # enquiries a site with no form still receives, so it cannot be true while
+    # the form gaps are.
     fired += A._gaps(dict(tech, forms=0, ecommerce=""),
-                     dict(signals, has_contact_form=False, has_quote_form=False), facts)
+                     dict(signals, has_contact_form=False, has_quote_form=False,
+                          has_email=True), facts)
     return {gap["code"]: gap for gap in fired}
 
 
@@ -1130,6 +1143,23 @@ def test_a_search_box_is_not_a_lead_form():
     joinable = _built('<h2>Newsletter</h2><form action="/subscribe">'
                       '<input type="email" name="EMAIL"><button>Subscribe</button></form>')
     assert "no_lead_capture" not in _codes(joinable), _codes(joinable)
+
+    # And the rejection itself was a substring standing in for a structure:
+    # "search" is inside "research", so a form posting to /research-request was
+    # discarded as the site's search box — and a site whose only form has been
+    # discarded is told nothing on it asks a visitor for a name.
+    enquiry = _built('<form action="/research-request" method="post">'
+                     '<input type="text" name="name"><input type="email" name="email">'
+                     '<textarea name="message"></textarea>'
+                     "<button type=\"submit\">Send</button></form>")
+    assert enquiry["tech"]["forms"] == 1, enquiry["tech"]
+    assert "no_lead_capture" not in _codes(enquiry), _codes(enquiry)
+    assert "no_crm_signals" in _codes(enquiry), _codes(enquiry)
+    # The box it was meant to reject is still rejected, however it is marked up.
+    for box in (_SEARCH_BOX, _SEARCH_INPUT,
+                '<form class="searchform" action="/results">'
+                '<input type="text" name="s"><button>Go</button></form>'):
+        assert A._is_contact_form(box) is False, box
     print("a search box is not a lead form: OK")
 
 
@@ -1843,10 +1873,21 @@ request a quote by email and wait.</p>
 
 
 def _corpus_rates(corpus) -> dict:
-    """Per-rule (true positives, false positives, false negatives) over `corpus`."""
+    """Per-rule (true positives, false positives, false negatives) over `corpus`.
+
+    A row is `(name, html, gaps)` or `(name, url, html, gaps)`. The four-part
+    form exists because the address a page was served from is itself a fact the
+    audit reads — a site on plain http is one `no_ssl` fires on — and a
+    synthesised https URL would have graded that rule against a page it never
+    saw.
+    """
     rates = {code: [0, 0, 0] for code in A.GAP_CATALOGUE}
-    for name, html, expected in corpus:
-        url = "https://%s.test/" % re.sub(r"[^a-z]+", "-", name.lower())
+    for row in corpus:
+        if len(row) == 4:
+            name, url, html, expected = row
+        else:
+            name, html, expected = row
+            url = "https://%s.test/" % re.sub(r"[^a-z]+", "-", name.lower())
         fired = set(_codes(A.audit_from_html({url: html}, url)))
         for code in A.GAP_CATALOGUE:
             hit, want = code in fired, code in expected
@@ -1858,6 +1899,771 @@ def _corpus_rates(corpus) -> dict:
                 rates[code][2] += 1
     return rates
 
+
+
+# ── A third corpus: the platforms this tool actually meets ──
+
+# Thirty-six pages built from the markers real site builders ship, every label
+# written down from reading the page before a rule was run against it. The two
+# corpora above are made of one page shape on purpose, which is what makes them
+# sharp about a single rule and blind to everything a real crawl brings with it:
+# a site builder that ships its own chat, a page that answers 200 with a bot
+# check on it, a consent wall, a framework shell, a business whose whole site is
+# in German.
+#
+# `reason` is the other half of the label. On six of these pages the honest
+# answer is not a list of faults but "nobody read this site, and here is why" —
+# and until this corpus existed, all six produced a full slate of confident
+# absences instead. See `test_a_page_nobody_could_read_is_not_a_list_of_faults`.
+
+_PLATFORM_CORPUS: list = []
+
+
+def _platform(name, url, html, gaps, reason=""):
+    _PLATFORM_CORPUS.append((name, url, html, frozenset(gaps), reason))
+
+
+OLD_POST = (TODAY - datetime.timedelta(days=1100)).isoformat()
+
+_FOOT = ('<footer><p>&copy; %d %%s. %%s</p></footer></body></html>' % TODAY.year)
+
+
+# ── 1. WordPress + Elementor, a dentist ──
+_platform("wp-elementor-dentist", "https://bloorwestdental.test/", """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="generator" content="WordPress 6.5.2">
+<title>Bloor West Dental | Family Dentist in Toronto</title>
+<link rel="stylesheet" href="/wp-content/plugins/elementor/assets/css/frontend.min.css?ver=3.21.0">
+<link rel="stylesheet" href="/wp-content/uploads/elementor/css/post-14.css">
+<script src="/wp-includes/js/jquery/jquery.min.js"></script>
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-7QK2L9"></script>
+<script type="application/ld+json">{"@context":"https://schema.org","@type":"Dentist",
+"name":"Bloor West Dental","telephone":"(416) 555-0142"}</script>
+</head><body class="elementor-page elementor-page-14">
+<nav><a href="/">Home</a> <a href="/services/">Services</a> <a href="/contact/">Contact</a></nav>
+<h1>Bloor West Dental</h1>
+<h2>Our Services</h2>
+<ul><li>Dental cleaning and check-ups</li><li>Emergency dental repair</li>
+<li>Teeth whitening</li></ul>
+<p>Call (416) 555-0142 or send the form and the front desk will call you back.</p>
+<form class="elementor-form" action="/contact/" method="post">
+<input type="text" name="form_fields[name]"><input type="email" name="form_fields[email]">
+<textarea name="form_fields[message]"></textarea><button type="submit">Send</button></form>
+<p><a href="https://www.facebook.com/bloorwestdental/">Facebook</a></p>
+""" + _FOOT % ("Bloor West Dental", "2180 Bloor St W, Toronto, ON M6S 1N3."),
+     {"no_online_booking", "no_crm_signals", "no_live_chat", "price_opaque"})
+
+# ── 2. WordPress + Divi, a roofer that quotes by form and is hiring ──
+_platform("wp-divi-roofer", "https://summitroofing.test/", """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Summit Roofing | Mississauga Roofers</title>
+<link rel="stylesheet" href="/wp-content/themes/Divi/style.css?ver=4.24">
+<script src="/wp-content/themes/Divi/js/custom.unified.js"></script>
+</head><body class="et_pb_pagebuilder_layout">
+<nav><a href="/">Home</a> <a href="/services/">Services</a> <a href="/careers/">Careers</a></nav>
+<h1>Summit Roofing</h1>
+<h2>Our Services</h2>
+<ul><li>Roof repair</li><li>Roof inspection</li><li>Eavestrough installation</li></ul>
+<h2>What our customers say</h2>
+<blockquote>They were on the roof the same afternoon. &mdash; Dana R.</blockquote>
+<p><a class="et_pb_button" href="/contact/">Request a free quote</a></p>
+<form action="/contact/" method="post"><input type="text" name="name">
+<input type="email" name="email"><textarea name="message"></textarea>
+<button type="submit">Send</button></form>
+<p>Call (905) 555-0188.</p>
+""" + _FOOT % ("Summit Roofing", "77 Dundas St E, Mississauga, ON L4W 5N5."),
+     {"no_online_booking", "no_crm_signals", "no_live_chat", "no_analytics", "no_schema",
+      "no_social_presence", "price_opaque", "quote_by_form", "careers_manual",
+      "no_review_capture"})
+
+# ── 3. Wix, a salon running Wix Bookings and Wix Chat ──
+_platform("wix-salon", "https://gildedshears.test/", """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gilded Shears Salon</title>
+<link rel="stylesheet" href="https://static.parastorage.com/services/wix-thunderbolt/dist/main.css">
+<script src="https://static.parastorage.com/services/wix-thunderbolt/dist/main.bundle.min.js"></script>
+<script src="https://static.parastorage.com/services/chat-widget/1.2.0/wix-visitor-chat.bundle.min.js"></script>
+</head><body>
+<nav><a href="/">Home</a> <a href="/book-online">Book Online</a>
+<a href="https://www.instagram.com/gildedshears/">Instagram</a></nav>
+<h1>Gilded Shears</h1>
+<h2>Services</h2>
+<ul><li>Cut and blow dry &mdash; $70</li><li>Balayage &mdash; $210</li>
+<li>Keratin treatment &mdash; $180</li></ul>
+<div data-hook="bookings-widget" id="comp-bookings"></div>
+<script>window.wixBookingsConfig={"instance":"abc"};</script>
+<form action="/_functions/contact" method="post"><input type="text" name="name">
+<input type="email" name="email"><textarea name="message"></textarea>
+<button type="submit">Send</button></form>
+<p>Call (647) 555-0110.</p>
+""" + _FOOT % ("Gilded Shears", "14 Ossington Ave, Toronto, ON M6J 2Y7."),
+     {"no_crm_signals", "no_analytics", "no_schema"})
+
+# ── 4. Squarespace, a yoga studio with Acuity, Mailchimp and analytics ──
+_platform("squarespace-yoga", "https://stillpointyoga.test/", """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stillpoint Yoga</title>
+<link rel="stylesheet" href="https://static1.squarespace-cdn.com/static/site.css">
+<script src="https://static.squarespace.com/universal/scripts-compressed/common.js"></script>
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-BB88CC"></script>
+<script src="https://chimpstatic.com/mcjs-connected/js/users/abc/1.js"></script>
+<script type="application/ld+json">{"@context":"https://schema.org",
+"@type":"HealthAndBeautyBusiness","name":"Stillpoint Yoga"}</script>
+</head><body>
+<nav><a href="/">Home</a>
+<a href="https://stillpoint.squarespacescheduling.com/schedule.php">Book a class</a>
+<a href="https://www.instagram.com/stillpointyoga/">Instagram</a></nav>
+<h1>Stillpoint Yoga</h1>
+<h2>Classes</h2><ul><li>Drop-in class &mdash; $24</li><li>Ten-class pass &mdash; $200</li></ul>
+<form action="/api/form" method="post"><input type="email" name="email">
+<textarea name="message"></textarea><button type="submit">Send</button></form>
+<p>Call (416) 555-0177.</p>
+""" + _FOOT % ("Stillpoint Yoga", "500 Queen St W, Toronto, ON M5V 2B3."),
+     {"no_live_chat"})
+
+# ── 5. Shopify with Shopify Inbox and Klaviyo ──
+_platform("shopify-inbox-store", "https://northsidesupply.test/", """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Northside Supply</title>
+<script>var Shopify = Shopify || {}; Shopify.theme = {"name":"Dawn","id":1};</script>
+<link href="https://cdn.shopify.com/s/files/1/0001/theme.css" rel="stylesheet">
+<script src="https://cdn.shopify.com/shopifycloud/chat/assets/chat.js" async></script>
+<script src="https://static.klaviyo.com/onsite/js/klaviyo.js?company_id=ABC"></script>
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-SHOP1"></script>
+<script type="application/ld+json">{"@context":"https://schema.org","@type":"Product",
+"name":"Steel toe boot","offers":{"@type":"Offer","price":"129.00"}}</script>
+</head><body>
+<nav><a href="/collections/all">Shop</a> <a href="/cart">Cart</a>
+<a href="https://www.instagram.com/northsidesupply/">Instagram</a></nav>
+<h1>Northside Supply</h1>
+<p>Boots from $129.00, jackets $189.00, gloves $24.99.</p>
+<form action="/cart/add" method="post"><input type="hidden" name="id" value="1">
+<button>Add to cart</button></form>
+<p>Call (905) 555-0123.</p>
+""" + _FOOT % ("Northside Supply", "9 Barton St, Hamilton, ON L8L 2X1."),
+     {"ecommerce_manual"})
+
+# ── 6. Webflow agency on HubSpot ──
+_platform("webflow-agency", "https://foldstudio.test/", """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fold Studio | Brand and Product Design</title>
+<link rel="stylesheet" href="https://assets-global.website-files.com/6011/fold.css">
+<script src="https://assets-global.website-files.com/6011/webflow.js"></script>
+<script src="https://js.hs-scripts.com/4455667.js" async defer></script>
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-FOLD1"></script>
+</head><body data-wf-page="6011a" data-wf-site="6011">
+<nav><a href="/">Home</a> <a href="/work">Work</a>
+<a href="https://www.linkedin.com/company/foldstudio/">LinkedIn</a></nav>
+<h1>Fold Studio</h1>
+<h2>What we do</h2><ul><li>Brand strategy</li><li>Product design</li>
+<li>Design systems</li></ul>
+<form action="/contact" method="post"><input type="text" name="name">
+<input type="email" name="email"><textarea name="message"></textarea>
+<button type="submit">Send</button></form>
+<p>Call 020 7946 0102.</p>
+""" + _FOOT % ("Fold Studio", "18 Hoxton Sq, London N1 6NU."),
+     {"no_schema", "price_opaque"})
+
+# ── 7. GoDaddy one-page brochure, an email address and nothing else ──
+_platform("godaddy-brochure", "https://verdantlawns.test/", """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Verdant Lawns</title>
+<link rel="stylesheet" href="https://img1.wsimg.com/blobby/go/site/styles.css">
+<script src="https://img1.wsimg.com/blobby/go/bundle.js"></script>
+</head><body>
+<h1>Verdant Lawns</h1>
+<p>Lawn care and garden maintenance across Barrie and Innisfil.</p>
+<h2>Services</h2><ul><li>Lawn mowing</li><li>Garden maintenance</li>
+<li>Spring and fall cleanup</li></ul>
+<p>Email <a href="mailto:hello@verdantlawns.test">hello@verdantlawns.test</a>
+or call (705) 555-0166.</p>
+""" + _FOOT % ("Verdant Lawns", "31 Dunlop St E, Barrie, ON L4M 1A2."),
+     {"no_lead_capture", "email_only_intake", "no_live_chat", "no_analytics", "no_schema",
+      "no_social_presence", "price_opaque"})
+
+# ── 8. Duda, a three-branch physiotherapy chain ──
+_platform("duda-physio-chain", "https://tricityphysio.test/", """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tri-City Physiotherapy</title>
+<link rel="stylesheet" href="https://irp.cdn-website.com/tricity/styles.css">
+<script src="https://static.cdn-website.com/libs/runtime.js"></script>
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-TRI1"></script>
+<script type="application/ld+json">{"@context":"https://schema.org",
+"@type":"MedicalBusiness","name":"Tri-City Physiotherapy"}</script>
+</head><body>
+<nav><a href="/">Home</a> <a href="/locations">Locations</a>
+<a href="https://www.facebook.com/tricityphysio/">Facebook</a></nav>
+<h1>Tri-City Physiotherapy</h1>
+<h2>Treatments</h2><ul><li>Manual therapy</li><li>Sports injury treatment</li>
+<li>Post-surgical rehabilitation</li></ul>
+<address>120 King St W, Kitchener, ON N2G 1A7</address>
+<address>55 Erb St E, Waterloo, ON N2J 1L7</address>
+<address>10 Queen St S, Cambridge, ON N3C 1G2</address>
+<form action="/contact" method="post"><input type="text" name="name">
+<input type="email" name="email"><textarea name="message"></textarea>
+<button type="submit">Send</button></form>
+<p>Call (519) 555-0144.</p>
+""" + _FOOT % ("Tri-City Physiotherapy", "Three clinics across Waterloo Region."),
+     {"no_online_booking", "no_crm_signals", "no_live_chat", "multi_location",
+      "price_opaque"})
+
+# ── 9. Weebly restaurant, OpenTable, no form ──
+_platform("weebly-restaurant", "https://ferrymanstable.test/", """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Ferryman's Table</title>
+<link rel="stylesheet" href="https://www.editmysite.com/editor/site.css">
+<script src="https://www.weebly.com/uploads/site.js"></script>
+</head><body>
+<nav><a href="/">Home</a>
+<a href="https://www.opentable.com/r/the-ferrymans-table">Reserve a table</a>
+<a href="https://www.facebook.com/ferrymanstable/">Facebook</a>
+<a href="https://www.instagram.com/ferrymanstable/">Instagram</a></nav>
+<h1>The Ferryman's Table</h1>
+<h2>Menu</h2><p>Starters from $14, mains $32, desserts $11.</p>
+<p>Questions? <a href="mailto:eat@ferrymanstable.test">eat@ferrymanstable.test</a>
+or call (250) 555-0195.</p>
+""" + _FOOT % ("The Ferryman's Table", "42 Wharf St, Victoria, BC V8W 1T2."),
+     {"no_lead_capture", "no_live_chat", "no_analytics", "no_schema"})
+
+# ── 10. Joomla contractor on plain http, no viewport, a 2019 footer ──
+_platform("joomla-http-contractor", "http://cornerstoneconcrete.test/", """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>Cornerstone Concrete</title>
+<link rel="stylesheet" href="/media/jui/css/bootstrap.min.css">
+<script src="/media/system/js/core.js"></script>
+</head><body>
+<h1>Cornerstone Concrete</h1>
+<h2>What we do</h2><ul><li>Concrete forming</li><li>Excavation</li>
+<li>Site servicing</li></ul>
+<form action="/index.php?option=com_contact" method="post"><input type="text" name="name">
+<input type="email" name="email"><textarea name="message"></textarea>
+<button type="submit">Send</button></form>
+<p>Call (613) 555-0121.</p>
+<footer><p>&copy; 2019 Cornerstone Concrete. 8 Bank St, Ottawa, ON K1P 5N2.</p></footer>
+</body></html>""",
+     {"no_ssl", "no_mobile", "stale_site", "no_crm_signals", "no_live_chat",
+      "no_analytics", "no_schema", "no_social_presence", "price_opaque"})
+
+# ── 11. Drupal clinic with a blog nobody has posted to in three years ──
+_platform("drupal-stale-blog", "https://harbourhealth.test/", """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Harbour Health Clinic</title>
+<script src="/sites/default/files/js/drupal-settings.js"></script>
+<script type="application/json" data-drupal-selector="drupal-settings-json">{}</script>
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-HARB1"></script>
+</head><body>
+<nav><a href="/">Home</a> <a href="/blog">Blog</a>
+<a href="https://www.facebook.com/harbourhealth/">Facebook</a></nav>
+<h1>Harbour Health Clinic</h1>
+<h2>Our Services</h2><ul><li>Physiotherapy treatment</li><li>Massage therapy</li>
+<li>Custom orthotics</li></ul>
+<article><h2><a href="/blog/winter-injuries">Winter injuries and how to avoid them</a></h2>
+<time datetime="%s">a while ago</time></article>
+<form action="/contact" method="post"><input type="text" name="name">
+<input type="email" name="email"><textarea name="message"></textarea>
+<button type="submit">Send</button></form>
+<p>Call (902) 555-0133.</p>
+""" % OLD_POST + _FOOT % ("Harbour Health Clinic", "5 Water St, Halifax, NS B3J 1A1."),
+     {"no_online_booking", "no_crm_signals", "no_live_chat", "stale_blog", "no_schema",
+      "price_opaque"})
+
+# ── 12. A Cloudflare bot check ──
+_platform("cloudflare-challenge", "https://guardedplumbing.test/", """<!doctype html>
+<html lang="en-US"><head><meta charset="utf-8">
+<title>Just a moment...</title>
+<meta http-equiv="X-UA-Compatible" content="IE=Edge">
+<meta name="robots" content="noindex,nofollow">
+</head><body class="no-js">
+<div class="main-wrapper" role="main"><div class="main-content">
+<h1><span>guardedplumbing.test</span></h1>
+<h2 class="h2"><span id="challenge-error-text">Verifying you are human. This may take a
+few seconds.</span></h2>
+<p>guardedplumbing.test needs to review the security of your connection before proceeding.</p>
+</div></div>
+<script src="/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page/v1?ray=8a1"></script>
+</body></html>""", set(), "challenge")
+
+# ── 13. A Dutch cookie wall and nothing behind it ──
+_platform("dutch-cookie-wall", "https://dakwerkenvermeer.test/", """<!doctype html>
+<html lang="nl"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dakwerken Vermeer</title>
+</head><body>
+<div id="cookie-consent-wall">
+<h1>Deze website gebruikt cookies</h1>
+<p>Wij en onze partners plaatsen cookies om de website te laten werken, het gebruik te
+meten en advertenties te personaliseren. U kunt uw keuze later altijd wijzigen.</p>
+<button id="accept-all">Alles accepteren</button>
+<button id="reject-all">Alleen noodzakelijke</button>
+<a href="/cookiebeleid">Cookiebeleid</a>
+</div>
+</body></html>""", set(), "cookie_wall")
+
+# ── 14. A Next.js shell that renders everything client side ──
+_platform("nextjs-shell", "https://orbitdental.test/", """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Orbit Dental</title>
+<link rel="preload" href="/_next/static/css/a1b2.css" as="style">
+<link rel="stylesheet" href="/_next/static/css/a1b2.css">
+</head><body>
+<div id="__next"></div>
+<script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{}},
+"page":"/","query":{},"buildId":"x9"}</script>
+<script src="/_next/static/chunks/main-9f2.js" defer></script>
+<script src="/_next/static/chunks/pages/index-3c1.js" defer></script>
+</body></html>""", set(), "js_only")
+
+# ── 15. A parked domain ──
+_platform("parked-domain", "https://claymoreelectric.test/", """<!doctype html>
+<html><head><meta charset="utf-8">
+<title>claymoreelectric.test</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+</head><body>
+<h1>claymoreelectric.test</h1>
+<p>This domain is for sale. Buy this domain today.</p>
+<p><a href="https://www.hugedomains.com/domain_profile.cfm?d=claymoreelectric">
+Make an offer</a></p>
+<script src="https://parkingcrew.net/js/park.js"></script>
+</body></html>""", set(), "parked")
+
+# ── 16. A response with a shell and no body at all ──
+_platform("empty-body", "https://kettlevalleymasonry.test/",
+     "<!doctype html><html><head><title></title></head><body></body></html>",
+     set(), "empty")
+
+# ── 17. A WordPress maintenance-mode splash ──
+_platform("under-construction", "https://tidewaterhvac.test/", """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tidewater HVAC &#8212; Coming Soon</title>
+<link rel="stylesheet" href="/wp-content/plugins/coming-soon/style.css">
+</head><body>
+<h1>Our new site is coming soon</h1>
+<p>We are working on something great. Check back shortly.</p>
+</body></html>""", set(), "under_construction")
+
+# ── 18. French plumber, appointments by telephone ──
+_platform("french-plumber", "https://plomberiedurand.test/", """<!doctype html>
+<html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="generator" content="WordPress 6.4">
+<title>Plomberie Durand | Plombier &agrave; Lyon</title>
+<link rel="stylesheet" href="/wp-content/themes/durand/style.css">
+</head><body>
+<nav><a href="/">Accueil</a> <a href="/nos-prestations/">Nos prestations</a>
+<a href="/contact/">Contact</a>
+<a href="https://www.facebook.com/plomberiedurand/">Facebook</a></nav>
+<h1>Plomberie Durand</h1>
+<h2>Nos prestations</h2><ul><li>D&eacute;pannage plomberie</li>
+<li>Installation de chaudi&egrave;re</li><li>Recherche de fuite</li></ul>
+<p>Pour prendre rendez-vous, appelez le 04 78 55 44 33.</p>
+<form action="/contact/" method="post"><input type="text" name="nom">
+<input type="email" name="email"><textarea name="message"></textarea>
+<button type="submit">Envoyer</button></form>
+""" + _FOOT % ("Plomberie Durand", "12 rue de la R&eacute;publique, 69002 Lyon."),
+     {"no_online_booking", "no_crm_signals", "no_live_chat", "no_analytics", "no_schema",
+      "price_opaque"})
+
+# ── 19. German dentist booking through Doctolib ──
+_platform("german-doctolib", "https://zahnarztpraxis-berg.test/", """<!doctype html>
+<html lang="de"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Zahnarztpraxis Berg | Z&auml;hne in M&uuml;nchen</title>
+<script type="application/ld+json">{"@context":"https://schema.org","@type":"Dentist",
+"name":"Zahnarztpraxis Berg"}</script>
+</head><body>
+<nav><a href="/">Start</a> <a href="/leistungen/">Leistungen</a>
+<a href="https://www.doctolib.de/zahnarzt/muenchen/praxis-berg">Termin buchen</a>
+<a href="https://www.facebook.com/zahnarztpraxisberg/">Facebook</a></nav>
+<h1>Zahnarztpraxis Berg</h1>
+<h2>Unsere Leistungen</h2><ul><li>Professionelle Zahnreinigung</li>
+<li>Implantologie</li><li>Kinderzahnheilkunde</li></ul>
+<form action="/kontakt/" method="post"><input type="text" name="name">
+<input type="email" name="email"><textarea name="nachricht"></textarea>
+<button type="submit">Senden</button></form>
+<p>Telefon 089 55 44 33 22.</p>
+""" + _FOOT % ("Zahnarztpraxis Berg", "Leopoldstra&szlig;e 21, 80802 M&uuml;nchen."),
+     {"no_crm_signals", "no_live_chat", "no_analytics", "price_opaque"})
+
+# ── 20. Spanish dental clinic: online booking and a WhatsApp button ──
+_platform("spanish-whatsapp-clinic", "https://clinicadentalsol.test/", """<!doctype html>
+<html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cl&iacute;nica Dental Sol | Valencia</title>
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-SOL22"></script>
+</head><body>
+<nav><a href="/">Inicio</a> <a href="/pedir-cita/">Pedir cita online</a>
+<a href="https://www.instagram.com/clinicadentalsol/">Instagram</a></nav>
+<h1>Cl&iacute;nica Dental Sol</h1>
+<h2>Nuestros servicios</h2><ul><li>Limpieza dental</li><li>Ortodoncia invisible</li>
+<li>Implantes dentales</li></ul>
+<p><a href="https://wa.me/34600555044">Escr&iacute;benos por WhatsApp</a></p>
+<form action="/contacto/" method="post"><input type="text" name="nombre">
+<input type="email" name="email"><textarea name="mensaje"></textarea>
+<button type="submit">Enviar</button></form>
+<p>Tel&eacute;fono 960 55 50 44.</p>
+""" + _FOOT % ("Cl&iacute;nica Dental Sol", "Carrer de Colon 8, 46004 Valencia."),
+     {"no_crm_signals", "no_live_chat", "no_schema", "price_opaque", "whatsapp_manual"})
+
+# ── 21. Dutch dentist, appointment link, no form ──
+_platform("dutch-tandarts", "https://tandartsdekade.test/", """<!doctype html>
+<html lang="nl"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tandartspraktijk De Kade</title>
+</head><body>
+<nav><a href="/">Home</a> <a href="/afspraak-maken/">Afspraak maken</a>
+<a href="/behandelingen/">Behandelingen</a></nav>
+<h1>Tandartspraktijk De Kade</h1>
+<h2>Onze behandelingen</h2><ul><li>Gebitsreiniging</li><li>Vullingen</li>
+<li>Kronen en bruggen</li></ul>
+<p>Bel 010 555 44 33 of mail
+<a href="mailto:info@tandartsdekade.test">info@tandartsdekade.test</a>.</p>
+""" + _FOOT % ("Tandartspraktijk De Kade", "Westzeedijk 100, 3016 AE Rotterdam."),
+     {"no_lead_capture", "no_live_chat", "no_analytics", "no_schema",
+      "no_social_presence", "price_opaque"})
+
+# ── 22. A real WooCommerce bakery ──
+_platform("woocommerce-bakery", "https://proofbakehouse.test/", """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Proof Bakehouse</title>
+<link rel="stylesheet" href="/wp-content/plugins/woocommerce/assets/css/woocommerce.css">
+<script src="/wp-content/plugins/woocommerce/assets/js/frontend/add-to-cart.min.js"></script>
+<script>var wc_add_to_cart_params = {"ajax_url":"/?wc-ajax=%%%%endpoint%%%%"};</script>
+<script src="https://chimpstatic.com/mcjs-connected/js/users/proof/1.js"></script>
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-PROOF"></script>
+</head><body class="woocommerce-page">
+<nav><a href="/shop/">Shop</a> <a href="/cart/">Cart</a>
+<a href="https://www.facebook.com/proofbakehouse/">Facebook</a></nav>
+<h1>Proof Bakehouse</h1>
+<ul class="products"><li>Sourdough loaf &mdash; $9.00</li><li>Cinnamon buns &mdash; $18.00</li></ul>
+<form class="cart" method="post"><button type="submit" name="add-to-cart" value="41">
+Add to cart</button></form>
+<p>Call (416) 555-0109.</p>
+""" + _FOOT % ("Proof Bakehouse", "88 Ossington Ave, Toronto, ON M6J 2Z1."),
+     {"ecommerce_manual", "no_live_chat", "no_schema"})
+
+# ── 23. An agency that sells WooCommerce builds and runs no shop ──
+_platform("agency-mentions-woocommerce", "https://reddeerdigital.test/", """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Red Deer Digital</title>
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-RDD1"></script>
+</head><body>
+<nav><a href="/">Home</a> <a href="/services/">Services</a>
+<a href="https://www.linkedin.com/company/reddeerdigital/">LinkedIn</a></nav>
+<h1>Red Deer Digital</h1>
+<h2>Our Services</h2><ul><li>WooCommerce development</li><li>Shopify theme builds</li>
+<li>Magento migrations</li></ul>
+<p>We build online stores for other people. We do not sell anything here.</p>
+<form action="/contact/" method="post"><input type="text" name="name">
+<input type="email" name="email"><textarea name="message"></textarea>
+<button type="submit">Send</button></form>
+<p>Call (403) 555-0187.</p>
+""" + _FOOT % ("Red Deer Digital", "44 Gaetz Ave, Red Deer, AB T4N 4A1."),
+     {"no_crm_signals", "no_live_chat", "no_schema", "price_opaque"})
+
+# ── 24. An HR consultancy that links to workforce.com ──
+_platform("hr-links-workforce", "https://northgatepeople.test/", """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Northgate People</title>
+</head><body>
+<nav><a href="/">Home</a> <a href="/services/">Services</a>
+<a href="https://www.linkedin.com/company/northgatepeople/">LinkedIn</a></nav>
+<h1>Northgate People</h1>
+<h2>What we do</h2><ul><li>HR policy reviews</li><li>Payroll setup</li>
+<li>Employment contracts</li></ul>
+<p>We implement rota tools such as
+<a href="https://www.workforce.com/features">Workforce.com</a> for our clients.</p>
+<form action="/contact/" method="post"><input type="text" name="name">
+<input type="email" name="email"><textarea name="message"></textarea>
+<button type="submit">Send</button></form>
+<p>Call 0161 555 0134.</p>
+""" + _FOOT % ("Northgate People", "3 Deansgate, Manchester M3 2BW."),
+     {"no_crm_signals", "no_live_chat", "no_analytics", "no_schema", "price_opaque"})
+
+# ── 25. Tag Manager only, Intercom, Calendly ──
+_platform("gtm-intercom-calendly", "https://arborfinance.test/", """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Arbor Finance</title>
+<script>(function(w,d,s,l,i){w[l]=w[l]||[];})(window,document,'script','dataLayer','GTM-ABC123');</script>
+<script src="https://www.googletagmanager.com/gtm.js?id=GTM-ABC123"></script>
+<script>window.intercomSettings={app_id:"ab12cd"};</script>
+<script src="https://widget.intercom.io/widget/ab12cd"></script>
+</head><body>
+<nav><a href="/">Home</a>
+<a href="https://calendly.com/arborfinance/intro">Book a consultation</a>
+<a href="https://www.linkedin.com/company/arborfinance/">LinkedIn</a></nav>
+<h1>Arbor Finance</h1>
+<h2>What we do</h2><ul><li>Cashflow forecasting</li><li>Bookkeeping</li>
+<li>Year-end accounts</li></ul>
+<form action="/contact" method="post"><input type="text" name="name">
+<input type="email" name="email"><textarea name="message"></textarea>
+<button type="submit">Send</button></form>
+<p>Call 0117 555 0192.</p>
+""" + _FOOT % ("Arbor Finance", "9 Queen Sq, Bristol BS1 4JQ."),
+     {"no_crm_signals", "no_schema", "price_opaque"})
+
+# ── 26. Testimonials with a live Google review link ──
+_platform("movers-with-review-link", "https://ironhorsemoving.test/", """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Iron Horse Moving</title>
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-IRON1"></script>
+<script type="application/ld+json">{"@context":"https://schema.org",
+"@type":"MovingCompany","name":"Iron Horse Moving"}</script>
+</head><body>
+<nav><a href="/">Home</a>
+<a href="https://www.facebook.com/ironhorsemoving/">Facebook</a></nav>
+<h1>Iron Horse Moving</h1>
+<h2>What we do</h2><ul><li>Local moving</li><li>Packing and unpacking</li>
+<li>Storage</li></ul>
+<h2>What our customers say</h2>
+<blockquote>Nothing broken, nothing late. &mdash; Priya S.</blockquote>
+<p><a href="https://g.page/r/CQabcdEFGhIJ/review">Leave us a Google review</a></p>
+<form action="/contact" method="post"><input type="text" name="name">
+<input type="email" name="email"><textarea name="message"></textarea>
+<button type="submit">Send</button></form>
+<p>Call (204) 555-0155.</p>
+""" + _FOOT % ("Iron Horse Moving", "300 Portage Ave, Winnipeg, MB R3C 0C4."),
+     {"no_crm_signals", "no_live_chat", "price_opaque"})
+
+# ── 27. A German optician chain whose branches live in JSON-LD ──
+_platform("german-optician-chain", "https://optikwendt.test/", """<!doctype html>
+<html lang="de"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Optik Wendt | Vier Filialen</title>
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-WENDT"></script>
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[
+{"@type":"Optician","name":"Optik Wendt Mitte","address":{"@type":"PostalAddress",
+"streetAddress":"Friedrichstra&szlig;e 12","postalCode":"10117","addressLocality":"Berlin"}},
+{"@type":"Optician","name":"Optik Wendt Charlottenburg","address":{"@type":"PostalAddress",
+"streetAddress":"Kantstra&szlig;e 55","postalCode":"10627","addressLocality":"Berlin"}},
+{"@type":"Optician","name":"Optik Wendt Potsdam","address":{"@type":"PostalAddress",
+"streetAddress":"Brandenburger Str. 3","postalCode":"14467","addressLocality":"Potsdam"}},
+{"@type":"Optician","name":"Optik Wendt Spandau","address":{"@type":"PostalAddress",
+"streetAddress":"Carl-Schurz-Str. 9","postalCode":"13597","addressLocality":"Berlin"}}]}</script>
+</head><body>
+<nav><a href="/">Start</a> <a href="/filialen/">Filialen</a>
+<a href="https://www.facebook.com/optikwendt/">Facebook</a></nav>
+<h1>Optik Wendt</h1>
+<h2>Unsere Leistungen</h2><ul><li>Sehtest</li><li>Brillenanpassung</li>
+<li>Kontaktlinsen</li></ul>
+<form action="/kontakt/" method="post"><input type="text" name="name">
+<input type="email" name="email"><textarea name="nachricht"></textarea>
+<button type="submit">Senden</button></form>
+<p>Telefon 030 55 44 33 22.</p>
+""" + _FOOT % ("Optik Wendt", "Vier Filialen in Berlin und Potsdam."),
+     {"no_online_booking", "no_crm_signals", "no_live_chat", "multi_location",
+      "price_opaque"})
+
+# ── 28. Behind Cloudflare, but serving the real site ──
+_platform("cloudflare-real-site", "https://ashgrovevets.test/", """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ashgrove Veterinary Surgery</title>
+<script src="/cdn-cgi/scripts/7d0fa10a/cloudflare-static/rocket-loader.min.js"></script>
+<script defer src="https://static.cloudflareinsights.com/beacon.min.js"
+data-cf-beacon='{"token":"abc123"}'></script>
+</head><body>
+<nav><a href="/">Home</a> <a href="/services/">Services</a>
+<a href="https://www.facebook.com/ashgrovevets/">Facebook</a></nav>
+<h1>Ashgrove Veterinary Surgery</h1>
+<h2>Our Services</h2><ul><li>Vaccinations and wellness exams</li>
+<li>Dental cleaning</li><li>Pet grooming</li></ul>
+<form action="/contact/" method="post"><input type="text" name="name">
+<input type="email" name="email"><textarea name="message"></textarea>
+<button type="submit">Send</button></form>
+<p>Call (07) 3555 0177.</p>
+""" + _FOOT % ("Ashgrove Veterinary Surgery", "12 Waterworks Rd, Ashgrove QLD 4060."),
+     {"no_online_booking", "no_crm_signals", "no_live_chat", "no_schema", "price_opaque"})
+
+# ── 29. A React site that still ships its content in the HTML ──
+_platform("react-but-rendered", "https://lakelinedental.test/", """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lakeline Dental</title>
+<script src="/static/js/react-dom.production.min.js" defer></script>
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-LAKE1"></script>
+</head><body>
+<div id="root" data-reactroot="">
+<nav><a href="/">Home</a> <a href="/services">Services</a>
+<a href="https://www.instagram.com/lakelinedental/">Instagram</a></nav>
+<h1>Lakeline Dental</h1>
+<h2>Our Services</h2><ul><li>Dental cleaning</li><li>Emergency repair</li>
+<li>Whitening</li></ul>
+<p><a href="https://code.tidio.co/abc.js">chat</a></p>
+<script src="//code.tidio.co/abc123.js" async></script>
+<form action="/contact" method="post"><input type="text" name="name">
+<input type="email" name="email"><textarea name="message"></textarea>
+<button type="submit">Send</button></form>
+<p>Call (512) 555-0143.</p>
+</div>
+""" + _FOOT % ("Lakeline Dental", "1400 Ranch Rd, Austin, TX 78717."),
+     {"no_online_booking", "no_crm_signals", "no_schema", "price_opaque"})
+
+# ── 30. A shop whose only route in is WhatsApp ──
+_platform("whatsapp-only-shop", "https://muebleslaparra.test/", """<!doctype html>
+<html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Muebles La Parra</title>
+</head><body>
+<h1>Muebles La Parra</h1>
+<h2>Nuestros productos</h2><ul><li>Sof&aacute;s a medida</li><li>Mesas de comedor</li>
+<li>Armarios empotrados</li></ul>
+<p>Pregunta por
+<a href="https://api.whatsapp.com/send?phone=34611555099">WhatsApp</a>
+o llama al 961 55 50 99.</p>
+""" + _FOOT % ("Muebles La Parra", "Avinguda del Port 44, 46023 Val&egrave;ncia."),
+     {"no_lead_capture", "whatsapp_manual", "no_live_chat", "no_analytics", "no_schema",
+      "no_social_presence", "price_opaque"})
+
+# ── 31. Squarespace with Squarespace Scheduling and a Trustpilot widget ──
+_platform("squarespace-trustpilot", "https://sableaccounting.test/", """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sable Accounting</title>
+<link rel="stylesheet" href="https://static1.squarespace-cdn.com/static/sable.css">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-SABLE"></script>
+<script src="https://widget.trustpilot.com/bootstrap/v5/tp.widget.bootstrap.min.js"></script>
+<script type="application/ld+json">{"@context":"https://schema.org",
+"@type":"AccountingService","name":"Sable Accounting"}</script>
+</head><body>
+<nav><a href="/">Home</a>
+<a href="https://sable.squarespacescheduling.com/schedule.php">Book a consultation</a>
+<a href="https://www.linkedin.com/company/sableaccounting/">LinkedIn</a></nav>
+<h1>Sable Accounting</h1>
+<h2>Fees</h2><ul><li>Self-assessment return &mdash; &pound;180</li>
+<li>Limited company accounts &mdash; from &pound;950</li></ul>
+<h2>What our clients say</h2>
+<blockquote>Straight answers, no jargon. &mdash; Tom H.</blockquote>
+<div class="trustpilot-widget" data-businessunit-id="abc"></div>
+<form action="/contact" method="post"><input type="text" name="name">
+<input type="email" name="email"><textarea name="message"></textarea>
+<button type="submit">Send</button></form>
+<p>Call 0131 555 0121.</p>
+""" + _FOOT % ("Sable Accounting", "22 George St, Edinburgh EH2 2PF."),
+     {"no_crm_signals", "no_live_chat"})
+
+# ── 32. A French Ecwid shop running Crisp ──
+_platform("french-ecwid-crisp", "https://cavesaintjulien.test/", """<!doctype html>
+<html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cave Saint-Julien</title>
+<script src="https://app.ecwid.com/script.js?store=12345" charset="utf-8"></script>
+<script>window.$crisp=[];window.CRISP_WEBSITE_ID="ab-12-cd";</script>
+<script src="https://client.crisp.chat/l.js" async></script>
+</head><body>
+<nav><a href="/">Accueil</a> <a href="/boutique/">Boutique</a>
+<a href="https://www.facebook.com/cavesaintjulien/">Facebook</a></nav>
+<h1>Cave Saint-Julien</h1>
+<div id="my-store-12345"></div>
+<p>Bordeaux 2019 &mdash; 24,00 &euro;. Sancerre 2021 &mdash; 19,50 &euro;.</p>
+<p>T&eacute;l&eacute;phone 05 56 55 44 33.</p>
+""" + _FOOT % ("Cave Saint-Julien", "8 cours du Chapeau Rouge, 33000 Bordeaux."),
+     {"ecommerce_manual", "no_analytics", "no_schema"})
+
+# ── 33. A brochure whose only form is a Typeform embed ──
+_platform("typeform-brochure", "https://calderstonelaw.test/", """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Calderstone Law</title>
+</head><body>
+<h1>Calderstone Law</h1>
+<h2>What we do</h2><ul><li>Wills and probate</li><li>Conveyancing</li>
+<li>Employment advice</li></ul>
+<iframe src="https://form.typeform.com/to/AbCdEf" width="100%" height="500"></iframe>
+<p>Call 0151 555 0166.</p>
+""" + _FOOT % ("Calderstone Law", "5 Castle St, Liverpool L2 4SW."),
+     {"no_crm_signals", "no_live_chat", "no_analytics", "no_schema",
+      "no_social_presence", "price_opaque"})
+
+# ── 34. GoHighLevel: CRM, calendar and chat in one loader ──
+_platform("gohighlevel-hvac", "https://polarisheating.test/", """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Polaris Heating &amp; Cooling</title>
+<script src="https://widgets.leadconnectorhq.com/loader.js"
+data-resources-url="https://widgets.leadconnectorhq.com/chat-widget/loader.js"></script>
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-POLAR"></script>
+</head><body>
+<nav><a href="/">Home</a>
+<a href="https://api.leadconnectorhq.com/widget/booking/polaris">Book an appointment</a>
+<a href="https://www.facebook.com/polarisheating/">Facebook</a></nav>
+<h1>Polaris Heating &amp; Cooling</h1>
+<h2>Our Services</h2><ul><li>Furnace repair</li><li>Air conditioning installation</li>
+<li>Annual maintenance</li></ul>
+<form action="/contact" method="post"><input type="text" name="name">
+<input type="email" name="email"><textarea name="message"></textarea>
+<button type="submit">Send</button></form>
+<p>Call (780) 555-0198.</p>
+""" + _FOOT % ("Polaris Heating &amp; Cooling", "112 Jasper Ave, Edmonton, AB T5J 1W8."),
+     {"no_schema", "price_opaque"})
+
+# ── 35. Podium webchat and Housecall Pro booking ──
+_platform("podium-housecall", "https://brightpathelectric.test/", """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Brightpath Electric</title>
+<script src="https://connect.podium.com/widget.js#ORG_TOKEN=abc" async></script>
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-BRIGHT"></script>
+</head><body>
+<nav><a href="/">Home</a>
+<a href="https://book.housecallpro.com/book/Brightpath-Electric/abc">Book online</a>
+<a href="https://www.facebook.com/brightpathelectric/">Facebook</a></nav>
+<h1>Brightpath Electric</h1>
+<h2>Our Services</h2><ul><li>Panel upgrades</li><li>EV charger installation</li>
+<li>Electrical inspection</li></ul>
+<form action="/contact" method="post"><input type="text" name="name">
+<input type="email" name="email"><textarea name="message"></textarea>
+<button type="submit">Send</button></form>
+<p>Call (403) 555-0164.</p>
+""" + _FOOT % ("Brightpath Electric", "700 4 Ave SW, Calgary, AB T2P 3J4."),
+     {"no_crm_signals", "no_schema", "price_opaque"})
+
+# ── 36. A cookie banner sitting on top of a real page ──
+_platform("cookie-banner-real-page", "https://harlowdentalcare.test/", """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Harlow Dental Care</title>
+</head><body>
+<div id="cookie-banner"><p>This website uses cookies to make sure you get the best
+experience. <button>Accept all cookies</button> <button>Cookie settings</button></p></div>
+<nav><a href="/">Home</a> <a href="/treatments/">Treatments</a>
+<a href="/contact/">Contact</a></nav>
+<h1>Harlow Dental Care</h1>
+<h2>Our Treatments</h2><ul><li>Hygienist appointment</li><li>White fillings</li>
+<li>Teeth whitening</li></ul>
+<p>We have looked after families in Harlow for thirty years. New patients are welcome
+and there is parking behind the practice.</p>
+<form action="/contact/" method="post"><input type="text" name="name">
+<input type="email" name="email"><textarea name="message"></textarea>
+<button type="submit">Send</button></form>
+<p>Call 01279 555 012.</p>
+""" + _FOOT % ("Harlow Dental Care", "18 The High, Harlow CM20 1LN."),
+     {"no_online_booking", "no_crm_signals", "no_live_chat", "no_analytics", "no_schema",
+      "no_social_presence", "price_opaque"})
+
+
+PLATFORM_CORPUS: tuple = tuple(_PLATFORM_CORPUS)
+
+# The four codes added in the same pass as this corpus. Reported separately in
+# the docstring below, because a rule that did not exist cannot have had a rate.
+PLATFORM_NEW_CODES = frozenset({"no_ssl", "whatsapp_manual", "email_only_intake",
+                                "no_review_capture"})
 
 def test_no_rule_stands_a_substring_in_for_the_fact_it_claims():
     """Precision on the corpus, rule by rule, because a wrong headline is dear.
@@ -2159,6 +2965,265 @@ def test_a_threshold_and_a_vendor_list_are_not_the_fact_they_stand_in_for():
     print("a threshold and a vendor list are not the fact they stand in for: OK")
 
 
+
+# ── The platforms, the unreadable pages, and the reason a site is not reachable ──
+
+
+def test_the_platforms_this_tool_actually_meets():
+    """Precision and recall over thirty-six real page shapes, rule by rule.
+
+    The two corpora above are one page shape each, which makes them sharp about
+    a single rule and blind to what a real crawl drags in with it. These
+    thirty-six carry the platforms this tool actually meets — WordPress under
+    Elementor and under Divi, Wix, Squarespace, Shopify, Webflow, GoDaddy, Duda,
+    Weebly, Joomla, Drupal, WooCommerce, Ecwid, GoHighLevel — plus a one-page
+    brochure, a three-branch chain, a four-branch chain whose addresses live
+    only in JSON-LD, a site behind Cloudflare, a React site that does ship its
+    content, and pages in French, German, Spanish and Dutch.
+
+    Over these pages, before -> after:
+
+        rule                 precision            recall
+        no_lead_capture      0.364 -> 1.000       1.000 -> 1.000
+        no_social_presence   0.538 -> 1.000       1.000 -> 1.000
+        no_analytics         0.650 -> 1.000       1.000 -> 1.000
+        no_live_chat         0.688 -> 1.000       1.000 -> 1.000
+        no_schema            0.786 -> 1.000       1.000 -> 1.000
+        price_opaque         0.786 -> 1.000       0.957 -> 1.000
+        ecommerce_manual     0.750 -> 1.000       1.000 -> 1.000
+        no_online_booking    0.889 -> 1.000       0.889 -> 1.000
+        no_mobile            0.333 -> 1.000       1.000 -> 1.000
+        contact_form_only    0.000 -> 1.000          --
+        multi_location       1.000 -> 1.000       0.500 -> 1.000
+        no_crm_signals       1.000 -> 1.000       0.950 -> 1.000
+        every rule together  0.728 -> 1.000       0.969 -> 1.000
+
+    Forty-seven false claims became none. Thirty-eight of the forty-seven came
+    from six pages nobody could read — see the test below — and the other nine
+    were a vendor table that had never heard of the product on the page (Wix's
+    own chat, Shopify Inbox, Podium, GoHighLevel, Cloudflare's own page-view
+    counter), a bare "woocommerce" matching an agency's services list, a
+    services list reading "Site servicing" as a thing somebody books, and an
+    Australian phone number printed inside brackets that no pattern here could
+    see. The four recall misses were a German chain whose branches are only in
+    its JSON-LD, an optician whose bookable trade is only in its schema type, a
+    shop excused from `price_opaque` by a false storefront, and an HR firm
+    linking to workforce.com, which `force.com` read as Salesforce.
+
+    `contact_form_only` has a dash for recall because no page here is labelled
+    with it while one page used to claim it.
+    """
+    wrong = {}
+    for name, url, html, expected, _reason in PLATFORM_CORPUS:
+        fired = set(_codes(A.audit_from_html({url: html}, url)))
+        if fired != expected:
+            wrong[name] = {"claimed but false": sorted(fired - expected),
+                           "true but missed": sorted(expected - fired)}
+    assert not wrong, wrong
+
+    assert len(PLATFORM_CORPUS) >= 30, len(PLATFORM_CORPUS)
+    # Graded both ways, or the rate is a rate over one answer. The codes below
+    # are the ones this corpus is built to exercise; the rest are measured by
+    # the two corpora above.
+    rates = _corpus_rates([(n, u, h, g) for n, u, h, g, _r in PLATFORM_CORPUS])
+    for code in ("no_live_chat", "no_analytics", "no_schema", "price_opaque",
+                 "no_crm_signals", "no_online_booking", "ecommerce_manual",
+                 "no_lead_capture", "multi_location"):
+        true_positives = rates[code][0]
+        assert true_positives >= 1, (code, rates[code])
+        assert true_positives < len(PLATFORM_CORPUS), (code, rates[code])
+    # And every code added in this pass earns its row the same way.
+    for code in PLATFORM_NEW_CODES:
+        assert rates[code][0] >= 1, (code, rates[code])
+        assert rates[code][1] == 0 and rates[code][2] == 0, (code, rates[code])
+    print("the platforms this tool actually meets: OK")
+
+
+def test_a_page_nobody_could_read_is_not_a_list_of_faults():
+    """Six pages answered 200, told the crawler nothing, and it said plenty.
+
+    Every rule in the catalogue is an absence — no chat, no markup, nothing asks
+    a visitor for a name — and an absence is only a fact when there was
+    somewhere to look. A Cloudflare bot check, a Dutch consent wall, a Next.js
+    shell, a parked domain, an empty body and a coming-soon splash all present
+    the same way to the rules: no markers anywhere, so all of them fire. Between
+    them those six pages produced thirty-eight sentences about businesses whose
+    home page had never actually been seen, and every one of them was headed for
+    a live email.
+
+    What comes back instead is the reason, in the two keys the Leads table
+    reads. `tech` survives the verdict and the signals do not, and that is the
+    whole distinction: a marker on the page is a positive fact and stays true
+    however little rendered, while every signal is the other kind.
+    """
+    for name, url, html, _gaps, reason in PLATFORM_CORPUS:
+        result = A.audit_from_html({url: html}, url)
+        if not reason:
+            assert result["reachable"] is True, name
+            assert result["unreachable_reason"] == "", (name, result["unreachable_reason"])
+            assert result["unreachable_detail"] == "", name
+            continue
+        assert result["unreachable_reason"] == reason, (name, result["unreachable_reason"])
+        assert result["reachable"] is False, name
+        assert result["gaps"] == [], (name, _codes(result))
+        assert result["opportunity_score"] == 0, name
+        # The sentence the operator reads, and it has to be one.
+        detail = result["unreachable_detail"]
+        assert detail == A.UNREACHABLE_REASONS[reason], (name, detail)
+        assert detail and detail[0].islower() and not detail.endswith("."), (name, detail)
+
+    # A shell is still a Next.js shell, and saying so is not an absence claim.
+    shell = next(h for n, _u, h, _g, _r in PLATFORM_CORPUS if n == "nextjs-shell")
+    read = A.audit_from_html({"https://orbitdental.test/": shell},
+                             "https://orbitdental.test/")
+    assert "nextjs" in read["tech"]["frameworks"], read["tech"]
+
+    # And the model is told what is known rather than what was not found. The
+    # digest used to hand it "no chat | no booking | no crm | no analytics"
+    # about a host that never answered, and the opener was written around that.
+    brief = A.digest(read)
+    assert "UNREADABLE:" in brief, brief
+    for invented in ("no chat", "no booking", "no crm", "no analytics", "TOP GAPS"):
+        assert invented not in brief, (invented, brief)
+    print("a page nobody could read is not a list of faults: OK")
+
+
+def test_an_unreachable_site_says_why():
+    """The operator asked which site is not reachable, and got back "that one".
+
+    `reachable=False` with the reason thrown away is the same answer for a lead
+    that moved to a new domain, one whose certificate expired on Sunday and one
+    that is simply slow, and those three want three different things done about
+    them. The reason is now a pair of keys on the audit — a code to branch on
+    and a sentence to print — and it rides into `audit_json` on the lead, which
+    is where the UI reads it.
+    """
+    cases = {
+        "": "",
+        "dns": "dns",
+        "URLError: <urlopen error [Errno 11001] getaddrinfo failed>": "dns",
+        "timeout": "timeout",
+        "TimeoutError: timed out": "timeout",
+        "ssl": "tls",
+        "SSLCertVerificationError: certificate verify failed": "tls",
+        "refused": "refused",
+        "ConnectionRefusedError: [Errno 111]": "refused",
+        "reset": "reset",
+        "redirect loop": "redirect_loop",
+        "http 404": "http_404",
+        "HTTP 403": "http_403",
+        "http 500": "http_500",
+        "http 503": "http_503",
+        "http 418": "http_error",
+        "content-type": "not_html",
+        "no url": "no_url",
+        "empty response": "empty",
+        "something nobody has a word for": "unreachable",
+    }
+    for error, expected in cases.items():
+        assert A.unreachable_reason(error) == expected, (error, A.unreachable_reason(error))
+    # A status with no error text answers too, which is the shape an HTTPError
+    # reaches `_blank` in.
+    assert A.unreachable_reason("", 404) == "http_404"
+    assert A.unreachable_reason("", 200) == ""
+
+    # Every code in the vocabulary has a sentence, and every sentence is one.
+    for code, sentence in A.UNREACHABLE_REASONS.items():
+        assert sentence and sentence[0].islower(), code
+        assert not sentence.endswith((".", "!", "?")), code
+        assert len(sentence) <= 60, (code, len(sentence))
+        assert A.unreachable_detail(code) == sentence, code
+    assert A.unreachable_detail("nothing anybody wrote down") == ""
+
+    # The whole result, built the way `core.campaign` builds it for a host it
+    # has already paid the connection timeout on twice.
+    dead = A.unreachable_audit("https://gone.test/", "dns")
+    assert dead["reachable"] is False and dead["error"] == "dns"
+    assert dead["unreachable_reason"] == "dns"
+    assert dead["unreachable_detail"] == "the domain name does not resolve"
+    assert dead["gaps"] == [] and dead["opportunity_score"] == 0
+    assert dead["final_url"] == "https://gone.test/"
+    # It has to survive the round trip to the lead, because that is where the
+    # UI reads it from.
+    assert json.loads(json.dumps(dead))["unreachable_reason"] == "dns"
+
+    # And the audit of a live site says nothing of the kind.
+    alive = A.audit_from_html({"https://acmeplumbing.ca/": WORDPRESS_PLUMBER},
+                              "https://acmeplumbing.ca/")
+    assert alive["reachable"] is True
+    assert alive["unreachable_reason"] == "" and alive["unreachable_detail"] == ""
+    print("an unreachable site says why: OK")
+
+
+def test_a_vendor_name_inside_a_longer_host_is_not_that_vendor():
+    """The substring-for-a-structure shape, in the tables rather than the rules.
+
+    Every vendor table answers "there is no such thing on this site" when it
+    finds nothing, so a marker landing inside a longer host is a true finding
+    deleted: `force.com` is the tail of `workforce.com`, and an HR consultancy
+    linking to a rota product was credited with Salesforce, which silenced the
+    one thing actually wrong with its site. `_present` now requires a
+    host-shaped marker to start where a host starts.
+    """
+    assert A._present("https://www.workforce.com/features", "workforce.com") is True
+    assert A._present("https://www.workforce.com/features", "force.com") is False
+    assert A._present("https://acme.force.com/apex/form", ".force.com") is True
+    assert A._present("https://static.wixstatic.com/x", "wixstatic.com") is True
+    assert A._present("https://www.pressy.com/wine", "resy.com") is False
+    assert A._present("https://resy.com/cities/ny", "resy.com") is True
+    # A path or a JavaScript identifier is matched plainly, as it always was.
+    assert A._present("var x=$crisp||[];", "$crisp") is True
+    assert A._present("/wp-content/themes/x", "/wp-content/") is True
+
+    hr = next(h for n, _u, h, _g, _r in PLATFORM_CORPUS if n == "hr-links-workforce")
+    read = A.audit_from_html({"https://northgatepeople.test/": hr},
+                             "https://northgatepeople.test/")
+    assert read["tech"]["crm"] == "", read["tech"]
+    assert "no_crm_signals" in _codes(read), _codes(read)
+
+    # And the other half of the same lesson: a bare vendor name in a services
+    # list is not a storefront. It cost two claims at once, because a shop is
+    # excused from publishing prices.
+    agency = next(h for n, _u, h, _g, _r in PLATFORM_CORPUS
+                  if n == "agency-mentions-woocommerce")
+    built = A.audit_from_html({"https://reddeerdigital.test/": agency},
+                              "https://reddeerdigital.test/")
+    assert built["tech"]["ecommerce"] == "", built["tech"]
+    assert "ecommerce_manual" not in _codes(built), _codes(built)
+    assert "price_opaque" in _codes(built), _codes(built)
+
+    shop = next(h for n, _u, h, _g, _r in PLATFORM_CORPUS if n == "woocommerce-bakery")
+    real = A.audit_from_html({"https://proofbakehouse.test/": shop},
+                             "https://proofbakehouse.test/")
+    assert real["tech"]["ecommerce"] == "woocommerce", real["tech"]
+    print("a vendor name inside a longer host is not that vendor: OK")
+
+
+def test_a_printed_number_survives_its_own_brackets():
+    """The email says out loud that there is no number to tap. There was one.
+
+    `contact_form_only` claims the form is the only way in, and all four phone
+    patterns died on a bracketed trunk code — `(07) 3555 0177`, which is how
+    Australia and most of Europe print an area code. The first pattern wants
+    three digits inside the bracket, and the two loose ones run into the `)`
+    and stop.
+    """
+    printed = ("(07) 3555 0177", "(0161) 555 0134", "(905) 555-0134",
+               "+44 20 7946 0102", "04 78 55 44 33", "920 55 10 40",
+               "(+61) 2 9374 4000")
+    for number in printed:
+        assert A._phone_present("Call us on %s today" % number), number
+    for not_a_number in ("2026 2025 2024", "Suite 200", "(12) 34"):
+        assert not A._phone_present(not_a_number), not_a_number
+
+    vet = next(h for n, _u, h, _g, _r in PLATFORM_CORPUS if n == "cloudflare-real-site")
+    read = A.audit_from_html({"https://ashgrovevets.test/": vet},
+                             "https://ashgrovevets.test/")
+    assert read["signals"]["has_phone"] is True, read["signals"]
+    assert "contact_form_only" not in _codes(read), _codes(read)
+    print("a printed number survives its own brackets: OK")
+
+
 if __name__ == "__main__":
     test_catalogue_services_are_real()
     test_subject_phrases_are_neutral()
@@ -2198,4 +3263,9 @@ if __name__ == "__main__":
     test_a_trade_books_times_whether_or_not_it_says_so()
     test_a_phrase_is_matched_on_its_words_and_not_on_its_punctuation()
     test_a_threshold_and_a_vendor_list_are_not_the_fact_they_stand_in_for()
+    test_the_platforms_this_tool_actually_meets()
+    test_a_page_nobody_could_read_is_not_a_list_of_faults()
+    test_an_unreachable_site_says_why()
+    test_a_vendor_name_inside_a_longer_host_is_not_that_vendor()
+    test_a_printed_number_survives_its_own_brackets()
     print("\nALL AUDIT TESTS PASSED")

@@ -150,12 +150,19 @@ def test_catalogue():
     print("catalogue: OK")
 
 
-# The gap codes the catalogue has no honest answer for. Page speed and a missing
-# mobile layout are front-end work; the seller automates the business behind the
-# site and does not build sites. Mapping them anyway is what produced "a slow
-# site, so we build approval systems", so they are absent from `GAP_SERVICES` on
-# purpose and `core.audit` records them with no services of their own.
-NO_OFFER_CODES = frozenset({"slow_site", "no_mobile"})
+# The gap codes the catalogue has no honest answer for. Page speed, a missing
+# mobile layout and an expired certificate are hosting and front-end work; the
+# seller automates the business behind the site and does not build sites.
+# Mapping them anyway is what produced "a slow site, so we build approval
+# systems", so they are absent from `GAP_SERVICES` on purpose and `core.audit`
+# records them with no services of their own.
+#
+# (Superseded: this set read `{"slow_site", "no_mobile"}` until `core.audit`
+# added `no_ssl`. Widening it is not a weakening — every assertion below still
+# demands that a code in this set contributes no offer, never leads an email,
+# and is dropped whole from the copy. `no_ssl` joins them under that rule, not
+# beside it.)
+NO_OFFER_CODES = frozenset({"slow_site", "no_mobile", "no_ssl"})
 
 
 def test_gap_services():
@@ -165,6 +172,11 @@ def test_gap_services():
         "careers_manual", "ecommerce_manual", "pdf_forms", "multi_location",
         "no_social_presence", "stale_site", "slow_site", "no_mobile", "no_schema",
         "price_opaque",
+        # Added with the audit's second sweep over the vendor tables: what
+        # happens to an enquiry that arrives as an email, the green button a
+        # person answers by hand, a page printing praise that routes nobody to
+        # leave any, and a site a browser marks as not secure.
+        "email_only_intake", "whatsapp_manual", "no_review_capture", "no_ssl",
     }
     assert NO_OFFER_CODES < spec_codes
     assert spec_codes - NO_OFFER_CODES == set(T.GAP_SERVICES), \
@@ -221,7 +233,11 @@ def test_no_catalogue_heading_is_offered_to_a_prospect():
     cases = [(code, dict(entry, code=code, evidence="the page says so"))
              for code, entry in A.GAP_CATALOGUE.items()]
     cases.append(("<no gaps at all>", None))
-    assert len(cases) == 19, len(cases)
+    # Every code in the catalogue plus the no-gap case. (Superseded: 19 while
+    # the catalogue held eighteen codes; four were added with the audit's
+    # second sweep. The count is here so a new gap cannot be added without a
+    # heading check being run against it.)
+    assert len(cases) == len(A.GAP_CATALOGUE) + 1 == 23, len(cases)
 
     for code, gap in cases:
         ctx = T.build_context(LEAD, {"gaps": [gap]} if gap else {}, AI, PROFILE, SETTINGS)
@@ -766,8 +782,13 @@ def test_every_gap_reads_as_a_reason_in_the_question_template():
     way through: a blog that has gone quiet."
 
     Why the question is worth asking is not a finding about this reader, and it
-    no longer claims to be one. All eighteen are rendered here."""
-    assert len(A.GAP_CATALOGUE) == 18, len(A.GAP_CATALOGUE)
+    no longer claims to be one. Every code in the catalogue is rendered here.
+
+    (Superseded: this read `== 18` while the catalogue held eighteen codes. The
+    number moved to 22 when the audit's second sweep added four; the assertion
+    is unchanged in what it demands, which is that a code cannot join the
+    catalogue without being rendered through this template.)"""
+    assert len(A.GAP_CATALOGUE) == 22, len(A.GAP_CATALOGUE)
     seen = 0
     for code, spec in A.GAP_CATALOGUE.items():
         gap = dict(spec, code=code, evidence="what the crawl saw")
@@ -799,7 +820,7 @@ def test_every_gap_reads_as_a_reason_in_the_question_template():
         assert len(finding) == 1, (code, body)
         assert finding[0].endswith(ctx["gap_1"] + "."), (code, finding[0])
         assert finding[0] != reason[0], code
-    assert seen == 18, seen
+    assert seen == len(A.GAP_CATALOGUE) == 22, seen
 
 
 def test_a_doubled_greeting_is_stripped_however_many_deep():

@@ -182,6 +182,70 @@ def _contrast(one: str, two: str) -> float:
 _UNPAINTED = "#000000"
 
 
+@contextlib.contextmanager
+def _no_review_dialog(accept: bool = True):
+    """`_on_plan_ready` without the modal it opens, for an offscreen run.
+
+    Not a weakening of anything: Qt 5.15's offscreen platform has no event loop
+    a modal can return from, so `_CampaignReviewDialog.exec_()` never comes
+    back and the whole suite hangs on the call. That is not hypothetical — it
+    is what `tests/test_outreach_screen.py` did before this existed, and a run
+    of the file stopped dead at the second `_on_plan_ready` below.
+
+    The dialog itself is driven for real, with a platform and a click, by
+    `tests/test_modals.py::test_campaign_review_dialog_shows_metrics_and_can_be_accepted`.
+    That is the rule the whole file follows: modals are somebody else's process.
+    """
+    from PyQt5.QtWidgets import QDialog
+
+    class _Stub(QDialog):
+        opened = []
+
+        def __init__(self, plan, parent=None):
+            super().__init__(parent)
+            _Stub.opened.append(plan)
+
+        def exec_(self):
+            return QDialog.Accepted if accept else QDialog.Rejected
+
+    real = SO._CampaignReviewDialog
+    SO._CampaignReviewDialog = _Stub
+    try:
+        yield _Stub.opened
+    finally:
+        SO._CampaignReviewDialog = real
+        _Stub.opened = []
+
+
+def _audit(error: str = "", status: int = 0, gap: str = "",
+           reason: str = None) -> dict:
+    """One `core.audit` result, in the shape the crawl writes today.
+
+    Built through `core.audit.unreachable_reason` rather than with the codes
+    spelled out, because that is what `core.audit._blank` does: a test that
+    hard-coded the mapping would keep passing after the crawl changed it, which
+    is the one thing these assertions exist to catch.
+
+    `reason` forces a code directly — for the states that answer 200 and still
+    tell the crawl nothing, where there is no error string to derive it from.
+    """
+    from core import audit as AU
+
+    code = reason if reason is not None else AU.unreachable_reason(error, status)
+    return {
+        "url": "https://example.test",
+        "final_url": "" if code else "https://example.test",
+        "reachable": not code, "status": status,
+        "load_ms": 0, "pages": [], "page_count": 0, "title": "", "description": "",
+        "h1": "", "brand": "", "tech": {}, "services": [],
+        "signals": {"has_email": False},
+        "gaps": [{"key": "g", "title": gap, "severity": 3}] if gap else [],
+        "opportunity_score": 61 if gap else 0, "error": error,
+        "unreachable_reason": code,
+        "unreachable_detail": AU.unreachable_detail(code),
+    }
+
+
 def _accent(widget) -> str:
     """The colour `widget` paints most, ignoring the unpainted ground.
 
@@ -505,11 +569,57 @@ def test_plan_worker_stops_co_operatively():
 
 
 def test_a_cancelled_plan_says_so():
+    """The same two assertions, with the review dialog stubbed out.
+
+    The second `_on_plan_ready` opens `_CampaignReviewDialog`, and an offscreen
+    `exec_()` never returns — so this call used to hang the process and take
+    the whole file with it. `_no_review_dialog` is why it does not; the dialog
+    is driven for real in `tests/test_modals.py`.
+    """
     screen = _screen()
-    screen._on_plan_ready({"queued": 4, "days": 1, "cancelled": True})
-    assert "Stopped before" in screen.plan_summary.text()
-    screen._on_plan_ready({"queued": 4, "days": 1})
-    assert "Stopped before" not in screen.plan_summary.text()
+    with _no_review_dialog() as opened:
+        screen._on_plan_ready({"queued": 4, "days": 1, "cancelled": True})
+        assert "Stopped before" in screen.plan_summary.text()
+        assert not opened, "a cancelled plan must not ask for approval"
+
+        screen._on_plan_ready({"queued": 4, "days": 1})
+        assert "Stopped before" not in screen.plan_summary.text()
+        assert len(opened) == 1, "a finished plan is reviewed before it counts"
+
+
+def test_a_plan_that_queued_nothing_does_not_open_a_review():
+    """A dialog whose whole content is six zeros is a click for nothing.
+
+    The card's own warning already says why nothing was queued, and it stays on
+    screen where a dismissed dialog does not.
+    """
+    screen = _screen()
+    with _no_review_dialog() as opened:
+        screen._on_plan_ready({"queued": 0, "skipped": 3,
+                               "skip_reasons": {"already contacted": 3}})
+        assert not opened
+    assert screen.plan_warning.isVisible() or screen.plan_summary.text()
+
+
+def test_a_refused_plan_takes_its_messages_back_out():
+    screen = _screen()
+    campaign = DB.create_campaign(screen.conn, "refused", "gap_direct", {}, {})
+    DB.queue_message(screen.conn, {"campaign_id": campaign,
+                                   "lead_id": screen._leads[0]["id"], "step": 0,
+                                   "subject": "s", "body_text": "b",
+                                   "scheduled_at": 1.0})
+    screen._campaign_id = campaign
+    with _no_review_dialog(accept=False):
+        screen._on_plan_ready({"queued": 1, "days": 1})
+    assert SO._int_of(DB.campaign_stats(screen.conn, campaign).get("total")) == 0
+    assert SO._text_of(DB.get_campaign(screen.conn, campaign).get("status")) == "failed"
+    # And the Sending tab says which of the two empty queues this is. "Nothing
+    # left in this campaign's queue" is what a finished campaign says, and this
+    # one never started.
+    screen._campaign_id = campaign
+    head, why = screen._send_health()
+    assert "discarded" in head, head
+    assert "Prepare a new one" in why, why
 
 
 # ── R14: a container inside a card must not punch through it ─────────────────
@@ -1642,6 +1752,535 @@ def test_the_query_parser_reads_what_the_user_typed():
     # Not a field, so not a query — a time is a string like any other.
     assert SO._parse_query("9:30") == [("", "9:30")]
     assert SO._parse_query("   ") == []
+
+
+# ── L3-A: which site is not reachable, and why ───────────────────────────
+
+def test_a_crawl_that_failed_is_read_off_the_keys_the_audit_writes():
+    """The crawl's own `unreachable_reason`, not a second opinion about `error`.
+
+    `core.audit` classifies the failure and `core.enrich` writes the words it
+    reads, so a third vocabulary here would be a third dialect for one fact.
+    What this screen adds is the register a column needs — four words to scan
+    down — and the sentence beside it comes back from the crawl unedited.
+    """
+    from core import audit as AU
+
+    assert SO._site_failure(_audit(gap="No online booking"))[0] == ""
+    assert SO._site_failure({})[0] == "", "nobody has crawled this one"
+
+    words, detail, raw = SO._site_failure(_audit("HTTP 403", status=403))
+    assert words == SO._SITE_WORDS["http_403"]
+    assert detail == AU.unreachable_detail("http_403")
+    assert raw == "HTTP 403", "the crawl's own line is kept whole"
+
+    # Every code the crawl can produce has words of its own, and no two of the
+    # ones an operator actually meets read the same.
+    assert set(AU.UNREACHABLE_REASONS) <= set(SO._SITE_WORDS), (
+        "the crawl grew a reason this table has no words for: %s"
+        % sorted(set(AU.UNREACHABLE_REASONS) - set(SO._SITE_WORDS)))
+    assert len(set(SO._SITE_WORDS.values())) >= len(SO._SITE_WORDS) - 2
+
+    for error, code in (
+        ("URLError: <urlopen error [Errno 11001] getaddrinfo failed>", "dns"),
+        ("timeout: The read operation timed out", "timeout"),
+        ("SSLCertVerificationError: certificate has expired", "tls"),
+        ("ConnectionRefusedError: [WinError 10061] refused", "refused"),
+        ("empty response", "empty"),
+        ("no url", "no_url"),
+        ("Something nobody has seen", "unreachable"),
+    ):
+        assert SO._site_failure(_audit(error))[0] == SO._SITE_WORDS[code], error
+
+    # A page that answered 200 and still told the crawl nothing. There is no
+    # error string to read here at all, which is why the reason is the key.
+    for code in ("challenge", "parked", "js_only", "cookie_wall"):
+        blob = _audit(reason=code)
+        assert SO._site_failure(blob)[0] == SO._SITE_WORDS[code], code
+
+    # A code this build has never heard of is spelled out rather than flattened
+    # back into "unreachable": a new reason from the crawl is worth more on
+    # screen than a guess is.
+    made_up = SO._site_failure({"reachable": False,
+                                "unreachable_reason": "geo_blocked"})
+    assert made_up[0] == "geo blocked", made_up
+
+
+def test_a_store_crawled_before_the_reason_existed_still_reads():
+    """A blob with no `unreachable_reason` goes through the crawl's own reader.
+
+    Not through a copy of it here. `core.audit.unreachable_reason` is the
+    function that filled the key in the first place, so a lead crawled last
+    month lands in the same bucket as one crawled today.
+    """
+    assert SO._site_failure({"error": "timeout: timed out"})[0] == \
+        SO._SITE_WORDS["timeout"]
+    assert SO._site_failure({"reachable": False, "status": 404})[0] == \
+        SO._SITE_WORDS["http_404"]
+    # Silence is not evidence. A hand-written blob that never mentions
+    # `reachable` must not paint "unreachable" over every row in an old store.
+    assert SO._site_failure({"gaps": [{"title": "No booking"}]})[0] == ""
+
+
+def test_a_site_that_answered_is_not_reported_as_a_failure():
+    """A crawl that read pages and still logged a note is not an outage.
+
+    The reason is the key and the error line is not: a sub-page that 404ed on a
+    site whose home page read perfectly well must not paint the row as
+    unreachable, and it is the difference between a note about the crawl and a
+    site nothing could be learned from.
+    """
+    ok = dict(_audit(gap="No online booking"), error="one sub-page 404ed")
+    words, _detail, raw = SO._site_failure(ok)
+    assert words == ""
+    assert raw == "one sub-page 404ed", "the line is still kept"
+
+
+def test_the_leads_table_says_which_site_failed_and_how():
+    """Four unreachable leads, four different reasons, all on screen.
+
+    Before this pass every one of them painted the same cell — "form letter —
+    the site could not be reached" — so the table knew the answer to "which
+    site is not reachable?" and would not give it.
+    """
+    screen = _screen()
+    app = _app()
+    conn = screen.conn
+    cases = {
+        "L3 Timeout": _audit("timeout: The read operation timed out"),
+        "L3 Blocked": _audit("HTTP 403", status=403),
+        "L3 NoDns": _audit("URLError: <urlopen error getaddrinfo failed>"),
+        "L3 Fine": _audit(gap="No online booking"),
+    }
+    for name, blob in cases.items():
+        lead_id = DB.upsert_lead(conn, {"email": "%s@l3.test" % name.split()[1].lower(),
+                                        "name": name, "website": "https://l3.test",
+                                        "status": "audited", "source": "test"})
+        DB.set_lead_audit(conn, lead_id, blob, {})
+    try:
+        screen._reload_leads()
+        app.processEvents()
+        painted = {}
+        for row in range(screen.lead_table.rowCount()):
+            lead = screen._lead_at(row)
+            if SO._text_of(lead.get("name")).startswith("L3 "):
+                painted[lead["name"]] = screen._site_text(lead)[0]
+        assert painted == {"L3 Timeout": SO._SITE_WORDS["timeout"],
+                           "L3 Blocked": SO._SITE_WORDS["http_403"],
+                           "L3 NoDns": SO._SITE_WORDS["dns"],
+                           "L3 Fine": ""}, painted
+        assert len(set(painted.values())) == 4, (
+            "four different failures must not read as one: %s" % painted)
+
+        # And the Headline gap column says it in prose rather than repeating
+        # the one sentence it used to give all of them.
+        gaps = {name: screen._gap_text(lead)[0]
+                for row in range(screen.lead_table.rowCount())
+                for lead in [screen._lead_at(row)]
+                for name in [SO._text_of(lead.get("name"))]
+                if name.startswith("L3 ")}
+        from core import audit as AU
+        assert gaps["L3 Timeout"] == ("form letter — "
+                                      + AU.unreachable_detail("timeout")), gaps
+        assert "could not be reached" not in gaps["L3 NoDns"], gaps
+    finally:
+        for name in cases:
+            conn.execute("DELETE FROM leads WHERE name = ?", (name,))
+        conn.commit()
+        screen._reload_leads()
+        app.processEvents()
+
+
+def test_unreachable_is_one_click_and_survives_as_a_saved_view():
+    screen = _screen()
+    app = _app()
+    conn = screen.conn
+    lead_id = DB.upsert_lead(conn, {"email": "down@l3.test", "name": "L3 Down",
+                                    "website": "https://down.l3.test",
+                                    "status": "audited", "source": "test"})
+    DB.set_lead_audit(conn, lead_id, _audit("timeout: timed out"), {})
+    try:
+        screen._reload_leads()
+        app.processEvents()
+        index = SO._STATUS_KEYS.index("~failed")
+        assert SO._STATUS_FILTERS[index][0] == "Unreachable sites", (
+            "the filter has to say what it selects")
+        screen.status_filter.setCurrentIndex(index)
+        app.processEvents()
+        shown = {SO._text_of(screen._lead_at(row).get("name"))
+                 for row in range(screen.lead_table.rowCount())
+                 if not screen.lead_table.isRowHidden(row)}
+        assert shown == {"L3 Down"}, shown
+
+        # A view is a filter under a name, and the key it stores is the one
+        # every view written before this pass already carries.
+        view = screen._current_view("unreachable")
+        assert view["status"] == "~failed"
+        screen.status_filter.setCurrentIndex(0)
+        app.processEvents()
+        screen._set_view(view)
+        app.processEvents()
+        assert screen._wanted_status() == "~failed"
+        assert "unreachable sites" in SO._view_sentence(view).lower()
+    finally:
+        screen.status_filter.setCurrentIndex(0)
+        conn.execute("DELETE FROM leads WHERE name = 'L3 Down'")
+        conn.commit()
+        screen._reload_leads()
+        app.processEvents()
+
+
+def test_a_new_column_arrives_switched_on_for_a_file_that_predates_it():
+    """A column nobody was offered is not a column anybody switched off.
+
+    `lead_views.json` stores the columns that are *shown*, so a file listing
+    the seven keys this screen used to have is indistinguishable from a user
+    who turned the eighth off — unless the file also says which keys it could
+    have named. Without `known`, adding Site would have hidden it for every
+    user who has ever opened the Leads tab.
+    """
+    old_file = {"columns": list(SO._KNOWN_BEFORE)}
+    fields = SO._fields_wanted(old_file, range(len(SO._LEAD_COLUMNS)))
+    assert SO._COL_SITE in fields, "a field the file predates must arrive on"
+
+    # A user of this build who really did switch it off keeps it off.
+    chosen = [key for key in SO._FIELD_KEYS if key != "site"]
+    kept = SO._fields_wanted({"columns": chosen, "known": list(SO._FIELD_KEYS)},
+                             range(len(SO._LEAD_COLUMNS)))
+    assert SO._COL_SITE not in kept
+    assert SO._COL_NAME in kept, "Business is pinned whatever the file says"
+
+
+def test_a_retry_that_changed_nothing_says_so():
+    """The one outcome a retry must never report as success.
+
+    A crawl that comes back with the same four failures leaves the table
+    looking exactly as it did, so a screen that only says "Audit finished"
+    hands the user four form letters and a reason to believe they are not.
+    """
+    screen = _screen()
+    app = _app()
+    conn = screen.conn
+    ids = []
+    for name, blob in (("L3 R1", _audit("timeout: timed out")),
+                       ("L3 R2", _audit("timeout: timed out")),
+                       ("L3 R3", _audit("HTTP 403", status=403))):
+        lead_id = DB.upsert_lead(conn, {"email": "%s@l3.test" % name.replace(" ", ""),
+                                        "name": name, "website": "https://l3.test",
+                                        "status": "audited", "source": "test"})
+        DB.set_lead_audit(conn, lead_id, blob, {})
+        ids.append(lead_id)
+    try:
+        screen._reload_leads()
+        app.processEvents()
+
+        # Nothing moved.
+        screen._audit_retry = True
+        screen._audit_before = {lead_id: screen._site_text(
+            next(l for l in screen._leads if l["id"] == lead_id))[0]
+            for lead_id in ids}
+        said = screen._audit_report()
+        assert "nothing changed" in said.lower(), said
+        assert "2 %s" % SO._SITE_WORDS["timeout"] in said, said
+        assert "1 %s" % SO._SITE_WORDS["http_403"] in said, said
+
+        # One of them answers this time.
+        DB.set_lead_audit(conn, ids[0], _audit(gap="No online booking"), {})
+        screen._reload_leads()
+        screen._audit_retry = True
+        screen._audit_before = {ids[0]: SO._SITE_WORDS["timeout"],
+                                ids[1]: SO._SITE_WORDS["timeout"],
+                                ids[2]: SO._SITE_WORDS["http_403"]}
+        said = screen._audit_report()
+        assert "1 answered this time" in said, said
+        assert "2 still unreachable" in said, said
+
+        # A plain run reports the same fact in its own words.
+        screen._audit_retry = False
+        screen._audit_before = {ids[1]: SO._SITE_WORDS["timeout"],
+                                ids[2]: SO._SITE_WORDS["http_403"]}
+        said = screen._audit_report()
+        assert said.startswith("Audited 2 sites"), said
+        assert "2 could not be read" in said, said
+    finally:
+        conn.execute("DELETE FROM leads WHERE name LIKE 'L3 R%'")
+        conn.commit()
+        screen._reload_leads()
+        app.processEvents()
+
+
+def test_the_campaign_card_counts_the_form_letters_before_prepare_is_pressed():
+    screen = _screen()
+    app = _app()
+    conn = screen.conn
+    for name, blob in (("L3 P1", _audit("timeout: timed out")),
+                       ("L3 P2", _audit("timeout: timed out"))):
+        lead_id = DB.upsert_lead(conn, {"email": "%s@l3.test" % name.replace(" ", ""),
+                                        "name": name, "website": "https://l3.test",
+                                        "status": "audited", "source": "test"})
+        DB.set_lead_audit(conn, lead_id, blob, {})
+    try:
+        screen._reload_leads()
+        screen._goto_tab(1)
+        app.processEvents()
+        said = screen.plan_targets.text()
+        assert "have a site nothing could read" in said, said
+        assert "form letter" in said, said
+    finally:
+        screen._goto_tab(0)
+        conn.execute("DELETE FROM leads WHERE name LIKE 'L3 P%'")
+        conn.commit()
+        screen._reload_leads()
+        app.processEvents()
+
+
+# ── L3-B: the Sending tab must never look dead ───────────────────────────
+
+class _FakeWorker:
+    """A run, for a screen that is only being asked what it would say."""
+
+    def __init__(self, dry: bool = True):
+        self.dry_run = dry
+
+    def isRunning(self):
+        return True
+
+    def stop(self):
+        self.stopped = True
+
+
+def _queued(screen, count: int = 2, when: float = 1.0) -> int:
+    screen.conn.execute("DELETE FROM messages")
+    screen.conn.execute("DELETE FROM sends")
+    screen.conn.commit()
+    campaign = DB.create_campaign(screen.conn, "l3-states", "gap_direct", {},
+                                  screen.settings)
+    for index in range(count):
+        DB.queue_message(screen.conn, {
+            "campaign_id": campaign, "lead_id": screen._leads[index]["id"],
+            "step": 0, "subject": "s", "body_text": "b",
+            "account_email": "rota@example.com", "scheduled_at": when})
+    screen._campaign_id = campaign
+    return campaign
+
+
+@contextlib.contextmanager
+def _sendable(screen):
+    """One Gmail account, an open window, and the state put back afterwards."""
+    saved = dict(screen.settings)
+    screen.settings["smtp_accounts"] = [{"email": "rota@example.com",
+                                         "app_password": "x" * 16,
+                                         "enabled": True, "daily_cap": 20}]
+    screen.settings["send_days"] = [0, 1, 2, 3, 4, 5, 6]
+    screen.settings["send_start_hour"] = 0
+    screen.settings["send_end_hour"] = 23
+    screen.settings["dry_run"] = True
+    screen._benched_at = 0.0
+    try:
+        yield
+    finally:
+        screen.settings = saved
+        screen._sending = False
+        screen._paused = False
+        screen._stopping = False
+        screen.send_worker = None
+        screen._benched_at = 0.0
+        screen.conn.execute("DELETE FROM messages")
+        screen.conn.execute("DELETE FROM sends")
+        screen.conn.execute("DELETE FROM events")
+        screen.conn.commit()
+
+
+def test_every_state_the_sending_tab_can_be_in_says_what_is_happening():
+    """Eighteen states, driven one at a time, each read off the screen.
+
+    The rule is the one the function's docstring states: a headline that
+    describes movement, or a reason that names what is stopping it and when it
+    changes. Three of these used to fail it outright — a run with no account
+    configured said "Every account has hit today's cap", an account benched for
+    the day by an AUTH failure was counted as one with room, and a campaign the
+    run had stopped invited the user to press Start again.
+    """
+    screen = _screen()
+    with _sendable(screen):
+        screen._campaign_id = 0
+        head, why = screen._send_health()
+        assert head == "No campaign yet" and "Prepare one" in why
+
+        campaign = _queued(screen)
+        head, why = screen._send_health()
+        assert "Not sending" in head and "Start sending" in why, (head, why)
+
+        # Running, and every one of these is a moving-or-explained pair.
+        screen._sending = True
+        screen.send_worker = _FakeWorker()
+        head, why = screen._send_health()
+        assert head.startswith("Rehearsing"), head
+
+        screen._paused = True
+        assert screen._send_health()[0].startswith("Paused after")
+        screen._paused = False
+
+        screen._stopping = True
+        head, why = screen._send_health()
+        assert head.startswith("Stopping"), head
+        assert "in flight" in why, why
+        screen._stopping = False
+
+        screen.settings["send_start_hour"] = 3
+        screen.settings["send_end_hour"] = 4
+        head, why = screen._send_health()
+        assert head.startswith("Holding") and "restarts at" in why, (head, why)
+        screen.settings["send_start_hour"] = 0
+        screen.settings["send_end_hour"] = 23
+
+        # No account at all, while running. This is the sentence that used to
+        # be about a cap on a set with nothing in it.
+        accounts = screen.settings["smtp_accounts"]
+        screen.settings["smtp_accounts"] = []
+        head, why = screen._send_health()
+        assert head.startswith("Holding"), head
+        assert "no Gmail account" in why, why
+        assert "cap" not in why, "there is no account to have a cap"
+        screen.settings["smtp_accounts"] = accounts
+
+        # Benched for the day by the run itself. The worker writes the event
+        # and then logs it at error level, and that line is what spends the
+        # two-second memo on `_benched_today` — so the status line and the
+        # Accounts card say "stopped for today" on the same tick the log does
+        # rather than up to two seconds behind it.
+        screen._benched_at = time.time()
+        DB.log_event(screen.conn, "account_stopped",
+                     "rota@example.com: AUTH: 535 bad credentials")
+        screen._append_log("rota@example.com stopped for today — AUTH", "error")
+        assert screen._benched_at == 0.0, (
+            "an error line did not spend the benched-accounts memo")
+        head, why = screen._send_health()
+        assert head.startswith("Holding"), head
+        assert "rota@example.com" in why and "refused" in why, why
+        screen.conn.execute("DELETE FROM events")
+        screen.conn.commit()
+        screen._benched_at = 0.0
+
+        # Waiting out the pacing gap: awake, free, and nothing due yet.
+        screen.conn.execute("UPDATE messages SET scheduled_at = ?",
+                            (time.time() + 300,))
+        screen.conn.commit()
+        head, why = screen._send_health()
+        assert "next at" in head, head
+        assert "gap between messages" in why, why
+        screen.conn.execute("UPDATE messages SET scheduled_at = 1.0")
+        screen.conn.commit()
+
+        screen._sending = False
+        screen.send_worker = None
+
+        # Every account at its cap is not the same as no account.
+        for _ in range(40):
+            DB.record_send(screen.conn, "rota@example.com", time.time())
+        head, why = screen._send_health()
+        assert "cap" in head and "midnight" in why, (head, why)
+        screen.conn.execute("DELETE FROM sends")
+        screen.conn.commit()
+
+        # The run stopped itself. Start would only stop again.
+        DB.set_campaign_status(screen.conn, campaign, "stopped")
+        head, why = screen._send_health()
+        assert head.startswith("Stopped"), head
+        assert "no account left" in why, why
+        DB.set_campaign_status(screen.conn, campaign, "scheduled")
+
+        # Queued past the horizon `_next_due_ts` looks over. The old branch
+        # blamed the suppression list without ever counting it.
+        screen.conn.execute("UPDATE messages SET scheduled_at = ?",
+                            (time.time() + 400 * 86400,))
+        screen.conn.commit()
+        head, why = screen._send_health()
+        assert head.startswith("Stalled"), head
+        assert "suppressed" not in why, "nothing here is suppressed: %s" % why
+        assert "due inside the next year" in why, why
+
+
+def test_stop_keeps_saying_it_is_stopping():
+    """The tick used to overwrite the one sentence Stop wrote.
+
+    `_refresh_send_controls` runs once a second off `_on_tick`, so the label
+    `_on_stop_clicked` set lived for under a second and the screen went back to
+    reporting a run that was on its way down as one that was sending.
+    """
+    screen = _screen()
+    app = _app()
+    with _sendable(screen):
+        _queued(screen)
+        screen._sending = True
+        screen.send_worker = _FakeWorker()
+        screen._goto_tab(2)
+        app.processEvents()
+
+        screen._on_stop_clicked()
+        assert "Stopping" in screen.send_status.text()
+        assert not screen.stop_btn.isEnabled()
+        assert not screen.pause_btn.isEnabled()
+
+        screen._on_tick()
+        app.processEvents()
+        assert "Stopping" in screen.send_status.text(), (
+            "one tick put back the sentence Stop replaced")
+        assert not screen.stop_btn.isEnabled(), (
+            "one tick re-armed Stop on a run that is already stopping")
+
+        screen._on_send_done()
+        assert not screen._stopping
+
+
+def test_send_now_says_why_it_cannot_rather_than_waiting_to_be_pressed():
+    """The one control on the tab nothing ever disabled.
+
+    It sat lit over a campaign that did not exist, promising to ignore the
+    sending window, and answered the press with a toast — so the screen's
+    answer to "why did nothing happen" arrived only after the click and only
+    for as long as a toast lives.
+    """
+    screen = _screen()
+    app = _app()
+    with _sendable(screen):
+        screen._campaign_id = 0
+        screen._refresh_send_controls()
+        app.processEvents()
+        assert not screen.send_now_btn.isEnabled()
+        assert "no campaign" in screen.send_now_btn.toolTip().lower()
+
+        _queued(screen, 2)
+        screen._refresh_send_controls()
+        app.processEvents()
+        assert screen.send_now_btn.isEnabled()
+        assert "Daily caps still apply" in screen.send_now_btn.toolTip()
+
+        for _ in range(40):
+            DB.record_send(screen.conn, "rota@example.com", time.time())
+        screen._refresh_send_controls()
+        app.processEvents()
+        assert not screen.send_now_btn.isEnabled()
+        assert "allowance for today" in screen.send_now_btn.toolTip()
+
+
+def test_the_shell_line_reports_the_run_the_sending_tab_reports():
+    """A rehearsal writes `rehearsed` and never `sent`.
+
+    The bar is visible from every screen, and it counted `sent` — so a dry run
+    reported "Sending — 0 of 500" for the whole of the one operation it was
+    there to report on, which is the frozen number `_send_health` was fixed for
+    one level down.
+    """
+    screen = _screen()
+    with _sendable(screen):
+        _queued(screen, 2)
+        screen._sending = True
+        screen.send_worker = _FakeWorker(dry=True)
+        screen._context_line = "!"
+        screen._publish_state()
+        assert screen._context_line == screen._send_health()[0]
+        assert screen._context_line.startswith("Rehearsing"), screen._context_line
 
 
 def _shown(screen, needle) -> set:

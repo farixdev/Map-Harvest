@@ -821,16 +821,37 @@ def sent_today(conn, account_email: str, tz, *, now_ts: float = 0.0) -> int:
                    (_email(account_email), start))
 
 
+def recent_sends(conn, account_email: str, *, since_ts: float) -> list[float]:
+    """This account's send times at or after `since_ts`, ascending.
+
+    A cap check only needs "how many", which is what `sent_last_hour` below
+    returns. A queue *held* by that cap needs the other half — when it clears —
+    and a count cannot say it: the answer is the cap-th most recent send plus
+    an hour. Without it the send loop could only guess a whole hour it did not
+    owe, or call the day spent and push the backlog to tomorrow.
+
+    The window is bounded by the hourly cap in every caller, so this is a
+    handful of rows off `idx_sends_account_ts` and not a scan.
+    """
+    return [_float(row.get("ts")) for row in _query(
+        conn, "SELECT ts FROM sends WHERE account_email = ? AND ts >= ? ORDER BY ts",
+        (_email(account_email), _float(since_ts)))]
+
+
 def sent_last_hour(conn, account_email: str, *, now_ts: float = 0.0) -> int:
     """Sends in the trailing 60 minutes.
 
     A rolling window is correct here where it is wrong for the daily count: the
     hourly cap exists to flatten bursts, and nothing about it resets on a clock
     hour.
+
+    Counted off `recent_sends` rather than by its own `COUNT(*)` so that "how
+    many are in the hour" and "when does the hour free" can never disagree
+    about which sends are in it — one of them deciding to hold the queue while
+    the other says it may go is a loop that never settles.
     """
     now = _float(now_ts) or time.time()
-    return _scalar(conn, "SELECT COUNT(*) FROM sends WHERE account_email = ? AND ts >= ?",
-                   (_email(account_email), now - _HOUR_SEC))
+    return len(recent_sends(conn, account_email, since_ts=now - _HOUR_SEC))
 
 
 # ── Events ───────────────────────────────────────────────────────────────────

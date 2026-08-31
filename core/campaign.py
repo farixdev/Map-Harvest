@@ -466,8 +466,14 @@ def audit_lead(lead: dict, *, settings: dict, ai=None, profile: dict | None = No
             # The enricher has already paid the connection timeout — twice, for
             # an https host it retried over plain http. Across five hundred
             # leads a third dead wait each is minutes of nothing.
-            audit = _audit.audit_from_html({}, site.get("final_url") or website)
-            audit["error"] = _text(site.get("error")) or "unreachable"
+            #
+            # Built through `unreachable_audit` rather than from an empty page
+            # dict, because the reason is the whole point: it is what the Leads
+            # table shows the operator, and `audit_from_html({}, url)` had
+            # nowhere to put it.
+            landed = _text(site.get("final_url")) or website
+            audit = _audit.unreachable_audit(
+                landed, _text(site.get("error")) or "unreachable", final_url=landed)
     except Exception:
         return {}, {}
 
@@ -1115,6 +1121,19 @@ def campaign_start_day(conn, campaign_id: int, settings: dict, now: float = 0.0)
 def release_now(conn, campaign_id: int, limit: int = 0) -> int:
     """Bring queued messages forward so they are due immediately.
 
+    Only the ones whose turn it actually is. A follow-up chases a message its
+    lead has not received yet, so releasing it alongside the touch it chases is
+    not "send now" — it is the whole sequence in one second. Measured on five
+    leads with two follow-up steps configured: `release_now` moved all fifteen
+    rows and every one of them left inside the same second, so each stranger's
+    first three emails were a cold pitch, "bumping my last email" and a closing
+    note, in that order, with no gap between them at all.
+
+    So a step waits while any earlier step for that lead is still owed. A
+    second press then releases the next step, which is the user asking to chase
+    now having watched the first touch go — a decision, rather than an
+    accident of ordering by `scheduled_at`.
+
     Separate from the worker because "go now" is a decision about the plan, not
     about the loop: the rows move, the loop then finds them overdue like any
     other backlog, and a stop half way through leaves the rest exactly where it
@@ -1124,8 +1143,12 @@ def release_now(conn, campaign_id: int, limit: int = 0) -> int:
         return 0
     rows = _db.rows(
         conn,
-        "SELECT id FROM messages WHERE campaign_id = ? AND status = 'queued' "
-        "ORDER BY scheduled_at, id LIMIT ?",
+        "SELECT id FROM messages AS m WHERE m.campaign_id = ? AND m.status = 'queued' "
+        "AND NOT EXISTS (SELECT 1 FROM messages AS owed "
+        "                WHERE owed.campaign_id = m.campaign_id "
+        "                AND owed.lead_id = m.lead_id AND owed.step < m.step "
+        "                AND owed.status IN ('queued', 'sending', 'rehearsed')) "
+        "ORDER BY m.scheduled_at, m.id LIMIT ?",
         (_int(campaign_id), int(limit)),
     )
     now = time.time()
@@ -1191,6 +1214,7 @@ class OutreachWorker(QThread):
         self._next_ok: dict[str, float] = {}   # per-account gap between sends
         self._rehearsed: dict[str, list] = {}  # dry-run sends, for the cap checks
         self._conn_failures = 0
+        self._holding = ""                     # the hold reason already announced
         self._replanned_at = 0.0
         self._polled_at = 0.0                  # last inbox read
         self._ramp_start: date | None = None   # resolved once the DB is open
@@ -1317,6 +1341,8 @@ class OutreachWorker(QThread):
             now = time.time()
             due = self._due(conn, now)
             if not due:
+                if not self._announce_wait(conn, now):
+                    break
                 self._nap(min(30.0, max(1.0, self._seconds_until_next(conn, now))))
                 continue
             self._dispatch(conn, due, now)
@@ -1358,13 +1384,75 @@ class OutreachWorker(QThread):
         """
         return _db.due_messages(conn, now, limit=200, campaign_id=self.campaign_id)
 
-    def _seconds_until_next(self, conn, now: float) -> float:
-        """How long until this campaign's next message is due. 30 s if unknown."""
+    def _next_due_at(self, conn, now: float) -> float:
+        """When this campaign's next sendable message is due. 0.0 when none is.
+
+        Zero is a real answer and not a missing one: every queued row left is
+        either addressed to an address that has since been suppressed, or
+        scheduled past the year the planner works in. Both mean the loop will
+        wait for ever, so the caller has something to say rather than a nap to
+        repeat.
+        """
         horizon = now + _MAX_PLAN_DAYS * _DAY_SEC
         rows = _db.due_messages(conn, horizon, limit=1, campaign_id=self.campaign_id)
-        if rows:
-            return max(1.0, _float(rows[0].get("scheduled_at")) - now)
-        return 30.0
+        return _float(rows[0].get("scheduled_at")) if rows else 0.0
+
+    def _seconds_until_next(self, conn, now: float) -> float:
+        """How long until this campaign's next message is due. 30 s if unknown."""
+        due = self._next_due_at(conn, now)
+        return max(1.0, due - now) if due else 30.0
+
+    def _hold(self, message: str, level: str = "info") -> None:
+        """Say why the queue is parked — once per reason, not once per nap.
+
+        Deduped on the text because the loop comes back around every thirty
+        seconds and a hold lasts hours; repeated verbatim it would bury the
+        sends either side of it. `_send` clears it, so the *next* hold is
+        announced again.
+        """
+        message = _text(message)
+        if message and message != self._holding:
+            self._holding = message
+            self.log_signal.emit(message, level)
+
+    def _announce_wait(self, conn, now: float) -> bool:
+        """Name the thing holding a queue that has nothing due. False to give up.
+
+        This is the commonest "glitch" there is and it was entirely silent. A
+        campaign planned on a Saturday for Monday morning, started straight
+        away: the button greys out, the counter sits at zero, and twenty passes
+        of this loop wrote exactly one line to the log — "Stopped", when the
+        user gave up. Nothing is wrong in that run, and nothing said so.
+
+        The false answer covers the one wait that never ends. `campaign_stats`
+        counts a row by its status and `due_messages` refuses one whose lead
+        has since been suppressed, so a crash part way through `suppress` — the
+        address written, the rows not yet cancelled — leaves a campaign that
+        reads as having a queue and can never send from it. That ran here as a
+        thirty-second nap repeated for ever, with nothing in the log.
+        """
+        waiting = _int(_db.campaign_stats(conn, self.campaign_id).get("queued"))
+        due = self._next_due_at(conn, now)
+        if not due:
+            self.log_signal.emit(
+                "Stopping: %d message(s) are queued and none of them can ever go "
+                "out — each is either addressed to a suppressed address or "
+                "scheduled beyond the next year. Prepare a fresh campaign from "
+                "the leads you can still contact." % waiting, "error")
+            return False
+        if not self.ignore_schedule and not in_send_window(now, self._settings):
+            self._hold("Outside the sending window — %d message(s) waiting. The "
+                       "window reopens %s, and the first of them goes %s."
+                       % (waiting, _clock(next_window_open(now, self._settings)),
+                          _clock(due)))
+            return True
+        if self._holding:
+            # A cap or a replan has already said something more specific, and
+            # nothing has left since. Repeating it as "waiting" adds no fact.
+            return True
+        self._hold("Waiting — %d message(s) queued and none due yet. The next one "
+                   "goes %s." % (waiting, _clock(due)))
+        return True
 
     # ── one message ──
 
@@ -1392,7 +1480,23 @@ class OutreachWorker(QThread):
         if waits:
             self._nap(min(min(waits), 30.0))     # only the pacing gap is holding us
             return
-        self._replan(conn, due, now, "Every account is at its cap for today")
+
+        hourly = self._hourly_hold(conn, now)
+        if hourly > 0:
+            # An hourly cap flattens a burst and clears inside the hour, so the
+            # queue does not want re-spacing over it. Replanning here sent the
+            # backlog to the next *window* open instead, which under Send now
+            # meant a run the user had just told to go immediately went quiet
+            # until Monday morning — measured: 30 of 40 messages held 35 hours
+            # by a cap that would have cleared in one — under a line that said
+            # the accounts were at their cap for the day when 35 of the 40 a
+            # day were still unspent.
+            self._hold("Holding for the hourly limit of %d per account — %d message(s) "
+                       "waiting, and the next can go %s."
+                       % (_hourly_cap(self._settings), len(due), _clock(now + hourly)))
+            self._nap(min(hourly, 30.0))
+            return
+        self._replan(conn, due, now, "Every account has sent its allowance for today")
 
     def _live_accounts(self, now: float = 0.0) -> list[dict]:
         """Enabled accounts that are not out of action for today.
@@ -1450,10 +1554,17 @@ class OutreachWorker(QThread):
             return account, 0.0
         return None, min(waits) if waits else 0.0
 
-    def _has_headroom(self, conn, account: dict, now: float) -> bool:
+    def _daily_room(self, conn, account: dict, now: float) -> int:
+        """How many more this account may send today. Zero means tomorrow.
+
+        Split out from the hourly check below because the two holds mean
+        different things and want different handling: a spent day is over until
+        midnight and its backlog wants re-spacing into tomorrow's window, while
+        an hourly cap clears inside the hour and the queue should stay where it
+        is.
+        """
         zone = _zone(self._settings)
         email = _text(account["email"]).strip().lower()
-        rehearsed = self._rehearsed.get(email) or []
         midnight = _at(_local_date(now, zone), 0, zone)
 
         cap = account_daily_cap(account, self._settings, on_day=_local_date(now, zone),
@@ -1462,16 +1573,47 @@ class OutreachWorker(QThread):
         # Rehearsed sends count towards the cap here but are never written to
         # `sends`: pacing a dry run realistically is worth having, spending a
         # live account's real daily quota on messages nobody received is not.
-        today += sum(1 for ts in rehearsed if ts >= midnight)
-        if today >= cap:
-            return False
+        today += sum(1 for ts in (self._rehearsed.get(email) or []) if ts >= midnight)
+        return max(0, cap - today)
 
+    def _hour_stamps(self, conn, account_email: str, now: float) -> list[float]:
+        """Every send this account has made in the trailing hour, ascending."""
+        stamps = _db.recent_sends(conn, account_email, since_ts=now - _HOUR_SEC)
+        stamps += [ts for ts in (self._rehearsed.get(account_email) or [])
+                   if ts > now - _HOUR_SEC]
+        stamps.sort()
+        return stamps
+
+    def _has_headroom(self, conn, account: dict, now: float) -> bool:
+        if self._daily_room(conn, account, now) <= 0:
+            return False
         hourly = _hourly_cap(self._settings)
         if hourly >= _NO_CAP:
             return True
-        hour = _db.sent_last_hour(conn, email, now_ts=now)
-        hour += sum(1 for ts in rehearsed if ts > now - _HOUR_SEC)
-        return hour < hourly
+        email = _text(account["email"]).strip().lower()
+        return len(self._hour_stamps(conn, email, now)) < hourly
+
+    def _hourly_hold(self, conn, now: float) -> float:
+        """Seconds until an hourly window frees, or 0 when the day is what holds.
+
+        Zero is also the answer when something is free, so a caller can read a
+        positive number as "the hourly cap, and only the hourly cap, is holding
+        this queue" and park for exactly that long.
+        """
+        cap = _hourly_cap(self._settings)
+        if cap >= _NO_CAP:
+            return 0.0
+        waits = []
+        for account in self._live_accounts(now):
+            if self._daily_room(conn, account, now) <= 0:
+                continue
+            stamps = self._hour_stamps(conn, _text(account["email"]).strip().lower(), now)
+            if len(stamps) < cap:
+                return 0.0
+            # The cap-th most recent send drops out of the trailing hour then,
+            # which is the instant this account may send again.
+            waits.append(max(1.0, stamps[-cap] + _HOUR_SEC - now))
+        return min(waits) if waits else 0.0
 
     def _thread_parent(self, conn, row: dict, account_email: str = "") -> str:
         """The first touch's Message-ID, for a chaser to reply into.
@@ -1584,6 +1726,9 @@ class OutreachWorker(QThread):
 
         if ok:
             self._conn_failures = 0
+            # The queue is moving, so whatever was holding it is over and the
+            # next hold is news again rather than a repeat.
+            self._holding = ""
             # A rehearsal writes its own status and no Message-ID. Both matter:
             # the status is what every "has this gone?" query reads, and a
             # header id on an unsent row would hand this lead's chaser an
@@ -1798,6 +1943,12 @@ class OutreachWorker(QThread):
                                 sent_today_by_account=self._sent_today_map(conn, accounts, opens),
                                 seed=self.campaign_id, ramp_start=self._ramp_start)
         if not slots:
+            # The settings leave no sendable instant inside a year: no send day
+            # survives, or every cap is zero. Nothing the loop does will shift
+            # it, so the one useful thing left is to say where the fix is.
+            self._hold("%s, and there is nowhere to move %d message(s) to — your "
+                       "sending days, hours or caps in Settings leave no room at "
+                       "all." % (reason, len(due)), "error")
             self._nap(30.0)
             return
 
@@ -1809,8 +1960,10 @@ class OutreachWorker(QThread):
             bound = self._thread_account(conn, row)
             _db.mark_message(conn, _int(row.get("id")), "queued",
                              scheduled_at=when, account_email=bound or email)
-        self.log_signal.emit("%s — %d message(s) held until %s"
-                             % (reason, len(slots), _clock(slots[0][0])), "info")
+        # Through `_hold` so that the wait this replan creates does not then get
+        # announced a second time, in vaguer words, by `_announce_wait`.
+        self._hold("%s — %d message(s) held until %s"
+                   % (reason, len(slots), _clock(slots[0][0])))
 
     def _sent_today_map(self, conn, accounts: list, when: float) -> dict[str, int]:
         """Today's send counts per account, rehearsals included.

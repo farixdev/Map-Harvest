@@ -39,6 +39,7 @@ from __future__ import annotations
 import hashlib
 import html as _html
 import json
+import io
 import os
 import re
 import urllib.parse
@@ -226,6 +227,19 @@ GAP_SERVICES: dict[str, list[str]] = {
                           "automatically add leads to CRM"],
     "no_crm_signals": ["automatic CRM updates", "automatically add leads to CRM", "lead assignment"],
     "no_lead_capture": ["business lead discovery", "automatic follow-ups", "website lead extraction"],
+    # The enquiries do arrive; they arrive as prose in a mailbox. Reading them,
+    # deciding which are worth a call and filing the rest is the work, and it is
+    # three catalogue entries deep.
+    "email_only_intake": ["AI email processing", "AI lead qualification",
+                          "automatically add leads to CRM"],
+    # A button the owner is proud of, so the offer is never "replace it" — it is
+    # answering the first message before a person has to.
+    "whatsapp_manual": ["WhatsApp workflows", "AI customer-support agents",
+                        "automatic follow-ups"],
+    # Asking is the whole job, and it happens after the work is finished, which
+    # is exactly where a follow-up belongs.
+    "no_review_capture": ["automatic follow-ups", "social media workflows",
+                          "customer segmentation"],
     "quote_by_form": ["AI lead scoring", "AI decision/triage systems", "approval systems"],
     "stale_blog": ["AI content generation", "content pipelines"],
     "no_analytics": ["automated reports", "competitor monitoring", "data collection and cleaning"],
@@ -537,7 +551,31 @@ TEMPLATES: list[Template] = BUILTIN_TEMPLATES
 # Read as a module global on every call rather than captured, so a test — or a
 # portable build that relocates the profile — can point the store somewhere else
 # by assigning to it.
-TEMPLATES_PATH: str = os.path.join(os.path.expanduser("~"), ".mapharvest", "templates.json")
+# The profile moved from .mapharvest to .leadforge and this store did not, so
+# an edited template was written to the old directory while settings, the queue
+# and the AI cache were read from the new one -- the user's own templates simply
+# stopped appearing. Not imported from core.settings: that module imports this
+# one for its service defaults, and the cycle is real.
+_PROFILE_DIR = os.path.join(os.path.expanduser("~"), ".leadforge")
+_OLD_PROFILE_DIR = os.path.join(os.path.expanduser("~"), ".mapharvest")
+TEMPLATES_PATH: str = os.path.join(_PROFILE_DIR, "templates.json")
+
+
+def _adopt_old_store() -> None:
+    """Carry a pre-rename store over, once, without overwriting a newer one."""
+    try:
+        if os.path.exists(TEMPLATES_PATH):
+            return
+        old = os.path.join(_OLD_PROFILE_DIR, "templates.json")
+        if not os.path.exists(old):
+            return
+        os.makedirs(os.path.dirname(TEMPLATES_PATH), exist_ok=True)
+        with io.open(old, encoding="utf-8") as handle:
+            body = handle.read()
+        with io.open(TEMPLATES_PATH, "w", encoding="utf-8") as handle:
+            handle.write(body)
+    except Exception:
+        pass
 
 _STORE_VERSION = 1
 
