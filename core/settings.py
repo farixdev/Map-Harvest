@@ -98,6 +98,37 @@ DEFAULT_SETTINGS = {
     "followup_gap_days": 4,
     "followup_max_steps": 2,
 
+    # ── WhatsApp (second channel) ──
+    # Every number below is deliberately tighter than its email counterpart
+    # above, and none of them is a placeholder. WhatsApp bans numbers for bulk
+    # outreach far faster than Gmail suspends accounts, there is no CAN-SPAM
+    # equivalent that permits cold contact, and a banned number is usually gone
+    # for good — so the defaults assume the user would rather send slowly than
+    # lose the number. See docs/WHATSAPP_SPEC.md.
+    "wa_enabled": False,
+    # Blank means an unqualified number is refused rather than guessed: "(416)
+    # 555-0142" is a different business in every country, and messaging the
+    # wrong one is not a bounce, it is a stranger abroad. See
+    # `core.whatsapp.to_wa_id`.
+    "wa_default_region": "",          # ISO code, e.g. "CA". Blank = require + prefix
+    "wa_headless": False,             # the QR needs a visible window the first time
+    "wa_daily_cap": 30,               # deliberately lower than email's 40
+    "wa_hourly_cap": 8,
+    "wa_min_gap_sec": 90,             # slower than email's 60
+    "wa_max_gap_sec": 300,
+    "wa_warmup_enabled": True,
+    "wa_warmup_start": 5,
+    "wa_warmup_step": 3,
+    "wa_warmup_max": 30,
+    "wa_send_days": [0, 1, 2, 3, 4],
+    "wa_send_start_hour": 10,         # a message at 08:00 reads worse than an email
+    "wa_send_end_hour": 19,
+    "wa_followup_enabled": True,
+    "wa_followup_gap_days": 3,
+    "wa_followup_max_steps": 1,       # one chaser, not two
+    "wa_dry_run": True,               # never surprise-send, same as email
+    "wa_opt_out_words": ["stop", "unsubscribe", "remove me", "do not message"],
+
     # ── Compliance ──
     "unsubscribe_mailto": "",         # blank = use the sending account address
     # On by default because this is what keeps cold mail out of the spam folder,
