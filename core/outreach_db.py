@@ -184,8 +184,18 @@ CREATE INDEX IF NOT EXISTS idx_messages_channel_due
   ON messages(channel, status, scheduled_at);
 """
 
-# column → the DDL that adds it. Ordered so a half-applied upgrade (a crash, a
-# read-only file) resumes rather than restarting.
+# Bumped when a migration step needs to run once and cannot be detected by
+# looking at the schema. Kept in SQLite's own `user_version`, which is a header
+# field rather than a table, so reading it costs nothing and no query can
+# accidentally join against it.
+#
+# 1 — `messages.channel`, `sends.channel`, `leads.phone_key` and the phone_key
+#     backfill.
+_SCHEMA_VERSION = 1
+
+# column → the DDL that adds it. Each is guarded by its own presence check, so
+# adding a column and stamping the version are independent and either order
+# survives an interrupted run.
 _ADDED_COLUMNS = (
     ("messages", "channel", "ALTER TABLE messages ADD COLUMN channel TEXT DEFAULT 'email'"),
     ("sends", "channel", "ALTER TABLE sends ADD COLUMN channel TEXT DEFAULT 'email'"),
@@ -206,10 +216,17 @@ def _migrate(conn) -> None:
     migrating rather than recreating.
 
     `leads.phone_key` is the exception, because a default cannot compute it: the
-    tail has to be derived from each stored phone number. It is backfilled once,
-    inside the branch that creates the column, so a lead whose number is too
-    short to key is not re-examined on every open for the rest of the file's
-    life.
+    tail has to be derived from each stored phone number.
+
+    That backfill is gated on `user_version` and not on whether the column
+    exists, which is the difference between resumable and quietly broken.
+    Adding the column commits on its own; if the process dies during the
+    backfill that follows, the transaction rolls back and every key is still
+    empty — and a check that asked "does the column exist" would answer yes
+    forever after and never fill them. Cross-channel suppression would then miss
+    every lead that predated the upgrade, silently, which is the one failure
+    here nobody would see until somebody who said stop got the email sequence.
+    The version is stamped only once the backfill has committed.
     """
     conn = _resolve(conn)
     with _LOCK:
@@ -218,8 +235,11 @@ def _migrate(conn) -> None:
             if not existing or column in existing:
                 continue
             _write(conn, ddl)
-            if (table, column) == ("leads", "phone_key"):
-                _backfill_phone_keys(conn)
+
+        if _schema_version(conn) < _SCHEMA_VERSION and "phone_key" in _columns(conn, "leads"):
+            if _backfill_phone_keys(conn):
+                _write(conn, "PRAGMA user_version = %d" % _SCHEMA_VERSION)
+
         try:
             conn.executescript(_LATE_INDEXES)
             conn.commit()
@@ -227,37 +247,52 @@ def _migrate(conn) -> None:
             pass
 
 
-def _backfill_phone_keys(conn) -> None:
-    """Derive `phone_key` for every lead already carrying a phone number.
+def _schema_version(conn) -> int:
+    return _scalar(conn, "PRAGMA user_version")
+
+
+def _backfill_phone_keys(conn) -> bool:
+    """Derive `phone_key` for every lead carrying a phone. True when it finished.
+
+    The return value is what `_migrate` stamps the schema version on: a pass
+    that could not write must not be recorded as done, or it never runs again.
 
     Done in Python because the key is not something SQL can express: it strips
     an extension before it reads a digit, and `replace()` chains cannot.
 
-    One `executemany` under one commit, not a `_write` per row. This runs on the
-    first open after the upgrade, which is app start, and the user is looking at
-    a splash screen while it does. Measured on a synthetic store of 20,000 leads
-    and 20,000 queued messages (81 MB): a commit per row took 1,780ms, batched
-    it takes 116ms, and every open after either is 7ms. At the 2,000 leads a
-    real store holds it is 141ms against 24ms — small enough not to matter, and
-    the large case is the one that would have been noticed as a hang.
+    One `executemany` under one commit, not a `_write` per row, and the
+    difference is not a micro-optimisation. `_write` commits every statement,
+    and in WAL with `synchronous=NORMAL` a commit is a real write barrier, so
+    the obvious loop pays one per lead. Measured against synthetic stores whose
+    `messages` rows carry a full rendered email:
+
+        2,000 leads    batched  16ms     a commit per row   12.0s
+       20,000 leads    batched 639ms     a commit per row  216.2s
+
+    This runs on the first open after the upgrade, which is app start. Three
+    and a half minutes of it is not a slow migration, it is a hung application
+    that the user kills — and killing it half way is how the backfill ends up
+    half applied. Every subsequent open is 6ms either way, which is why the cost
+    is invisible unless it is looked for.
     """
     updates = []
-    for row in _query(conn, "SELECT id, phone FROM leads "
-                            "WHERE phone IS NOT NULL AND phone != ''"):
+    for row in _query(conn, "SELECT id, phone, COALESCE(phone_key, '') AS key "
+                            "FROM leads WHERE phone IS NOT NULL AND phone != ''"):
         key = _phone_key(row.get("phone"))
-        if key:
+        if key and key != _text(row.get("key")):
             updates.append((key, _int(row.get("id"))))
     if not updates:
-        return
+        return True
     with _LOCK:
         try:
             conn.executemany("UPDATE leads SET phone_key = ? WHERE id = ?", updates)
             conn.commit()
         except sqlite3.Error:
-            # A backfill that could not finish is not a failed open: the column
-            # exists, new writes fill it, and the join simply misses the rows it
-            # never reached. Losing the store instead would be worse.
-            pass
+            # Not a failed open — the store still works and every new write
+            # fills its own key. Reporting False is what brings this pass back
+            # on the next open instead of leaving the old rows unmatched.
+            return False
+    return True
 
 
 # ── Connection ───────────────────────────────────────────────────────────────
@@ -550,7 +585,8 @@ def get_lead(conn, lead_id: int) -> dict:
     return _one(conn, "SELECT * FROM leads WHERE id = ?", (_int(lead_id),))
 
 
-def _lead_scope(head: str, status: str, campaign_id: int) -> tuple[str, list]:
+def _lead_scope(head: str, status: str, campaign_id: int,
+                has_phone: bool = False) -> tuple[str, list]:
     where, params = [], []
     if campaign_id:
         head += " JOIN messages ON messages.lead_id = leads.id"
@@ -559,20 +595,30 @@ def _lead_scope(head: str, status: str, campaign_id: int) -> tuple[str, list]:
     if status:
         where.append("leads.status = ?")
         params.append(status)
+    if has_phone:
+        where.append("COALESCE(leads.phone_key, '') != ''")
     if where:
         head += " WHERE " + " AND ".join(where)
     return head, params
 
 
 def list_leads(conn, *, status: str = "", campaign_id: int = 0,
-               limit: int = 0, offset: int = 0) -> list[dict]:
+               limit: int = 0, offset: int = 0, has_phone: bool = False) -> list[dict]:
     """Leads, oldest first. `limit=0` means all of them.
 
     Ordered by id rather than by score so that paging with `offset` is stable
     while the audit pass is still rewriting scores underneath the table.
+
+    `has_phone` narrows to leads carrying a number this app can *identify* —
+    eight digits or more, once an extension is off. It is not the same question
+    as "can be messaged on WhatsApp", and must not be presented as one: a number
+    with no country code is unsendable until the user sets a default region, and
+    the region lives in settings where this module cannot see it. Ask
+    `core.whatsapp.to_wa_id` for the second question.
     """
     sql, params = _lead_scope("SELECT DISTINCT leads.* FROM leads",
-                              _text(status).strip(), _int(campaign_id))
+                              _text(status).strip(), _int(campaign_id),
+                              bool(has_phone))
     sql += " ORDER BY leads.id"
     limit, offset = _int(limit), _int(offset)
     if limit > 0 or offset > 0:
@@ -582,9 +628,17 @@ def list_leads(conn, *, status: str = "", campaign_id: int = 0,
 
 
 def count_leads(conn, **filters) -> int:
+    """How many leads match. Same filters as `list_leads`, `has_phone` included.
+
+    The plan summary needs the complement of that one — how many leads a
+    WhatsApp campaign would have to drop for want of a number — and it has to
+    say so *before* the user commits, the way it already reports unpersonalised
+    emails.
+    """
     sql, params = _lead_scope("SELECT COUNT(DISTINCT leads.id) FROM leads",
                               _text(filters.get("status")).strip(),
-                              _int(filters.get("campaign_id")))
+                              _int(filters.get("campaign_id")),
+                              bool(filters.get("has_phone")))
     return _scalar(conn, sql, tuple(params))
 
 
