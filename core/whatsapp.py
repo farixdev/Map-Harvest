@@ -194,12 +194,18 @@ def to_wa_id(phone: str, default_region: str = "") -> str:
     if not digits:
         return ""
 
-    if raw.lstrip().startswith("+"):
+    # A "+" anywhere ahead of the first digit qualifies the number, not only one
+    # at the very start: a scraped listing says "Tel: +1 416-555-0142" as often
+    # as it says the number alone, and reading that as a local number would hand
+    # it a second country code.
+    head = raw[:raw.index(next(c for c in raw if c.isdigit()))]
+    if "+" in head:
         return _e164(digits)
     if digits.startswith("00"):
         return _e164(digits[2:])
 
-    code = _region_code(default_region)
+    region = str(default_region or "").strip().upper()
+    code = _region_code(region)
     if not code:
         return ""
 
@@ -218,7 +224,7 @@ def to_wa_id(phone: str, default_region: str = "") -> str:
         # region can complete — and completing it anyway would dial a stranger.
         if national[:1] in ("0", "1"):
             return ""
-    elif national.startswith("0") and str(default_region).upper() not in _KEEPS_TRUNK_ZERO:
+    elif national.startswith("0") and region not in _KEEPS_TRUNK_ZERO:
         # Exactly one digit, not `lstrip("0")`: the trunk prefix is a single 0,
         # and eating a second would silently renumber a subscriber whose own
         # number begins with one.
