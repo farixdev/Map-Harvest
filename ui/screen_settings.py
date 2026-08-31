@@ -1504,9 +1504,9 @@ class _AccountRow(QWidget):
         self.title_label = group.caption
 
         self.email_edit = QLineEdit()
-        self.email_edit.setPlaceholderText("you@gmail.com")
+        self.email_edit.setPlaceholderText("you@yourcompany.com")
         self.email_edit.setFixedHeight(t.control["md"])
-        group.field("Gmail address", self.email_edit)
+        group.field("Email address", self.email_edit)
 
         self.password_field = _secret_field("16-character app password")
         self.verify_btn = C.button(
@@ -1529,6 +1529,27 @@ class _AccountRow(QWidget):
 
         caps_row = _row_box()
         caps_row.addStretch()
+        # The host was hardcoded to Gmail, so a business domain that is not on
+        # Google could be typed in and then failed with an App Password error
+        # that had nothing to do with the real problem. Prefilled from the
+        # address and overridable, because guessing wrong costs one edit and
+        # offering nothing cost an account that could not be added at all.
+        self.smtp_host_edit = QLineEdit()
+        self.smtp_host_edit.setPlaceholderText("smtp.gmail.com")
+        self.smtp_host_edit.setFixedHeight(t.control["md"])
+        self.smtp_host_edit.setToolTip(
+            "Leave blank for Gmail and Google Workspace. Your provider calls "
+            "this the outgoing or SMTP server.")
+        self.smtp_port_spin = _spin(1, 65535, 1, "", chars=5)
+        self.smtp_port_spin.setToolTip("587 for STARTTLS, which is what almost "
+                                       "every provider wants")
+        server_holder = QWidget()
+        server_row = _row_box()
+        server_row.addWidget(self.smtp_host_edit, 1)
+        server_row.addWidget(self.smtp_port_spin)
+        server_holder.setLayout(server_row)
+        group.field("Outgoing server", server_holder)
+
         self.daily_cap_spin = _spin(1, 500, 5, "/day", chars=3)
         self.daily_cap_spin.setToolTip("This account's own ceiling; the global cap still applies")
         self.warmup_cb = C.toggle(
@@ -1578,6 +1599,10 @@ class _AccountRow(QWidget):
         for edit in (self.email_edit, self.display_edit):
             edit.textChanged.connect(lambda _text: self.changed.emit())
         self.password_field.textChanged.connect(lambda _text: self.changed.emit())
+        self.smtp_host_edit.textEdited.connect(lambda _t: self._host_touched())
+        self.smtp_host_edit.textChanged.connect(lambda _t: self.changed.emit())
+        self.smtp_port_spin.valueChanged.connect(lambda _v: self.changed.emit())
+        self.email_edit.textEdited.connect(lambda _t: self._follow_address())
         self.daily_cap_spin.valueChanged.connect(lambda _v: self.changed.emit())
         self.warmup_date.dateChanged.connect(lambda _d: self.changed.emit())
         for box in (self.enabled_cb, self.imap_cb, self.warmup_cb):
@@ -1585,6 +1610,14 @@ class _AccountRow(QWidget):
 
     def _load(self, account: dict) -> None:
         self.email_edit.setText(str(account.get("email") or ""))
+        guess = mailer.smtp_host_for(str(account.get("email") or ""))
+        self._imap_host = str(account.get("imap_host") or "") or guess[2]
+        self.smtp_host_edit.setText(str(account.get("smtp_host") or "") or guess[0])
+        try:
+            port = int(account.get("smtp_port") or 0)
+        except (TypeError, ValueError):
+            port = 0
+        self.smtp_port_spin.setValue(port or guess[1])
         self.display_edit.setText(str(account.get("display_name") or ""))
         self.enabled_cb.setChecked(bool(account.get("enabled", True)))
         self.imap_cb.setChecked(bool(account.get("imap_enabled", False)))
@@ -1636,6 +1669,23 @@ class _AccountRow(QWidget):
         else:
             _status(self.status_label, message, "err")
 
+    def _host_touched(self) -> None:
+        """Once the user types a server, stop overwriting it from the address."""
+        self._host_is_mine = True
+
+    def _follow_address(self) -> None:
+        """Keep the server in step with the address the user is typing.
+
+        Only while they have not set one themselves: a prefilled field that
+        silently reverts what you typed is worse than one that was never filled.
+        """
+        if getattr(self, "_host_is_mine", False):
+            return
+        host, port, imap = mailer.smtp_host_for(self.email_edit.text())
+        self._imap_host = imap
+        self.smtp_host_edit.setText(host)
+        self.smtp_port_spin.setValue(port)
+
     def to_dict(self) -> dict:
         """The stored shape, with the password left blank for `set_secret`."""
         return {
@@ -1649,6 +1699,9 @@ class _AccountRow(QWidget):
                 if self.warmup_cb.isChecked() else ""
             ),
             "imap_enabled": self.imap_cb.isChecked(),
+            "smtp_host": self.smtp_host_edit.text().strip(),
+            "smtp_port": self.smtp_port_spin.value(),
+            "imap_host": self._imap_host,
         }
 
 
@@ -3850,7 +3903,9 @@ class SettingsScreen(QWidget):
             return
         row.set_verifying()
         self._start_probe(
-            lambda: self._timed(lambda: mailer.verify_account(email, password)),
+            lambda: self._timed(lambda: mailer.verify_account(
+                email, password, host=row.smtp_host_edit.text().strip(),
+                port=row.smtp_port_spin.value())),
             row.show_verify_result,
         )
 

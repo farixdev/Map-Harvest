@@ -157,6 +157,13 @@ SMTP_ACCOUNT_DEFAULTS = {
     "enabled": True,
     "warmup_started": "",             # "YYYY-MM-DD"
     "imap_enabled": False,
+    # Blank means Gmail. The host was hardcoded, so a Workspace or a custom
+    # domain that is not on Google -- faris@mindcob.com, say -- could be typed
+    # in and then failed to authenticate against smtp.gmail.com with an error
+    # about App Passwords that had nothing to do with the real problem.
+    "smtp_host": "",
+    "smtp_port": 0,
+    "imap_host": "",
 }
 
 MAX_SAVED_SEARCHES = 12

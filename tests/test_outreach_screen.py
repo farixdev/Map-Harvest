@@ -2073,7 +2073,10 @@ def _sendable(screen):
                                          "enabled": True, "daily_cap": 20}]
     screen.settings["send_days"] = [0, 1, 2, 3, 4, 5, 6]
     screen.settings["send_start_hour"] = 0
-    screen.settings["send_end_hour"] = 23
+    # 24, not 23: `_hours` reads the end as exclusive, so 23 closes the window
+    # for the last hour of the day and a suite run at 23:10 saw every "the queue
+    # is moving" assertion below report a hold instead.
+    screen.settings["send_end_hour"] = 24
     screen.settings["dry_run"] = True
     screen._benched_at = 0.0
     try:
@@ -2127,12 +2130,18 @@ def test_every_state_the_sending_tab_can_be_in_says_what_is_happening():
         assert "in flight" in why, why
         screen._stopping = False
 
-        screen.settings["send_start_hour"] = 3
-        screen.settings["send_end_hour"] = 4
+        # A one-hour window that cannot be the hour this suite is running in.
+        # It was hard-coded to 03:00–04:00, which is a closed window for
+        # twenty-three hours of the day and an open one for the twenty-fourth:
+        # run at 03:06 and this branch reported "Rehearsing", correctly, against
+        # an assertion that the queue was held.
+        shut = (time.localtime().tm_hour + 2) % 22
+        screen.settings["send_start_hour"] = shut
+        screen.settings["send_end_hour"] = shut + 1
         head, why = screen._send_health()
         assert head.startswith("Holding") and "restarts at" in why, (head, why)
         screen.settings["send_start_hour"] = 0
-        screen.settings["send_end_hour"] = 23
+        screen.settings["send_end_hour"] = 24
 
         # No account at all, while running. This is the sentence that used to
         # be about a cap on a set with nothing in it.

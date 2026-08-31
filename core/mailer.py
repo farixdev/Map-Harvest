@@ -463,10 +463,14 @@ class SmtpSender:
     """
 
     def __init__(self, email: str, app_password: str, display_name: str = "",
-                 timeout: float = 30.0) -> None:
+                 timeout: float = 30.0, host: str = "", port: int = 0) -> None:
         self.email = str(email or "").strip()
         self.display_name = str(display_name or "").strip()
         self.timeout = float(timeout) if timeout else 30.0
+        # Blank falls back to Gmail, which is what every existing account has
+        # stored, so nothing that works today changes.
+        self.host = str(host or "").strip() or GMAIL_SMTP_HOST
+        self.port = int(port) if port else GMAIL_SMTP_PORT
         self._password = _normalize_app_password(app_password)
         self._smtp = None
 
@@ -481,7 +485,7 @@ class SmtpSender:
 
         smtp = None
         try:
-            smtp = smtplib.SMTP(GMAIL_SMTP_HOST, GMAIL_SMTP_PORT, timeout=self.timeout)
+            smtp = smtplib.SMTP(self.host, self.port, timeout=self.timeout)
             smtp.ehlo()
             smtp.starttls(context=ssl.create_default_context())
             smtp.ehlo()  # the extension list is renegotiated after STARTTLS
@@ -576,13 +580,39 @@ def _recipients(message) -> list[str]:
     return values
 
 
-def verify_account(email: str, app_password: str) -> tuple[bool, str]:
+def smtp_host_for(email: str) -> tuple[str, int, str]:
+    """A sensible (smtp host, port, imap host) guess for an address.
+
+    Only a starting point the user can overwrite: the common providers are worth
+    filling in so nobody has to look up a hostname, and a domain nobody knows
+    falls back to Gmail because Workspace is the usual answer for a business
+    domain. Guessing wrong costs one edit; not offering anything cost the user
+    an account they could not add at all.
+    """
+    domain = str(email or "").rsplit("@", 1)[-1].strip().lower()
+    known = {
+        "gmail.com": (GMAIL_SMTP_HOST, GMAIL_SMTP_PORT, GMAIL_IMAP_HOST),
+        "googlemail.com": (GMAIL_SMTP_HOST, GMAIL_SMTP_PORT, GMAIL_IMAP_HOST),
+        "outlook.com": ("smtp-mail.outlook.com", 587, "outlook.office365.com"),
+        "hotmail.com": ("smtp-mail.outlook.com", 587, "outlook.office365.com"),
+        "live.com": ("smtp-mail.outlook.com", 587, "outlook.office365.com"),
+        "office365.com": ("smtp.office365.com", 587, "outlook.office365.com"),
+        "zoho.com": ("smtp.zoho.com", 587, "imap.zoho.com"),
+        "yahoo.com": ("smtp.mail.yahoo.com", 587, "imap.mail.yahoo.com"),
+        "icloud.com": ("smtp.mail.me.com", 587, "imap.mail.me.com"),
+        "fastmail.com": ("smtp.fastmail.com", 587, "imap.fastmail.com"),
+    }
+    return known.get(domain, (GMAIL_SMTP_HOST, GMAIL_SMTP_PORT, GMAIL_IMAP_HOST))
+
+
+def verify_account(email: str, app_password: str, host: str = "",
+                   port: int = 0) -> tuple[bool, str]:
     """Prove the credentials work without sending anything.
 
     Used by the settings screen's per-account Verify button, so the error string
     is the one the user reads — hence the App Password explanation in `AUTH:`.
     """
-    sender = SmtpSender(email, app_password, timeout=20.0)
+    sender = SmtpSender(email, app_password, timeout=20.0, host=host, port=port)
     try:
         return sender.connect()
     finally:

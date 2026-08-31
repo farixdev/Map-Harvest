@@ -144,7 +144,13 @@ def stub_smtp(fail=None):
     opened, wire = [], []
 
     class _Sender:
-        def __init__(self, email, app_password, display_name=""):
+        # The host and port are accepted and ignored rather than left out. The
+        # worker passes whatever the account row carries, and a stub that
+        # refused them raised a TypeError inside `run()`, which swallows it —
+        # so seven tests read as "the campaign sent nothing at all" and none of
+        # them named the reason.
+        def __init__(self, email, app_password, display_name="", timeout=30.0,
+                     host="", port=0):
             opened.append(email)
             self.email = email
 
