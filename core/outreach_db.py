@@ -24,6 +24,21 @@ Nothing here raises. A locked, corrupt or missing database degrades to an empty
 list, a zero id or a False, because the alternative is a traceback out of a
 worker thread and a dead GUI. The blobs stay as text: `audit_json` and
 `ai_json` are handed back exactly as stored, and the caller decodes them.
+
+**Two channels, one lead pool.** `messages` and `sends` carry a `channel`
+(`"email"` | `"whatsapp"`), added in place so a database written before it opens
+and keeps working with every row reading as email. The caps and the sends ledger
+are per-channel, because WhatsApp's far smaller allowance must not be spent by
+the email run or the other way round.
+
+Suppression is the exception, and deliberately so: it is **shared across both
+channels, in both directions**. Somebody who replies STOP on WhatsApp must not
+then receive the email sequence, and an unsubscribe by email must stop the
+WhatsApp messages already scheduled. That is the entire point of one lead pool,
+so it is enforced twice over — eagerly, by `suppress` writing both handles when
+it is called, and lazily, by every read joining a lead's phone against the phone
+list. A lead scraped after the opt-out was recorded is caught by the second even
+though the first never saw it.
 """
 
 from __future__ import annotations
@@ -37,8 +52,21 @@ from datetime import datetime, tzinfo
 from zoneinfo import ZoneInfo
 
 from core import settings as _settings
+# Safe at module scope: core.whatsapp is stdlib-only to import and defers
+# selenium to its driver builder, precisely so the database can share one
+# definition of "the same phone number" with the transport instead of keeping a
+# second copy that drifts.
+from core.whatsapp import phone_key as _phone_key
 
 DB_FILENAME = "outreach.db"
+
+# Where a message went out, or is going out. Stored on the row rather than
+# inferred from the campaign, because the caps are counted per channel and a
+# count that had to join campaigns to know which allowance it was spending would
+# be wrong the moment a campaign row was edited.
+EMAIL = "email"
+WHATSAPP = "whatsapp"
+CHANNELS = (EMAIL, WHATSAPP)
 
 LEAD_STATUSES = ("new", "audited", "queued", "sent", "replied",
                  "bounced", "skipped", "suppressed")
@@ -63,7 +91,8 @@ _CONNS: dict[str, sqlite3.Connection] = {}
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS leads (
   id INTEGER PRIMARY KEY, email TEXT UNIQUE NOT NULL, name TEXT, domain TEXT,
-  website TEXT, phone TEXT, city TEXT, category TEXT, rating TEXT,
+  website TEXT, phone TEXT, phone_key TEXT DEFAULT '', city TEXT,
+  category TEXT, rating TEXT,
   maps_link TEXT, source TEXT, audit_json TEXT, ai_json TEXT,
   opportunity_score INTEGER DEFAULT 0, status TEXT DEFAULT 'new',
   created_at REAL, updated_at REAL);
@@ -75,14 +104,29 @@ CREATE TABLE IF NOT EXISTS campaigns (
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY, campaign_id INTEGER, lead_id INTEGER, step INTEGER DEFAULT 0,
   subject TEXT, body_text TEXT, body_html TEXT, account_email TEXT,
+  channel TEXT DEFAULT 'email',
   status TEXT DEFAULT 'queued', scheduled_at REAL, sent_at REAL,
   error TEXT, message_id TEXT, created_at REAL);
 
 CREATE TABLE IF NOT EXISTS suppression (
   email TEXT PRIMARY KEY, reason TEXT, added_at REAL);
 
+-- The other half of the do-not-contact list, and a table of its own rather than
+-- a column on `suppression`: a WhatsApp opt-out can arrive from a number this
+-- app has no address for at all, and `suppression.email` is the primary key, so
+-- there is nowhere to put such a row. Keyed on the match tail (see
+-- `core.whatsapp.phone_key`) so that the same number written two ways cannot
+-- become two entries, one of which is checked and one of which is not.
+CREATE TABLE IF NOT EXISTS suppression_phone (
+  tail TEXT PRIMARY KEY, phone TEXT, reason TEXT, added_at REAL);
+
+-- `account_email` carries the sending Gmail address on the email channel and
+-- the connected WhatsApp number on the WhatsApp one. Kept under the old name
+-- because renaming a column rewrites the table on every existing database for
+-- a word, and every reader here is channel-scoped anyway.
 CREATE TABLE IF NOT EXISTS sends (
-  id INTEGER PRIMARY KEY, account_email TEXT, ts REAL);
+  id INTEGER PRIMARY KEY, account_email TEXT, channel TEXT DEFAULT 'email',
+  ts REAL);
 
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY, ts REAL, kind TEXT, detail TEXT, lead_id INTEGER);
@@ -123,6 +167,97 @@ CREATE INDEX IF NOT EXISTS idx_messages_header ON messages(message_id);
 -- for the rest.
 DROP INDEX IF EXISTS idx_messages_campaign;
 """
+
+# Indexes over columns `_migrate` may still be adding, so they cannot live in
+# `_SCHEMA`: `executescript` stops at the first statement that fails and
+# `init_db` swallows the error, so one CREATE INDEX naming a column an older
+# database has not gained yet would silently skip everything after it.
+#
+# `sends` deliberately gains nothing. Every query against it is bounded by the
+# hourly or daily cap — dozens of rows — and `idx_sends_account_ts` already
+# seeks to them; a second btree carrying `channel` would cost every send an
+# insert to save a per-row column read that never happens more than a few dozen
+# times.
+_LATE_INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_leads_phone_key ON leads(phone_key);
+CREATE INDEX IF NOT EXISTS idx_messages_channel_due
+  ON messages(channel, status, scheduled_at);
+"""
+
+# column → the DDL that adds it. Ordered so a half-applied upgrade (a crash, a
+# read-only file) resumes rather than restarting.
+_ADDED_COLUMNS = (
+    ("messages", "channel", "ALTER TABLE messages ADD COLUMN channel TEXT DEFAULT 'email'"),
+    ("sends", "channel", "ALTER TABLE sends ADD COLUMN channel TEXT DEFAULT 'email'"),
+    ("leads", "phone_key", "ALTER TABLE leads ADD COLUMN phone_key TEXT DEFAULT ''"),
+)
+
+
+def _columns(conn, table: str) -> set:
+    return {_text(row.get("name")) for row in _query(conn, "PRAGMA table_info(%s)" % table)}
+
+
+def _migrate(conn) -> None:
+    """Bring an older database up to the channel-aware schema, in place.
+
+    Additive only, and idempotent. `ADD COLUMN ... DEFAULT 'email'` is what makes
+    the existing rows read as email without a single UPDATE — an unmigrated
+    campaign's history stays exactly what it was, which is the whole promise of
+    migrating rather than recreating.
+
+    `leads.phone_key` is the exception, because a default cannot compute it: the
+    tail has to be derived from each stored phone number. It is backfilled once,
+    inside the branch that creates the column, so a lead whose number is too
+    short to key is not re-examined on every open for the rest of the file's
+    life.
+    """
+    conn = _resolve(conn)
+    with _LOCK:
+        for table, column, ddl in _ADDED_COLUMNS:
+            existing = _columns(conn, table)
+            if not existing or column in existing:
+                continue
+            _write(conn, ddl)
+            if (table, column) == ("leads", "phone_key"):
+                _backfill_phone_keys(conn)
+        try:
+            conn.executescript(_LATE_INDEXES)
+            conn.commit()
+        except sqlite3.Error:
+            pass
+
+
+def _backfill_phone_keys(conn) -> None:
+    """Derive `phone_key` for every lead already carrying a phone number.
+
+    Done in Python because the key is not something SQL can express: it strips
+    an extension before it reads a digit, and `replace()` chains cannot.
+
+    One `executemany` under one commit, not a `_write` per row. This runs on the
+    first open after the upgrade, which is app start, and the user is looking at
+    a splash screen while it does. Measured on a synthetic store of 20,000 leads
+    and 20,000 queued messages (81 MB): a commit per row took 1,780ms, batched
+    it takes 116ms, and every open after either is 7ms. At the 2,000 leads a
+    real store holds it is 141ms against 24ms — small enough not to matter, and
+    the large case is the one that would have been noticed as a hang.
+    """
+    updates = []
+    for row in _query(conn, "SELECT id, phone FROM leads "
+                            "WHERE phone IS NOT NULL AND phone != ''"):
+        key = _phone_key(row.get("phone"))
+        if key:
+            updates.append((key, _int(row.get("id"))))
+    if not updates:
+        return
+    with _LOCK:
+        try:
+            conn.executemany("UPDATE leads SET phone_key = ? WHERE id = ?", updates)
+            conn.commit()
+        except sqlite3.Error:
+            # A backfill that could not finish is not a failed open: the column
+            # exists, new writes fill it, and the join simply misses the rows it
+            # never reached. Losing the store instead would be worse.
+            pass
 
 
 # ── Connection ───────────────────────────────────────────────────────────────
@@ -172,7 +307,14 @@ def _open(target: str) -> sqlite3.Connection:
 
 
 def init_db(conn) -> None:
-    """Create the tables and indexes. Idempotent; safe on every open."""
+    """Create the tables and indexes, then migrate. Idempotent; safe on every open.
+
+    The order is the point. `_SCHEMA` is `CREATE TABLE IF NOT EXISTS`, so it
+    does nothing at all to a database that already exists — including one
+    written before the `channel` columns. `_migrate` is what brings that file
+    forward, and it has to run before any index over the new columns is
+    attempted.
+    """
     conn = _resolve(conn)
     with _LOCK:
         try:
@@ -180,6 +322,7 @@ def init_db(conn) -> None:
             conn.commit()
         except sqlite3.Error:
             pass
+        _migrate(conn)
 
 
 def close_all() -> None:
@@ -275,6 +418,17 @@ def _email(value) -> str:
     return _text(value).strip().lower()
 
 
+def _channel(value, default: str = EMAIL) -> str:
+    """A stored channel name. Anything unrecognised reads as email.
+
+    Falling back rather than rejecting is what lets an unmigrated row, a blank
+    column and a typo all behave: every one of them is a row from before the
+    WhatsApp channel existed, and email is what it was.
+    """
+    name = _text(value).strip().lower()
+    return name if name in CHANNELS else default
+
+
 def _int(value) -> int:
     try:
         return int(value)
@@ -333,6 +487,12 @@ def _lead_columns(lead: dict, email: str) -> dict:
         value = _text(lead.get(key)).strip()
         if value:
             out[key] = value
+
+    # Derived, never taken from the caller: the WhatsApp channel and the shared
+    # do-not-contact list both match on this, and a scraper that supplied its own
+    # would be free to supply one that matches nothing.
+    if "phone" in out:
+        out["phone_key"] = _phone_key(out["phone"])
 
     domain = _text(lead.get("domain")).strip().lower()
     if not domain:
@@ -514,6 +674,7 @@ def queue_message(conn, msg: dict) -> int:
         "body_text": _text(msg.get("body_text")),
         "body_html": _text(msg.get("body_html")),
         "account_email": _email(msg.get("account_email")),
+        "channel": _channel(msg.get("channel")),
         "status": _text(msg.get("status")).strip() or "queued",
         "scheduled_at": _float(msg.get("scheduled_at")),
         "message_id": _text(msg.get("message_id")),
@@ -525,13 +686,31 @@ def queue_message(conn, msg: dict) -> int:
                   tuple(row.values()))
 
 
+# Both halves of the shared do-not-contact list, as one SQL fragment, so that no
+# query can be written that checks only the one it happens to be about. A
+# WhatsApp opt-out has to hold back the email queue and an email unsubscribe has
+# to hold back the WhatsApp queue; a `NOT EXISTS` per read is what makes that
+# true for rows queued before the opt-out arrived, and for leads scraped after
+# it. `phone_key` is compared rather than `phone` because the same number
+# reaches this app as "(416) 555-0142" from Maps and as "14165550142" from a
+# reply — see `core.whatsapp.phone_key`.
+_NOT_SUPPRESSED = (
+    "NOT EXISTS (SELECT 1 FROM suppression "
+    "            WHERE suppression.email = LOWER(COALESCE(leads.email, ''))) "
+    "AND NOT EXISTS (SELECT 1 FROM suppression_phone "
+    "                WHERE suppression_phone.tail != '' "
+    "                AND suppression_phone.tail = COALESCE(leads.phone_key, '')) "
+)
+
+
 def due_messages(conn, now_ts: float, limit: int = 50,
-                 campaign_id: int = 0) -> list[dict]:
+                 campaign_id: int = 0, *, channel: str = "") -> list[dict]:
     """Queued messages that are ready to send, earliest first.
 
     Suppressed leads are filtered out in the query rather than by the caller:
     the plan can be days old, and an unsubscribe that arrived in between must
-    take effect even for a message whose row `suppress()` never saw.
+    take effect even for a message whose row `suppress()` never saw. Both
+    channels' opt-outs are honoured here, whichever channel the row belongs to.
 
     `campaign_id` narrows the same way, and for the same reason it has to be
     done here rather than by the caller: `limit` is applied by SQLite before
@@ -539,29 +718,36 @@ def due_messages(conn, now_ts: float, limit: int = 50,
     campaign's queue through a window filled by another's. A second campaign
     prepared behind a stale one of two hundred overdue messages got back an
     empty list every time and never sent anything at all.
+
+    `channel` defaults to every channel rather than to email, because a campaign
+    is single-channel and `campaign_id` already answers the question for every
+    caller that has one.
     """
     scope, params = "", [_float(now_ts)]
     if _int(campaign_id):
-        scope = " AND messages.campaign_id = ?"
+        scope += " AND messages.campaign_id = ?"
         params.append(_int(campaign_id))
+    if _text(channel).strip():
+        scope += " AND COALESCE(messages.channel, 'email') = ?"
+        params.append(_channel(channel))
     params.append(_int(limit) if _int(limit) > 0 else -1)
     return _query(
         conn,
         "SELECT messages.* FROM messages "
         "LEFT JOIN leads ON leads.id = messages.lead_id "
         "WHERE messages.status = 'queued' AND messages.scheduled_at <= ?" + scope +
-        " AND NOT EXISTS (SELECT 1 FROM suppression "
-        "                 WHERE suppression.email = LOWER(COALESCE(leads.email, ''))) "
+        " AND " + _NOT_SUPPRESSED +
         "ORDER BY messages.scheduled_at ASC, messages.id ASC LIMIT ?",
         tuple(params),
     )
 
 
-_MESSAGE_NUMERIC = {"scheduled_at": _float, "sent_at": _float,
-                    "step": _int, "campaign_id": _int, "lead_id": _int}
+# How each writable column is coerced on the way in; anything absent is text.
+_MESSAGE_COERCE = {"scheduled_at": _float, "sent_at": _float, "step": _int,
+                   "campaign_id": _int, "lead_id": _int, "channel": _channel}
 _MESSAGE_UPDATABLE = ("sent_at", "error", "message_id", "account_email",
                       "scheduled_at", "subject", "body_text", "body_html",
-                      "step", "campaign_id", "lead_id")
+                      "step", "campaign_id", "lead_id", "channel")
 
 
 def first_touch_sent(conn, campaign_id: int, lead_id: int) -> dict:
@@ -632,7 +818,7 @@ def mark_message(conn, message_id, /, status: str, **fields) -> None:
     changes = {}
     for key in _MESSAGE_UPDATABLE:
         if key in fields:
-            coerce = _MESSAGE_NUMERIC.get(key, _text)
+            coerce = _MESSAGE_COERCE.get(key, _text)
             changes[key] = coerce(fields[key])
     status = _text(status).strip()
     if status:
@@ -721,62 +907,236 @@ def sent_messages(conn, campaign_id: int = 0, limit: int = 200) -> list[dict]:
 
 # ── Suppression ──────────────────────────────────────────────────────────────
 
-def suppress(conn, email: str, reason: str) -> None:
-    """Add an address to the do-not-contact list and unwind what is queued.
+def _holes(values) -> str:
+    """Placeholders for an `IN` list; `NULL` keeps an empty one from matching."""
+    return ", ".join("?" * len(values)) or "NULL"
 
-    Cancelling the queued messages is the whole point: by the time somebody
-    unsubscribes, their follow-ups are already scheduled days out, and leaving
-    them queued would send mail to a person who has explicitly opted out.
+
+def _handle_closure(conn, address: str, tail: str) -> tuple[set, set, dict]:
+    """Every address and phone tail that belongs to the person opting out.
+
+    One handle is rarely the whole identity. A lead is keyed on its email and
+    also carries a phone, so an unsubscribe by mail names a number this app is
+    about to WhatsApp, and a STOP on WhatsApp names an address it is about to
+    email. Expanding to the fixed point rather than one hop is deliberate: two
+    branch rows sharing a switchboard are one person answering that number, and
+    the alternative is that the eager write and the lazy join below disagree
+    about who is suppressed — the read gate would block a lead the write pass
+    never recorded, which is the kind of split nobody can debug from the UI.
+
+    This over-suppresses in one direction on purpose. A shared number can cost
+    a lead its email sequence; the mistake in the other direction is messaging
+    someone who has said stop, and there is no undo for that one.
+    """
+    emails = {address} if address else set()
+    tails = {tail} if tail else set()
+    # tail → the number as a human wrote it, so the do-not-contact list can show
+    # "(416) 555-0142" rather than the eight digits it matches on.
+    shown: dict = {}
+    # A lead has one email and one number, so the graph closes almost at once.
+    # The bound is here because a bug in the query must not become a hang in a
+    # worker thread, not because the data can reach it.
+    for _ in range(8):
+        found = _query(
+            conn,
+            "SELECT LOWER(email) AS email, COALESCE(phone, '') AS phone, "
+            "COALESCE(phone_key, '') AS tail "
+            "FROM leads WHERE LOWER(email) IN (%s) OR (phone_key != '' "
+            "AND phone_key IN (%s))" % (_holes(emails), _holes(tails)),
+            tuple(sorted(emails)) + tuple(sorted(tails)),
+        )
+        for row in found:
+            if row.get("tail") and row.get("phone"):
+                shown.setdefault(_text(row["tail"]), _text(row["phone"]))
+        grown = {_email(r.get("email")) for r in found if r.get("email")} - emails
+        grown_tails = {_text(r.get("tail")) for r in found if r.get("tail")} - tails
+        if not grown and not grown_tails:
+            break
+        emails |= grown
+        tails |= grown_tails
+    return emails, tails, shown
+
+
+def suppress(conn, email: str = "", reason: str = "", *, phone: str = "") -> None:
+    """Add a lead to the do-not-contact list and unwind what is queued.
+
+    **Suppression is shared across both channels.** Either handle suppresses
+    the person, not the transport: a STOP on WhatsApp stops the email sequence
+    and an unsubscribe by email stops the WhatsApp messages already scheduled.
+    That is the point of one lead pool, and it is why this writes both handles
+    rather than only the one it was called with.
+
+    Cancelling the queued messages is the whole point of the second half: by the
+    time somebody unsubscribes, their follow-ups are already scheduled days out,
+    and leaving them queued would contact a person who has explicitly opted out.
+    Every channel's rows go, not just the one the opt-out arrived on.
 
     A rehearsed row is cancelled with them. It is a message still owed to this
     lead, and `requeue_rehearsed` would put it straight back on the queue, so
     an opt-out that skipped over it would hold only until the next dry run.
+
+    `email` and `reason` stay positional so that every existing caller keeps
+    working unchanged; `phone` is keyword-only because a bare second string
+    would be ambiguous against `reason`.
     """
     address = _email(email)
     if "@" not in address:
+        address = ""
+    tail = _phone_key(phone)
+    if not address and not tail:
         return
 
     now = time.time()
     with _LOCK:
-        _write(conn,
-               "INSERT INTO suppression (email, reason, added_at) VALUES (?, ?, ?) "
-               "ON CONFLICT(email) DO UPDATE SET reason = excluded.reason",
-               (address, _text(reason), now))
+        emails, tails, shown = _handle_closure(conn, address, tail)
+        if tail:
+            shown[tail] = _text(phone).strip() or shown.get(tail, "")
+        for one in sorted(emails):
+            _write(conn,
+                   "INSERT INTO suppression (email, reason, added_at) VALUES (?, ?, ?) "
+                   "ON CONFLICT(email) DO UPDATE SET reason = excluded.reason",
+                   (one, _text(reason), now))
+        for one in sorted(tails):
+            _write(conn,
+                   "INSERT INTO suppression_phone (tail, phone, reason, added_at) "
+                   "VALUES (?, ?, ?, ?) ON CONFLICT(tail) DO UPDATE SET "
+                   "reason = excluded.reason, phone = CASE WHEN excluded.phone != '' "
+                   "THEN excluded.phone ELSE suppression_phone.phone END",
+                   (one, shown.get(one, ""), _text(reason), now))
+
+        scope = ("SELECT id FROM leads WHERE LOWER(email) IN (%s) "
+                 "OR (phone_key != '' AND phone_key IN (%s))"
+                 % (_holes(emails), _holes(tails)))
+        params = tuple(sorted(emails)) + tuple(sorted(tails))
         _write(conn,
                "UPDATE messages SET status = 'skipped', error = 'suppressed' "
                "WHERE status IN ('queued', 'sending', 'rehearsed') "
-               "AND lead_id IN (SELECT id FROM leads WHERE LOWER(email) = ?)",
-               (address,))
+               "AND lead_id IN (%s)" % scope, params)
         _write(conn, "UPDATE leads SET status = 'suppressed', updated_at = ? "
-                     "WHERE LOWER(email) = ?", (now, address))
-        detail = f"{address}: {reason}" if reason else address
+                     "WHERE id IN (%s)" % scope, (now, *params))
+
+        handle = address or _text(phone).strip() or tail
+        detail = f"{handle}: {reason}" if reason else handle
         log_event(conn, "suppressed", detail)
 
 
-def is_suppressed(conn, email: str) -> bool:
-    return bool(_scalar(conn, "SELECT COUNT(*) FROM suppression WHERE email = ?",
-                        (_email(email),)))
+def unsuppress(conn, email: str = "", *, phone: str = "") -> bool:
+    """Let a suppressed lead be contacted again. True when something was removed.
+
+    The inverse of `suppress`, and it has to clear **both** handles for the same
+    reason `suppress` writes both. Dropping only the address would leave the
+    number on the phone list, where the join in `_NOT_SUPPRESSED` would go on
+    refusing every queue — a lead the user had just released, still silently
+    unsendable, with nothing in the UI to say why.
+
+    Nothing is re-queued. Those rows carry a send time that has since passed and
+    restoring them would send the whole backlog at once; a released lead belongs
+    in the next campaign, not in the one they opted out of. The lead's status is
+    left to the caller, which is the only thing that knows what it was before.
+    """
+    address = _email(email)
+    if "@" not in address:
+        address = ""
+    tail = _phone_key(phone)
+    if not address and not tail:
+        return False
+
+    with _LOCK:
+        emails, tails, _ = _handle_closure(conn, address, tail)
+        removed = 0
+        if emails:
+            removed += _scalar(conn, "SELECT COUNT(*) FROM suppression "
+                                     "WHERE email IN (%s)" % _holes(emails),
+                               tuple(sorted(emails)))
+            _write(conn, "DELETE FROM suppression WHERE email IN (%s)"
+                   % _holes(emails), tuple(sorted(emails)))
+        if tails:
+            removed += _scalar(conn, "SELECT COUNT(*) FROM suppression_phone "
+                                     "WHERE tail IN (%s)" % _holes(tails),
+                               tuple(sorted(tails)))
+            _write(conn, "DELETE FROM suppression_phone WHERE tail IN (%s)"
+                   % _holes(tails), tuple(sorted(tails)))
+        if removed:
+            log_event(conn, "unsuppressed", address or _text(phone).strip() or tail)
+        return bool(removed)
+
+
+def is_suppressed(conn, email: str = "", *, phone: str = "") -> bool:
+    """Is this person on the do-not-contact list, by either handle.
+
+    Asked both ways round for each handle given. The direct lookups answer for
+    an opt-out `suppress` recorded; the joins answer for a lead scraped *after*
+    it, whose row that write pass could not have seen. Both are needed — the
+    lead pool keeps growing after somebody has said stop.
+    """
+    address = _email(email)
+    tail = _phone_key(phone)
+    if not address and not tail:
+        return False
+
+    if address:
+        if _scalar(conn, "SELECT COUNT(*) FROM suppression WHERE email = ?",
+                   (address,)):
+            return True
+        if _scalar(conn,
+                   "SELECT COUNT(*) FROM leads JOIN suppression_phone "
+                   "ON suppression_phone.tail = leads.phone_key "
+                   "WHERE LOWER(leads.email) = ? AND leads.phone_key != ''",
+                   (address,)):
+            return True
+    if tail:
+        if _scalar(conn, "SELECT COUNT(*) FROM suppression_phone WHERE tail = ?",
+                   (tail,)):
+            return True
+        if _scalar(conn,
+                   "SELECT COUNT(*) FROM leads JOIN suppression "
+                   "ON suppression.email = LOWER(leads.email) "
+                   "WHERE leads.phone_key = ?", (tail,)):
+            return True
+    return False
 
 
 def _lead_suppressed(conn, lead_id: int) -> bool:
+    """The same question about a stored lead, on either of its handles."""
     return bool(_scalar(
         conn,
-        "SELECT COUNT(*) FROM leads JOIN suppression "
-        "ON suppression.email = LOWER(leads.email) WHERE leads.id = ?",
+        "SELECT COUNT(*) FROM leads WHERE leads.id = ? AND NOT (%s)"
+        % _NOT_SUPPRESSED,
         (_int(lead_id),),
     ))
 
 
 def suppression_list(conn) -> list[dict]:
+    """The suppressed addresses. Numbers are `suppressed_phones` — see there."""
     return _query(conn, "SELECT * FROM suppression ORDER BY added_at DESC, email")
+
+
+def suppressed_phones(conn) -> list[dict]:
+    """The suppressed numbers, newest first.
+
+    A second list rather than a union into `suppression_list`, because that one
+    is read by a panel that treats every row as an address and offers to remove
+    it by address. A phone row arriving there would render blank and its Remove
+    button would silently delete nothing.
+    """
+    return _query(conn, "SELECT * FROM suppression_phone "
+                        "ORDER BY added_at DESC, tail")
 
 
 # ── Send log and quotas ──────────────────────────────────────────────────────
 
-def record_send(conn, account_email: str, ts: float) -> None:
-    """Log one delivered message against the sending account's quota."""
-    _write(conn, "INSERT INTO sends (account_email, ts) VALUES (?, ?)",
-           (_email(account_email), _float(ts) or time.time()))
+def record_send(conn, account_email: str, ts: float, *,
+                channel: str = EMAIL) -> None:
+    """Log one delivered message against this account's quota on this channel.
+
+    The channel is part of the key, not a label. WhatsApp's daily allowance is
+    thirty against email's forty, and a ledger that pooled them would let a
+    morning of WhatsApp messages spend the email budget — or, far worse, let a
+    day of email leave the WhatsApp cap looking spent while the number's real
+    exposure was nil.
+    """
+    _write(conn, "INSERT INTO sends (account_email, channel, ts) VALUES (?, ?, ?)",
+           (_email(account_email), _channel(channel), _float(ts) or time.time()))
 
 
 def _zone(tz):
@@ -805,8 +1165,9 @@ def _day_start(now_ts: float, tz) -> float:
     return local.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
 
 
-def sent_today(conn, account_email: str, tz, *, now_ts: float = 0.0) -> int:
-    """Sends by this account since local midnight in `tz`.
+def sent_today(conn, account_email: str, tz, *, now_ts: float = 0.0,
+               channel: str = EMAIL) -> int:
+    """Sends by this account on this channel since local midnight in `tz`.
 
     Deliberately *not* a rolling 24 hours. Gmail's daily limit resets on the
     calendar-day boundary, so a rolling window either strands most of a day's
@@ -814,15 +1175,19 @@ def sent_today(conn, account_email: str, tz, *, now_ts: float = 0.0) -> int:
     on yesterday's budget, which is how an account gets suspended.
 
     `now_ts` exists so the scheduler and the tests can ask about a fixed
-    instant instead of "now".
+    instant instead of "now". `channel` defaults to email so that every caller
+    written before there was a second channel still counts what it meant to.
     """
     start = _day_start(_float(now_ts) or time.time(), tz)
-    return _scalar(conn, "SELECT COUNT(*) FROM sends WHERE account_email = ? AND ts >= ?",
-                   (_email(account_email), start))
+    return _scalar(conn,
+                   "SELECT COUNT(*) FROM sends WHERE account_email = ? "
+                   "AND COALESCE(channel, 'email') = ? AND ts >= ?",
+                   (_email(account_email), _channel(channel), start))
 
 
-def recent_sends(conn, account_email: str, *, since_ts: float) -> list[float]:
-    """This account's send times at or after `since_ts`, ascending.
+def recent_sends(conn, account_email: str, *, since_ts: float,
+                 channel: str = EMAIL) -> list[float]:
+    """This account's send times on this channel at or after `since_ts`, ascending.
 
     A cap check only needs "how many", which is what `sent_last_hour` below
     returns. A queue *held* by that cap needs the other half — when it clears —
@@ -831,15 +1196,19 @@ def recent_sends(conn, account_email: str, *, since_ts: float) -> list[float]:
     owe, or call the day spent and push the backlog to tomorrow.
 
     The window is bounded by the hourly cap in every caller, so this is a
-    handful of rows off `idx_sends_account_ts` and not a scan.
+    handful of rows off `idx_sends_account_ts` and not a scan — which is also
+    why `channel` is filtered per row here rather than given an index of its
+    own: the seek has already narrowed to dozens of rows before it is read.
     """
     return [_float(row.get("ts")) for row in _query(
-        conn, "SELECT ts FROM sends WHERE account_email = ? AND ts >= ? ORDER BY ts",
-        (_email(account_email), _float(since_ts)))]
+        conn, "SELECT ts FROM sends WHERE account_email = ? "
+              "AND COALESCE(channel, 'email') = ? AND ts >= ? ORDER BY ts",
+        (_email(account_email), _channel(channel), _float(since_ts)))]
 
 
-def sent_last_hour(conn, account_email: str, *, now_ts: float = 0.0) -> int:
-    """Sends in the trailing 60 minutes.
+def sent_last_hour(conn, account_email: str, *, now_ts: float = 0.0,
+                   channel: str = EMAIL) -> int:
+    """Sends on this channel in the trailing 60 minutes.
 
     A rolling window is correct here where it is wrong for the daily count: the
     hourly cap exists to flatten bursts, and nothing about it resets on a clock
@@ -851,7 +1220,8 @@ def sent_last_hour(conn, account_email: str, *, now_ts: float = 0.0) -> int:
     the other says it may go is a loop that never settles.
     """
     now = _float(now_ts) or time.time()
-    return len(recent_sends(conn, account_email, since_ts=now - _HOUR_SEC))
+    return len(recent_sends(conn, account_email, since_ts=now - _HOUR_SEC,
+                            channel=channel))
 
 
 # ── Events ───────────────────────────────────────────────────────────────────
