@@ -90,8 +90,10 @@ import html
 import re
 import time
 
-from PyQt5.QtCore import QDate, QEvent, QSize, Qt, QThread, QTimer, pyqtSignal
-from PyQt5.QtGui import QColor, QFontDatabase, QTextCursor
+from PyQt5.QtCore import (
+    QDate, QEvent, QObject, QSize, Qt, QThread, QTimer, pyqtSignal,
+)
+from PyQt5.QtGui import QColor, QFontDatabase, QPixmap, QTextCursor
 from PyQt5.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDateEdit, QFrame, QGridLayout,
     QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
@@ -103,7 +105,9 @@ from PyQt5.QtWidgets import (
 from core import ai as ai_client
 from core import campaign as _campaign
 from core import mailer
+from core import outreach_db as _db
 from core import templates as _templates
+from core import whatsapp as _wa
 from core.settings import (
     SMTP_ACCOUNT_DEFAULTS, ai_budget_left, get_secret, load_settings,
     save_settings, set_secret,
@@ -146,6 +150,62 @@ COMMON_ZONES = (
     "Asia/Karachi", "Asia/Dubai", "Asia/Kolkata", "Asia/Singapore",
     "Australia/Sydney",
 )
+
+# ── WhatsApp ──
+# How often the connection card asks the session where it is. `status()`,
+# `me()` and `qr_png()` are dictionary reads behind a lock the browser never
+# holds — that is the shape `core/whatsapp.py` was written in and the reason
+# this can be a plain timer on the GUI thread rather than a worker. A second is
+# the longest anybody should be shown a QR that has already been scanned.
+_WA_POLL_MS = 1000
+
+# How wide the login QR is drawn, in characters of this screen's own copy —
+# the measure everything else here is sized in. It has to be scanned by a phone
+# held in front of the monitor, which is what decides the number: below about
+# twenty characters' worth the modules stop resolving at arm's length.
+_WA_QR_CH = 26
+
+# The ceilings the two caps may be typed up to. Deliberately far below the
+# email side's 500 and 200, and not because a bigger number would not fit in
+# the box: WhatsApp bans numbers for bulk outreach far faster than Gmail
+# suspends accounts, there is no CAN-SPAM equivalent permitting cold contact at
+# all, and a banned number is usually gone for good. A user who wants to send
+# faster than this is asking for the one outcome nothing here can undo.
+_WA_DAILY_CEILING = 100
+_WA_HOURLY_CEILING = 30
+
+# The floor under the gap between two messages, in seconds. The email side
+# allows five; a WhatsApp message every five seconds is the clearest automated
+# signature the platform can be handed.
+_WA_GAP_FLOOR = 30
+
+# One chaser, and the box will not offer a second. `wa_followup_max_steps`
+# ships at 1 for the reason the whole file is tighter: a third message to a
+# number that has never replied is what a recipient reports, and a report is
+# what takes the number away.
+_WA_FOLLOWUP_CEILING = 2
+
+
+def _wa_regions() -> tuple:
+    """(value, label) for every region an unqualified number may be completed in.
+
+    Read off `core.whatsapp.CALLING_CODES` rather than written out again here,
+    because that table is what `to_wa_id` actually consults: a picker offering a
+    country the transport does not know would be a control whose every use is
+    silently refused, and the refusal would look like the lead's fault.
+
+    The label carries the dialling code rather than a country name. There is no
+    country-name table in this app, and inventing one in the settings screen is
+    how a picker starts disagreeing with the thing behind it.
+
+    Blank is first and blank is the default. A number scraped as "(416)
+    555-0142" is a different business in every country that dials 416, and
+    getting it wrong is not a bounce — it is a message to a stranger abroad,
+    from a number that then has to survive being reported by them.
+    """
+    codes = getattr(_wa, "CALLING_CODES", None) or {}
+    return ((("", "No default — a number must carry its own + country code"),)
+            + tuple((iso, "%s  ·  +%s" % (iso, codes[iso])) for iso in sorted(codes)))
 
 # The three tones a validation line can carry, as token paths rather than as the
 # three hexes that used to sit here. They are reached through the module's own
@@ -242,6 +302,12 @@ FORM_LABELS = (
     "Daily cap per account", "Hourly cap per account", "Start at",
     "Increase each day by", "Stop increasing at", "Wait between touches",
     "Follow-ups per lead", "Unsubscribe address", "Theme", "Density",
+    # WhatsApp. None of these is wider than the entries above, which is the
+    # point of listing them: column one is one width on every tab, and a label
+    # that is not in this tuple is a label the next density change can move.
+    "Connection", "This number", "Default region", "Messaging days",
+    "Messaging window", "Minimum gap", "Maximum gap", "Daily cap",
+    "Hourly cap", "Opt-out words",
 )
 
 # Everything a paste can carry that ends a line, with whatever horizontal space
@@ -799,6 +865,19 @@ def _palette_ceiling() -> int:
     return 3 * t.control["xs"] + 2 * t.space["1"]
 
 
+def _qr_side(label: QWidget) -> int:
+    """How big the login QR is drawn, in this screen's own measure.
+
+    A square, sized in characters like every other width on this screen rather
+    than in a pixel count somebody once found readable on one monitor. The
+    reference prints its QR to a terminal because it is a Node CLI; this is a
+    desktop app and sending the user to a console to log in is that
+    constraint's, not ours — so the one thing this size has to be is scannable
+    by a phone held in front of the screen.
+    """
+    return _chars_wide(label.fontMetrics(), _WA_QR_CH)
+
+
 class _Spin(QSpinBox):
     """A number box as wide as the number it holds, and no wider.
 
@@ -953,6 +1032,56 @@ def _cap_note(settings: dict, accounts) -> str:
     return ("Sends %d today, not %d. Each account's own cap and the warm-up "
             "ramp both have to allow a message, and the smallest of the three "
             "is what goes out." % (kept, asked))
+
+
+def _wa_words(text: str) -> list:
+    """The opt-out vocabulary as typed, split on commas.
+
+    Lowercased and de-duplicated in order, because this list is compared
+    against whatever a stranger types back and "STOP", "Stop" and " stop " are
+    one word. An empty box keeps the shipped defaults rather than storing
+    nothing: a campaign with no opt-out vocabulary at all would append a line
+    inviting a reply it would then ignore, which is worse than not asking.
+    """
+    seen, out = set(), []
+    for piece in str(text or "").split(","):
+        word = " ".join(piece.split()).lower()
+        if word and word not in seen:
+            seen.add(word)
+            out.append(word)
+    return out or list(_settings_default_optout())
+
+
+def _settings_default_optout() -> tuple:
+    from core.settings import DEFAULT_SETTINGS
+
+    return tuple(DEFAULT_SETTINGS.get("wa_opt_out_words") or ())
+
+
+def _wa_region_note(values: dict) -> str:
+    """What a blank default region costs, when it is blank.
+
+    `core.campaign.wa_warnings` is the sentence the Campaign tab shows before a
+    plan is committed, and it is asked for here rather than paraphrased so the
+    two screens cannot come to describe the same setting differently.
+    """
+    warnings = _campaign.wa_warnings(values)
+    return warnings[0] if warnings else ""
+
+
+def _wa_cap_note(values: dict) -> str:
+    """The same sentence `_cap_note` writes, asked of the WhatsApp channel.
+
+    `channel_settings` renames every wa_* number onto the scheduler's own key
+    and `channel_accounts` describes the connected number as the one account row
+    the cap rules read, so the ramp and the cap compose here exactly as they do
+    for a Gmail address — through the same function, with no second copy of the
+    arithmetic to drift from it.
+    """
+    mapped = _campaign.channel_settings(values, _campaign.WHATSAPP)
+    accounts = _campaign.channel_accounts(dict(values, wa_enabled=True),
+                                          _campaign.WHATSAPP)
+    return _cap_note(mapped, accounts)
 
 
 def _mono_family() -> str:
@@ -1468,6 +1597,348 @@ class _Probe(QThread):
             self.result_signal.emit(bool(ok), str(message), int(latency_ms))
 
 
+# ── The WhatsApp connection ──────────────────────────────────────────────────
+
+class _LinkWorker(QThread):
+    """One blocking call on the WhatsApp session, off the GUI thread.
+
+    `start()` launches Chrome and `close()` quits it. Either run inline freezes
+    the window for seconds and Windows paints the "not responding" ghost over
+    it, which on the one screen where the user is waiting for a QR reads as a
+    crash. Nothing else about the session blocks — `status()`, `me()` and
+    `qr_png()` are dictionary reads — so this is the whole of what needs a
+    thread.
+
+    The answer comes back as a sentence because a sentence is what the
+    connection card shows. `start()` reports `(ok, error)` and `close()` reports
+    nothing at all; both arrive here as "" for success.
+    """
+
+    done_signal = pyqtSignal(str)
+
+    def __init__(self, call, parent=None):
+        super().__init__(parent)
+        self._call = call
+
+    def run(self) -> None:
+        try:
+            answer = self._call()
+        except Exception as exc:                    # noqa: BLE001 — reported
+            self.done_signal.emit("%s: %s" % (type(exc).__name__, exc))
+            return
+        if isinstance(answer, tuple) and len(answer) == 2 and not answer[0]:
+            self.done_signal.emit(str(answer[1] or "WhatsApp would not start."))
+            return
+        self.done_signal.emit("")
+
+
+class _QrView(QLabel):
+    """The login QR, square, and re-measured when the font it is sized in moves.
+
+    Scaled with `FastTransformation` on purpose. Smooth scaling averages
+    neighbouring pixels, which on a QR blurs the edge of every module — and a
+    blurred QR is one a phone camera will not lock onto, which is the only thing
+    this widget exists to allow.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignCenter)
+        self._png = b""
+        self._cap()
+
+    def show_png(self, png) -> None:
+        """Draw these PNG bytes. `b""` clears it."""
+        png = bytes(png or b"")
+        if png == self._png:
+            return
+        self._png = png
+        self._paint()
+
+    def png(self) -> bytes:
+        return self._png
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() in (QEvent.FontChange, QEvent.StyleChange,
+                            QEvent.ApplicationFontChange):
+            self._cap()
+
+    def _cap(self) -> None:
+        side = _qr_side(self)
+        self.setFixedSize(QSize(side, side))
+        self._paint()
+
+    def _paint(self) -> None:
+        if not self._png:
+            self.setPixmap(QPixmap())
+            return
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(self._png, "PNG"):
+            self.setPixmap(QPixmap())
+            return
+        self.setPixmap(pixmap.scaled(self.size(), Qt.KeepAspectRatio,
+                                     Qt.FastTransformation))
+
+
+class _WhatsAppLink(QObject):
+    """The one WhatsApp session this process may have open, and its state.
+
+    Four things about it are load-bearing.
+
+    **It is one session, and it lives outside any screen.** The session's
+    persistence is a Chrome user-data-dir standing in for the reference's
+    `LocalAuth`, and Chrome takes an exclusive lock on one: a second session
+    opened on the same profile does not give the user a second window, it
+    refuses to start or it corrupts the first — and what a corrupted profile
+    costs on this channel is the scanned QR, and sometimes the number. So the
+    Settings screen opens it, the send loop borrows it (`OutreachWorker` closes
+    only a session it opened itself), and neither of them owns it.
+
+    **Nothing here blocks the GUI thread.** Only `start()` and `close()` do, and
+    both go through `_LinkWorker`. Everything the card polls is served from the
+    session's cached snapshot.
+
+    **Opening is an explicit act, never a side effect.** No question asked of
+    this object opens a session, so walking onto the Settings screen costs no
+    browser at all: with nothing open `status()` is "offline", and that is the
+    whole of what the card draws until Connect is pressed.
+
+    **The factory is injectable and starts as None.** No test in this suite may
+    open a real WhatsApp session, and a factory captured at import would be the
+    only thing standing between a stubbed screen and a real Chrome.
+    """
+
+    changed = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.factory = None
+        self._session = None
+        self._worker = None
+        self._busy = ""                  # "opening" | "closing" | ""
+        self._error = ""
+        self._published = None
+        self._hooked = False
+        self._poll = QTimer(self)
+        self._poll.setInterval(_WA_POLL_MS)
+        self._poll.timeout.connect(self._tick)
+
+    # ── what the screens read ──
+
+    def status(self) -> str:
+        """One of `core.whatsapp.WA_STATUSES`. "offline" when nothing is open."""
+        session = self._session
+        if session is None:
+            return _wa.OFFLINE
+        try:
+            return str(session.status() or _wa.OFFLINE)
+        except Exception:                           # noqa: BLE001 — a card, not a raise
+            return _wa.OFFLINE
+
+    def qr_png(self) -> bytes:
+        """The login QR as PNG bytes, `b""` unless one is being waited for."""
+        session = self._session
+        if session is None:
+            return b""
+        try:
+            return bytes(session.qr_png() or b"")
+        except Exception:                           # noqa: BLE001
+            return b""
+
+    def me(self) -> str:
+        """The logged-in number, "" while it is not known yet."""
+        session = self._session
+        if session is None:
+            return ""
+        try:
+            return str(session.me() or "")
+        except Exception:                           # noqa: BLE001
+            return ""
+
+    def busy(self) -> str:
+        """What the link is doing to itself: "opening", "closing", or nothing."""
+        return self._busy
+
+    def error(self) -> str:
+        """Why the last open or close did not work, "" when it did."""
+        return self._error
+
+    def is_open(self) -> bool:
+        return self._session is not None
+
+    def session_for_send(self):
+        """The session a run may borrow, or None. Never opens one.
+
+        None rather than a session that is still showing a QR: handing the send
+        loop a browser that is not logged in turns every message in the queue
+        into an `AUTH:` failure, and the run would stop having spent the pacing
+        slot on each of them.
+        """
+        return self._session if self.status() == _wa.READY else None
+
+    # ── opening and closing ──
+
+    def open(self, settings: dict) -> str:
+        """Start Chrome on the persisted profile. "" when the attempt began.
+
+        A sentence rather than an exception when it cannot: a connection card is
+        not a place to print a traceback, and the one thing the user needs from
+        a failed connect is what to do next.
+        """
+        if self._busy:
+            return "The connection is already %s." % self._busy
+        if self._session is not None:
+            return ""
+        try:
+            session = self._build(settings)
+        except Exception as exc:                    # noqa: BLE001 — reported
+            self._error = "The WhatsApp browser could not be created (%s)." % exc
+            self.changed.emit()
+            return self._error
+        self._session = session
+        self._error = ""
+        self._busy = "opening"
+        self._hook_quit()
+        self._run(session.start, self._opened)
+        self._settle()
+        self.changed.emit()
+        return ""
+
+    def close(self) -> str:
+        """Quit the browser. The scanned login stays on disk and survives it."""
+        if self._busy == "closing":
+            return ""
+        session, self._session = self._session, None
+        self._error = ""
+        if session is None:
+            self._settle()
+            self.changed.emit()
+            return ""
+        self._busy = "closing"
+        self._run(session.close, self._closed)
+        self.changed.emit()
+        return ""
+
+    def shutdown(self) -> None:
+        """Quit the browser inline, because the application is going away.
+
+        Inline and not through a worker: `aboutToQuit` is the last moment
+        anything runs, and a thread started here would be destroyed while it was
+        still inside Selenium. `undetected_chromedriver` spawns a Chrome that
+        outlives this process if nobody quits it, so the couple of seconds this
+        costs at exit buys the user's machine not accumulating a browser per
+        session.
+        """
+        self._poll.stop()
+        session, self._session = self._session, None
+        worker, self._worker = self._worker, None
+        if worker is not None and worker.isRunning():
+            worker.wait(_WA_POLL_MS)
+        if session is None:
+            return
+        try:
+            session.close()
+        except Exception:                           # noqa: BLE001 — shutdown
+            pass
+
+    def worker(self):
+        """The thread currently opening or closing, or None.
+
+        Published so the screen that asked for it can hold a reference: the
+        window finds a screen's threads by inspecting its attributes at
+        shutdown, and a QThread nothing names is a QThread destroyed while it is
+        still running.
+        """
+        return self._worker
+
+    # ── internals ──
+
+    def _build(self, settings: dict):
+        factory = self.factory or _wa.WhatsAppSession
+        settings = settings if isinstance(settings, dict) else {}
+        return factory(
+            profile=str(settings.get("wa_profile") or "default"),
+            headless=bool(settings.get("wa_headless", False)),
+            default_region=str(settings.get("wa_default_region") or "").strip().upper())
+
+    def _run(self, call, done) -> None:
+        worker = _LinkWorker(call, self)
+        worker.done_signal.connect(done)
+        worker.finished.connect(lambda: self._retire(worker))
+        self._worker = worker
+        worker.start()
+
+    def _retire(self, worker) -> None:
+        if self._worker is worker:
+            self._worker = None
+        worker.deleteLater()
+
+    def _opened(self, error: str) -> None:
+        self._busy = ""
+        self._error = error
+        if error:
+            # A session that would not start is not a session. Dropped rather
+            # than kept, so pressing Connect again is a fresh attempt instead of
+            # a second `start()` on a browser that never came up.
+            self._session = None
+        self._settle()
+        self.changed.emit()
+
+    def _closed(self, error: str) -> None:
+        self._busy = ""
+        self._error = error
+        self._settle()
+        self.changed.emit()
+
+    def _settle(self) -> None:
+        """Poll while there is something to poll, and not one tick longer."""
+        if self._session is None and not self._busy:
+            self._poll.stop()
+        elif not self._poll.isActive():
+            self._poll.start()
+
+    def _tick(self) -> None:
+        """Announce a change, and only a change.
+
+        The card is rebuilt from this signal — a QR image, three labels and two
+        buttons — and the state behind it moves perhaps four times in a login.
+        Emitting once a second instead would rebuild all of it under the user's
+        pointer for the whole of the wait.
+        """
+        state = (self.status(), self.me(), self.qr_png(), self._busy)
+        if state == self._published:
+            return
+        self._published = state
+        self.changed.emit()
+
+    def _hook_quit(self) -> None:
+        """Close the browser when the application does, once."""
+        if self._hooked:
+            return
+        app = QApplication.instance()
+        if app is None:
+            return
+        app.aboutToQuit.connect(self.shutdown)
+        self._hooked = True
+
+
+_LINK = None
+
+
+def wa_link() -> _WhatsAppLink:
+    """The process's one WhatsApp connection, built on first ask.
+
+    Never at import: a QObject constructed before the QApplication is a QObject
+    with no thread affinity to speak of, and this module is imported by tests
+    that never build an application at all.
+    """
+    global _LINK
+    if _LINK is None:
+        _LINK = _WhatsAppLink()
+    return _LINK
+
+
 # ── Gmail account row ────────────────────────────────────────────────────────
 
 class _AccountRow(QWidget):
@@ -1711,13 +2182,18 @@ class SettingsScreen(QWidget):
     back_signal = pyqtSignal()
     saved_signal = pyqtSignal(dict)
 
-    TABS = ("AI", "Sender", "Templates", "Gmail", "Sending", "Compliance",
-            "Appearance")
+    TABS = ("AI", "Sender", "Templates", "Gmail", "Sending", "WhatsApp",
+            "Compliance", "Appearance")
 
     def __init__(self):
         super().__init__()
         self.settings = load_settings()
         self._probes: list[_Probe] = []
+        # The thread the WhatsApp link is currently running, held here and
+        # nowhere else. `ui.app._screen_threads` finds a screen's workers by
+        # inspecting its attributes, and a QThread nothing on a screen names is
+        # a QThread the window destroys while it is still inside Chrome.
+        self._wa_worker = None
         self._account_rows: list[_AccountRow] = []
         self._templates: list = []
         self._template_id = ""
@@ -1733,6 +2209,12 @@ class SettingsScreen(QWidget):
         self._publish_timer = QTimer(self)
         self._publish_timer.setSingleShot(True)
         self._publish_timer.timeout.connect(self._push_to_shell)
+        # Connected once here rather than inside the page, because `restyle()`
+        # rebuilds every page and a connection made in a builder would be made
+        # again on each rebuild — the card would then be redrawn once per theme
+        # change the app has ever seen. The screen object outlives its widgets,
+        # so this survives the rebuild and the handler checks the card is there.
+        wa_link().changed.connect(self._on_wa_changed)
         self._build()
         self._load_into_ui()
 
@@ -1959,6 +2441,7 @@ class SettingsScreen(QWidget):
         # minimum it started below the fold.
         self.pages.addWidget(self._build_gmail_page())
         self.pages.addWidget(self._scrolled(self._build_sending_page()))
+        self.pages.addWidget(self._scrolled(self._build_whatsapp_page()))
         self.pages.addWidget(self._scrolled(self._build_compliance_page()))
         self.pages.addWidget(self._scrolled(self._build_appearance_page()))
         self.pages.currentChanged.connect(lambda _index: self._publish_to_shell())
@@ -3282,6 +3765,478 @@ class SettingsScreen(QWidget):
             "warmup_max": self.warmup_max_spin.value(),
         }
 
+    # ── WhatsApp ─────────────────────────────────────────────────────────────
+
+    def _build_whatsapp_page(self) -> QWidget:
+        """The second channel: one number, its login, and its own limits.
+
+        Every number below is tighter than the one above it on the Sending tab,
+        and none of them is a placeholder. WhatsApp bans numbers for bulk
+        outreach far faster than Gmail suspends accounts, there is no CAN-SPAM
+        equivalent that permits cold contact at all, and a banned number is
+        usually gone for good — so the defaults, and the ceilings the boxes
+        themselves allow, assume the user would rather send slowly than lose the
+        number.
+
+        The connection card is here and not on the outreach screen for the
+        reason the Gmail accounts are: this is where a transport is set up, and
+        the campaign screen's job is to use one. It opens nothing by being
+        looked at — connecting is a press.
+        """
+        page, column = self._page(
+            "WhatsApp",
+            "The second channel. One number, logged in by scanning a QR, with "
+            "limits deliberately tighter than the email side's.")
+
+        self._build_wa_connection(column)
+
+        channel = _Group(column, "Channel")
+        self.wa_enabled_cb = C.toggle(
+            "Offer WhatsApp as a channel",
+            help="Off, the Campaign tab has one channel and nothing can be "
+                 "queued against this number.")
+        channel.wide(self.wa_enabled_cb, note=self.wa_enabled_cb.help_label)
+        self.wa_region_combo = _combo(_wa_regions())
+        self.wa_region_note = _hint("")
+        self.wa_region_note.setVisible(False)
+        channel.field("Default region", _loose(self.wa_region_combo),
+                      note=self.wa_region_note)
+        channel.foot(
+            "A number scraped from Maps as “(416) 555-0142” is a different "
+            "business in every country that dials 416. With no default region "
+            "those leads are left out of a WhatsApp campaign rather than "
+            "guessed at — messaging the wrong one is not a bounce, it is a "
+            "stranger abroad who can report the number.")
+
+        window = _Group(column, "Window")
+        days_row = _row_box()
+        days_row.addStretch()
+        self.wa_day_boxes: list[QCheckBox] = []
+        for name in DAY_NAMES:
+            box = QCheckBox(name)
+            box.setCursor(Qt.PointingHandCursor)
+            box.toggled.connect(lambda _on: self._refresh_wa_notes())
+            self.wa_day_boxes.append(box)
+            days_row.addWidget(box)
+        self.wa_days_note = _hint("")
+        self.wa_days_note.setVisible(False)
+        window.field("Messaging days", days_row, note=self.wa_days_note)
+
+        self.wa_start_hour_spin = _spin(0, 23, 1, ":00", 2)
+        self.wa_end_hour_spin = _spin(1, 24, 1, ":00", 2)
+        hours_row = _row_box()
+        hours_row.addStretch()
+        hours_row.addWidget(self.wa_start_hour_spin)
+        hours_row.addWidget(QLabel("to"))
+        hours_row.addWidget(self.wa_end_hour_spin)
+        self.wa_window_note = _hint("")
+        self.wa_window_note.setVisible(False)
+        window.field("Messaging window", hours_row, note=self.wa_window_note)
+        for spin in (self.wa_start_hour_spin, self.wa_end_hour_spin):
+            spin.valueChanged.connect(lambda _value: self._refresh_wa_notes())
+        window.foot(
+            "The timezone is the one on the Sending tab: your working hours are "
+            "your working hours whichever channel you are on. The default here "
+            "opens an hour later and closes two hours later than the email "
+            "window, because a message at 08:00 reads worse on a phone than an "
+            "email does in an inbox.")
+
+        pacing = _Group(column, "Pacing")
+        self.wa_min_gap_spin = _spin(_WA_GAP_FLOOR, 7200, 15, " s", 4)
+        self.wa_max_gap_spin = _spin(_WA_GAP_FLOOR, 7200, 15, " s", 4)
+        self.wa_daily_cap_spin = _spin(1, _WA_DAILY_CEILING, 5, "", 3)
+        self.wa_hourly_cap_spin = _spin(1, _WA_HOURLY_CEILING, 1, "", 3)
+        self.wa_gap_note = _hint("")
+        self.wa_gap_note.setVisible(False)
+        self.wa_cap_note = _hint("")
+        self.wa_cap_note.setVisible(False)
+        for label, widget, note in (
+                ("Minimum gap", self.wa_min_gap_spin, None),
+                ("Maximum gap", self.wa_max_gap_spin, self.wa_gap_note),
+                ("Daily cap", self.wa_daily_cap_spin, self.wa_cap_note),
+                ("Hourly cap", self.wa_hourly_cap_spin, None)):
+            pacing.field(label, _loose(widget), note=note)
+            widget.valueChanged.connect(lambda _value: self._refresh_wa_notes())
+        pacing.foot(
+            "Thirty a day and eight an hour against the email side's forty and "
+            "twelve, and a floor of %d seconds between two messages against its "
+            "five. The boxes stop at %d a day and %d an hour: a number sending "
+            "faster than that is asking for the one outcome nothing here can "
+            "undo." % (_WA_GAP_FLOOR, _WA_DAILY_CEILING, _WA_HOURLY_CEILING))
+
+        warm = _Group(column, "Warm-up")
+        self.wa_warmup_cb = C.toggle(
+            "Ramp this number up gradually",
+            help="The ramp starts from the day the first campaign on this "
+                 "number began.")
+        self.wa_warmup_cb.toggled.connect(lambda _on: self._refresh_wa_notes())
+        warm.wide(self.wa_warmup_cb, note=self.wa_warmup_cb.help_label)
+        self.wa_warmup_start_spin = _spin(1, _WA_DAILY_CEILING, 1, "/day", 3)
+        self.wa_warmup_step_spin = _spin(1, _WA_HOURLY_CEILING, 1, "/day", 3)
+        self.wa_warmup_max_spin = _spin(1, _WA_DAILY_CEILING, 5, "/day", 3)
+        for label, widget in (("Start at", self.wa_warmup_start_spin),
+                              ("Increase each day by", self.wa_warmup_step_spin),
+                              ("Stop increasing at", self.wa_warmup_max_spin)):
+            warm.field(label, _loose(widget))
+            widget.valueChanged.connect(lambda _value: self._refresh_wa_notes())
+        warm.foot(
+            "A number that has never sent a cold message and then sends thirty "
+            "in a day is the pattern the platform looks for. Five on the first "
+            "day, three more each day after, is what the defaults ramp at.")
+
+        follow = _Group(column, "Follow-ups")
+        self.wa_followup_cb = C.toggle(
+            "Send one chaser when nobody replies",
+            help="A reply, or anything matching the opt-out words below, "
+                 "cancels it.")
+        follow.wide(self.wa_followup_cb, note=self.wa_followup_cb.help_label)
+        self.wa_followup_gap_spin = _spin(1, 60, 1, " days", 2)
+        self.wa_followup_steps_spin = _spin(0, _WA_FOLLOWUP_CEILING, 1, "", 2)
+        follow.field("Wait between touches", _loose(self.wa_followup_gap_spin))
+        follow.field("Follow-ups per lead", _loose(self.wa_followup_steps_spin))
+        follow.foot(
+            "One chaser, not the email side's two, and the box will not offer "
+            "more than %d. A third message to a number that has never replied "
+            "is what a recipient reports, and a report is what takes the number "
+            "away." % _WA_FOLLOWUP_CEILING)
+
+        safety = _Group(column, "Safety")
+        self.wa_dry_run_cb = C.toggle(
+            "Dry run — build every message, send none",
+            help="On, a WhatsApp campaign renders every message, opens no "
+                 "browser session at all, and hands the queue back sendable.")
+        self.wa_dry_run_cb.toggled.connect(self._on_wa_dry_run_toggled)
+        safety.wide(self.wa_dry_run_cb, note=self.wa_dry_run_cb.help_label)
+        self.wa_live_warning = C.body_label(
+            "Live: a WhatsApp campaign will message real numbers from this "
+            "connection. There is no way to recall a message once it has left, "
+            "and a number that is reported is usually gone for good.",
+            tone="danger")
+        self.wa_live_warning.setVisible(False)
+        safety.wide(self.wa_live_warning)
+        self.wa_optout_edit = _line("stop, unsubscribe, remove me")
+        safety.field("Opt-out words", self.wa_optout_edit)
+        safety.foot(
+            "Every first message carries a line in plain words telling the "
+            "reader to reply with the first of these. A reply matching any of "
+            "them suppresses that lead on both channels at once and cancels its "
+            "queued follow-up — someone who says stop on WhatsApp must not then "
+            "receive the email sequence. Separate them with commas.")
+
+        column.addStretch()
+        return page
+
+    def _build_wa_connection(self, column: QVBoxLayout) -> None:
+        """The QR login, in the app. Opens nothing until Connect is pressed.
+
+        The reference prints its QR to a terminal because it is a Node CLI.
+        That is its constraint and not ours: this is a desktop application, and
+        sending a user to a console to log a channel in would be the one step of
+        the whole flow that happens somewhere else.
+        """
+        group = _Group(column, "Connection")
+
+        self.wa_status_note = _StatusNote()
+        group.wide(_measured(self.wa_status_note))
+
+        self.wa_qr = _QrView()
+        qr_row = _row_box()
+        qr_row.addWidget(self.wa_qr)
+        qr_row.addStretch()
+        self.wa_qr_hint = _hint(
+            "Open WhatsApp on the phone this number lives on, then Settings → "
+            "Linked devices → Link a device, and point it at this square. The "
+            "scan is remembered, so this is a one-off rather than something to "
+            "do every morning.")
+        group.wide(qr_row, note=self.wa_qr_hint)
+
+        self.wa_number = C.body_label("", tone="secondary")
+        group.field("This number", self.wa_number)
+
+        buttons = _row_box()
+        buttons.addStretch()
+        self.wa_connect_btn = C.button("Connect", kind="primary", size="md",
+                                       icon="play", on_click=self._on_wa_connect)
+        self.wa_disconnect_btn = C.button(
+            "Disconnect", kind="secondary", size="md", icon="stop",
+            on_click=self._on_wa_disconnect)
+        self.wa_disconnect_btn.setToolTip(
+            "Quit the browser. The scanned login stays on this machine, so "
+            "connecting again does not usually need a second scan.")
+        buttons.addWidget(self.wa_connect_btn)
+        buttons.addWidget(self.wa_disconnect_btn)
+        group.wide(buttons)
+
+        self.wa_headless_cb = C.toggle(
+            "Keep the browser window hidden",
+            help="WhatsApp Web is likelier to refuse a hidden browser, and a "
+                 "login that goes wrong behind one is invisible. The QR is "
+                 "drawn here either way.")
+        group.wide(self.wa_headless_cb, note=self.wa_headless_cb.help_label)
+
+        # The restriction, and the only place in the app it can be cleared.
+        # `OutreachWorker` refuses to start a WhatsApp run while one stands —
+        # on this run and every future one — because a number that keeps trying
+        # after a block is a number whose block stops being temporary.
+        self.wa_ban_note = C.body_label("", tone="danger")
+        self.wa_ban_note.setVisible(False)
+        group.wide(_measured(self.wa_ban_note))
+        self.wa_ack_btn = C.button(
+            "I have checked the account — resume WhatsApp", kind="danger",
+            size="md", icon="warning", on_click=self._on_wa_acknowledge)
+        self.wa_ack_btn.setVisible(False)
+        ack_row = _row_box()
+        ack_row.addWidget(self.wa_ack_btn)
+        ack_row.addStretch()
+        group.wide(ack_row)
+
+        group.foot(
+            "Connecting opens a Chrome window on a profile kept beside your "
+            "settings, which is how one scan survives a restart. Nothing here "
+            "opens it on its own: a browser started by walking onto a settings "
+            "screen is a browser the user did not ask for.")
+
+    # ── WhatsApp: the connection card ────────────────────────────────────────
+
+    def _on_wa_changed(self) -> None:
+        """The link moved. Redraw the card, if this screen still has one."""
+        if hasattr(self, "wa_status_note"):
+            self._refresh_wa_card()
+
+    def _on_wa_connect(self) -> None:
+        link = wa_link()
+        refused = link.open(self._wa_settings())
+        self._wa_worker = link.worker()
+        if refused:
+            _status(self.wa_status_note, refused, "err")
+        self._refresh_wa_card()
+
+    def _on_wa_disconnect(self) -> None:
+        link = wa_link()
+        link.close()
+        self._wa_worker = link.worker()
+        self._refresh_wa_card()
+
+    def _wa_settings(self) -> dict:
+        """What the link needs to build a session, as the widgets hold it now.
+
+        Read off the widgets and not off `self.settings`, because a user who has
+        just picked a region and pressed Connect has not necessarily pressed
+        Save — and a session built on the saved value would resolve numbers in a
+        country they had already changed their mind about.
+        """
+        saved = self.settings if isinstance(self.settings, dict) else {}
+        return {
+            "wa_profile": saved.get("wa_profile") or "default",
+            "wa_headless": (self.wa_headless_cb.isChecked()
+                            if hasattr(self, "wa_headless_cb")
+                            else bool(saved.get("wa_headless", False))),
+            "wa_default_region": (self.wa_region_combo.currentData()
+                                  if hasattr(self, "wa_region_combo")
+                                  else saved.get("wa_default_region") or ""),
+        }
+
+    def _wa_conn(self):
+        """The outreach store, for the one fact this screen reads out of it.
+
+        Opened on demand rather than held: the standing restriction is the only
+        thing on this screen that lives in the database, and a settings screen
+        keeping a connection open would be a second owner of a handle the
+        outreach screen already has.
+        """
+        try:
+            return _db.connect()
+        except Exception:                           # noqa: BLE001 — a note, not a raise
+            return None
+
+    def _wa_ban_notice(self) -> str:
+        conn = self._wa_conn()
+        if conn is None:
+            return ""
+        try:
+            return str(_campaign.wa_ban_notice(conn) or "")
+        except Exception:                           # noqa: BLE001
+            return ""
+
+    def _on_wa_acknowledge(self) -> None:
+        """Clear the standing restriction, having said what clearing it means."""
+        conn = self._wa_conn()
+        if conn is None:
+            return
+        if not C.confirm(
+                self, title="Resume WhatsApp on this number?",
+                body="WhatsApp restricted this number and every run since has "
+                     "refused to send because of it.\n\nOnly clear this once "
+                     "you have opened WhatsApp on the phone itself and seen "
+                     "that the account is working. Sending again while a block "
+                     "is still in place is what turns a temporary restriction "
+                     "into a permanent one, and a permanent one cannot be "
+                     "appealed.",
+                confirm_text="I have checked — resume", danger=True,
+                remember_key=""):
+            return
+        try:
+            _campaign.acknowledge_wa_ban(conn)
+        except Exception:                           # noqa: BLE001
+            pass
+        self._refresh_wa_card()
+
+    def _refresh_wa_card(self) -> None:
+        """Say where the connection is, in the words of the state it is in.
+
+        Every branch names what to do next, because a status word on its own —
+        "loading", "qr" — is the transport's vocabulary and not the user's.
+        """
+        if not hasattr(self, "wa_status_note"):
+            return
+        link = wa_link()
+        busy, status = link.busy(), link.status()
+        error, number = link.error(), link.me()
+
+        if busy == "opening":
+            _status(self.wa_status_note,
+                    "Starting Chrome on the saved WhatsApp profile. This takes "
+                    "a few seconds the first time.", "busy")
+        elif busy == "closing":
+            _status(self.wa_status_note, "Closing the browser.", "busy")
+        elif error:
+            _status(self.wa_status_note, error, "err")
+        elif status == _wa.READY:
+            _status(self.wa_status_note,
+                    "Connected. Messages queued for WhatsApp will go out from "
+                    "this number.", "ok")
+        elif status == _wa.QR:
+            _status(self.wa_status_note,
+                    "Waiting for the QR below to be scanned.", "busy")
+        elif status == _wa.LOADING:
+            _status(self.wa_status_note,
+                    "Logged in — WhatsApp is still loading the chat list. "
+                    "Nothing can be sent until it has.", "busy")
+        elif status == _wa.BANNED:
+            _status(self.wa_status_note,
+                    "WhatsApp has restricted this number. Nothing will be sent "
+                    "on this channel until it is acknowledged below.", "err")
+        else:
+            _status(self.wa_status_note,
+                    "Not connected. Nothing is open and nothing can be sent on "
+                    "this channel — press Connect and scan the QR once.", "busy")
+
+        png = link.qr_png()
+        self.wa_qr.show_png(png)
+        self.wa_qr.setVisible(bool(png))
+        self.wa_qr_hint.setVisible(bool(png))
+
+        self.wa_number.setText(
+            number if number else
+            "Known once the login finishes" if link.is_open() or busy else
+            "Nothing connected")
+
+        opening = bool(busy)
+        self.wa_connect_btn.setEnabled(not opening and not link.is_open())
+        self.wa_connect_btn.setToolTip(
+            "The connection is already %s" % busy if opening else
+            "This connection is already open" if link.is_open() else
+            "Open WhatsApp Web on the saved profile. The QR appears here if a "
+            "scan is needed.")
+        self.wa_disconnect_btn.setEnabled(not opening and link.is_open())
+        self.wa_disconnect_btn.setToolTip(
+            "The connection is already %s" % busy if opening else
+            "Nothing is open to disconnect" if not link.is_open() else
+            "Quit the browser. The scanned login stays on this machine.")
+
+        notice = self._wa_ban_notice()
+        self.wa_ban_note.setText(
+            "%s Every WhatsApp run, this one and the next, refuses to send "
+            "while this stands." % notice if notice else "")
+        self.wa_ban_note.setVisible(bool(notice))
+        self.wa_ack_btn.setVisible(bool(notice))
+
+    # ── WhatsApp: what the numbers will really do ────────────────────────────
+
+    def _wa_values(self) -> dict:
+        """The WhatsApp settings as the widgets hold them, under their own keys.
+
+        Asked of the widgets rather than of `self.settings` for the reason
+        `_schedule_values` is: the notes exist to answer the number being typed,
+        not the one that was last saved.
+        """
+        low, high = sorted((self.wa_min_gap_spin.value(),
+                            self.wa_max_gap_spin.value()))
+        return {
+            "wa_enabled": self.wa_enabled_cb.isChecked(),
+            "wa_default_region": str(self.wa_region_combo.currentData() or ""),
+            "wa_headless": self.wa_headless_cb.isChecked(),
+            "wa_send_days": [i for i, box in enumerate(self.wa_day_boxes)
+                             if box.isChecked()],
+            "wa_send_start_hour": self.wa_start_hour_spin.value(),
+            "wa_send_end_hour": self.wa_end_hour_spin.value(),
+            "wa_min_gap_sec": low,
+            "wa_max_gap_sec": high,
+            "wa_daily_cap": self.wa_daily_cap_spin.value(),
+            "wa_hourly_cap": self.wa_hourly_cap_spin.value(),
+            "wa_warmup_enabled": self.wa_warmup_cb.isChecked(),
+            "wa_warmup_start": self.wa_warmup_start_spin.value(),
+            "wa_warmup_step": self.wa_warmup_step_spin.value(),
+            "wa_warmup_max": self.wa_warmup_max_spin.value(),
+            "wa_followup_enabled": self.wa_followup_cb.isChecked(),
+            "wa_followup_gap_days": self.wa_followup_gap_spin.value(),
+            "wa_followup_max_steps": self.wa_followup_steps_spin.value(),
+            "wa_dry_run": self.wa_dry_run_cb.isChecked(),
+            "wa_opt_out_words": _wa_words(self.wa_optout_edit.text()),
+        }
+
+    def _refresh_wa_notes(self) -> None:
+        """The same four sentences the Sending tab writes, for this channel.
+
+        Through `channel_settings`, which is the whole of "one scheduler, two
+        channels": every wa_* number arrives under the scheduler's own key, so
+        the composed window, the composed day set, the swapped gap range and the
+        warm-up ramp are answered by the same four functions that answer them
+        for email. A second copy of that arithmetic here would be a second
+        answer waiting to disagree with the one the send loop uses.
+        """
+        if self._building:
+            return
+        live = self._wa_values()
+        mapped = _campaign.channel_settings(live, _campaign.WHATSAPP)
+        for label, note in (
+                (self.wa_days_note, _days_note(mapped["send_days"])),
+                (self.wa_window_note, _hours_note(mapped["send_start_hour"],
+                                                  mapped["send_end_hour"])),
+                (self.wa_gap_note, _gap_note(mapped["send_min_gap_sec"],
+                                             mapped["send_max_gap_sec"])),
+                (self.wa_cap_note, _wa_cap_note(live)),
+                (self.wa_region_note, _wa_region_note(live))):
+            label.setText(note)
+            label.setVisible(bool(note))
+
+    def _on_wa_dry_run_toggled(self, checked: bool) -> None:
+        """Turning the WhatsApp rehearsal off is a decision, not a click.
+
+        The same gate the email dry run has, and asked for a harder reason. An
+        email that lands badly costs a spam complaint against an account that
+        can be replaced; a WhatsApp message that lands badly costs the number,
+        and a banned number is usually gone for good.
+        """
+        if checked:
+            self.wa_live_warning.hide()
+            return
+        answer = QMessageBox.warning(
+            self, "Send real WhatsApp messages?",
+            "A WhatsApp campaign will message real numbers from the connected "
+            "account, on the limits above, as soon as one is started.\n\n"
+            "Nothing about a message can be undone once it has left, and a "
+            "recipient who reports it can cost you the number itself. "
+            "Continue?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            self.wa_dry_run_cb.blockSignals(True)
+            self.wa_dry_run_cb.setChecked(True)
+            self.wa_dry_run_cb.blockSignals(False)
+            return
+        self.wa_live_warning.show()
+
     # ── Compliance ───────────────────────────────────────────────────────────
 
     def _build_compliance_page(self) -> QWidget:
@@ -3482,14 +4437,15 @@ class SettingsScreen(QWidget):
         already have `_mark_template_dirty` of their own. The one place the two
         meet is `_outstanding`, which says both.
         """
-        for edit in list(self.profile_edits.values()) + [self.unsubscribe_edit]:
+        for edit in list(self.profile_edits.values()) + [self.unsubscribe_edit,
+                                                         self.wa_optout_edit]:
             edit.textChanged.connect(lambda _text: self._mark_dirty())
         for box in (self.postal_edit, self.proof_edit):
             box.textChanged.connect(self._mark_dirty)
         for field in (self.groq_key, self.openrouter_key):
             field.textChanged.connect(lambda _text: self._mark_dirty())
         for combo in (self.provider_combo, self.tone_combo, self.theme_combo,
-                      self.density_combo):
+                      self.density_combo, self.wa_region_combo):
             combo.currentIndexChanged.connect(lambda _index: self._mark_dirty())
         for combo in (self.groq_model, self.openrouter_model,
                       self.timezone_combo):
@@ -3499,12 +4455,20 @@ class SettingsScreen(QWidget):
                      self.min_gap_spin, self.max_gap_spin, self.daily_cap_spin,
                      self.hourly_cap_spin, self.warmup_start_spin,
                      self.warmup_step_spin, self.warmup_max_spin,
-                     self.followup_gap_spin, self.followup_steps_spin):
+                     self.followup_gap_spin, self.followup_steps_spin,
+                     self.wa_start_hour_spin, self.wa_end_hour_spin,
+                     self.wa_min_gap_spin, self.wa_max_gap_spin,
+                     self.wa_daily_cap_spin, self.wa_hourly_cap_spin,
+                     self.wa_warmup_start_spin, self.wa_warmup_step_spin,
+                     self.wa_warmup_max_spin, self.wa_followup_gap_spin,
+                     self.wa_followup_steps_spin):
             spin.valueChanged.connect(lambda _value: self._mark_dirty())
-        for toggle in (list(self.day_boxes)
+        for toggle in (list(self.day_boxes) + list(self.wa_day_boxes)
                        + [self.warmup_cb, self.followup_cb, self.dry_run_cb,
                           self.append_unsubscribe_cb, self.append_postal_cb,
-                          self.require_profile_cb]):
+                          self.require_profile_cb, self.wa_enabled_cb,
+                          self.wa_headless_cb, self.wa_warmup_cb,
+                          self.wa_followup_cb, self.wa_dry_run_cb]):
             toggle.toggled.connect(lambda _on: self._mark_dirty())
         self.services_list.itemChanged.connect(lambda _item: self._mark_dirty())
 
@@ -3557,6 +4521,8 @@ class SettingsScreen(QWidget):
         # a screen that matched disk, and the footer offering to undo nothing.
         self._dirty = False
         self._refresh_schedule_notes()
+        self._refresh_wa_notes()
+        self._refresh_wa_card()
         self._refresh_footer()
         self._publish_to_shell()
 
@@ -3611,6 +4577,8 @@ class SettingsScreen(QWidget):
         self.followup_gap_spin.setValue(self._int(settings.get("followup_gap_days"), 4))
         self.followup_steps_spin.setValue(self._int(settings.get("followup_max_steps"), 2))
 
+        self._fill_whatsapp(settings)
+
         self.unsubscribe_edit.setText(str(settings.get("unsubscribe_mailto") or ""))
         for key, box in (("append_unsubscribe", self.append_unsubscribe_cb),
                          ("append_postal_address", self.append_postal_cb),
@@ -3640,6 +4608,54 @@ class SettingsScreen(QWidget):
             self._refresh_template_preview()
         else:
             self._reload_templates(self._template_id)
+
+    def _fill_whatsapp(self, settings: dict) -> None:
+        """Put the WhatsApp tab back to what the file holds.
+
+        The two caps are clamped by the boxes themselves rather than by anything
+        here, and the clamp is deliberate: a `wa_daily_cap` hand-edited into
+        settings.json above the ceiling arrives at the ceiling, is shown at the
+        ceiling, and is saved at the ceiling. Silently lowering a number the
+        user typed is normally the wrong thing to do — here it is the only
+        honest one, because the alternative is a screen displaying a cap it has
+        no intention of honouring. The Pacing group says what the ceiling is.
+        """
+        self.wa_enabled_cb.setChecked(bool(settings.get("wa_enabled", False)))
+        self._select_data(self.wa_region_combo,
+                          str(settings.get("wa_default_region") or "").strip().upper())
+        self.wa_headless_cb.setChecked(bool(settings.get("wa_headless", False)))
+
+        days = {self._int(day, -1) for day in (settings.get("wa_send_days") or [])}
+        for index, box in enumerate(self.wa_day_boxes):
+            box.setChecked(index in days)
+        self.wa_start_hour_spin.setValue(self._int(settings.get("wa_send_start_hour"), 10))
+        self.wa_end_hour_spin.setValue(self._int(settings.get("wa_send_end_hour"), 19))
+
+        self.wa_min_gap_spin.setValue(self._int(settings.get("wa_min_gap_sec"), 90))
+        self.wa_max_gap_spin.setValue(self._int(settings.get("wa_max_gap_sec"), 300))
+        self.wa_daily_cap_spin.setValue(self._int(settings.get("wa_daily_cap"), 30))
+        self.wa_hourly_cap_spin.setValue(self._int(settings.get("wa_hourly_cap"), 8))
+
+        self.wa_warmup_cb.setChecked(bool(settings.get("wa_warmup_enabled", True)))
+        self.wa_warmup_start_spin.setValue(self._int(settings.get("wa_warmup_start"), 5))
+        self.wa_warmup_step_spin.setValue(self._int(settings.get("wa_warmup_step"), 3))
+        self.wa_warmup_max_spin.setValue(self._int(settings.get("wa_warmup_max"), 30))
+
+        self.wa_followup_cb.setChecked(bool(settings.get("wa_followup_enabled", True)))
+        self.wa_followup_gap_spin.setValue(self._int(settings.get("wa_followup_gap_days"), 3))
+        self.wa_followup_steps_spin.setValue(
+            self._int(settings.get("wa_followup_max_steps"), 1))
+
+        self.wa_optout_edit.setText(", ".join(
+            str(word) for word in (settings.get("wa_opt_out_words") or [])))
+
+        # Blocked for the reason the email switch is: this is a restore, not a
+        # decision, and it must not raise "you are about to message real
+        # numbers" at somebody who has only opened the screen.
+        self.wa_dry_run_cb.blockSignals(True)
+        self.wa_dry_run_cb.setChecked(bool(settings.get("wa_dry_run", True)))
+        self.wa_dry_run_cb.blockSignals(False)
+        self.wa_live_warning.setVisible(not self.wa_dry_run_cb.isChecked())
 
     @staticmethod
     def _int(value, default: int = 0) -> int:
@@ -4034,6 +5050,12 @@ class SettingsScreen(QWidget):
         settings["followup_enabled"] = self.followup_cb.isChecked()
         settings["followup_gap_days"] = self.followup_gap_spin.value()
         settings["followup_max_steps"] = self.followup_steps_spin.value()
+
+        # Straight out of `_wa_values`, which is also what the notes under the
+        # boxes are computed from — so what the tab promises and what is written
+        # cannot come apart. It has already sorted an inverted gap range for the
+        # same reason `send_min_gap_sec` is sorted above.
+        settings.update(self._wa_values())
 
         settings["unsubscribe_mailto"] = self.unsubscribe_edit.text().strip()
         settings["append_unsubscribe"] = self.append_unsubscribe_cb.isChecked()

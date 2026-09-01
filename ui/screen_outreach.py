@@ -282,9 +282,18 @@ from core import mailer as _mailer
 from core import outreach_db as _db
 from core import settings as _settings
 from core import templates as _templates
+from core import whatsapp as _wa
 from core.ai import AIClient
 from core.campaign import (AuditWorker, OutreachWorker, account_daily_cap,
                            plan_campaign, release_now)
+
+# The WhatsApp copy, if this build carries it. Guarded for the reason
+# `core.campaign.copy_for` is guarded: a build without it must still plan and
+# send email rather than fail to import the screen that does both.
+try:
+    from core import wa_templates as _wa_templates
+except Exception:                                # noqa: BLE001 — an absent channel
+    _wa_templates = None
 from ui import components
 from ui import icons as _icons
 from ui import theme as _theme
@@ -333,6 +342,11 @@ _PAPER_CH = 76
 _LEAD_COLUMNS = (
     Column("Business", "stretch", weight=3, min_ch=14, max_ch=36),
     Column("Email", "stretch", weight=3, min_ch=16, max_ch=52),
+    # Beside the email because they are the same fact — how this lead can be
+    # reached — and because a WhatsApp campaign cannot include a lead that has
+    # no number at all. `fit` and capped: a phone number is a short fixed value,
+    # and the longest E.164 there is fits inside the sample.
+    Column("Phone", "fit", min_ch=12, max_ch=20, sample="+1 416-555-0142"),
     Column("City", "fit", min_ch=8, max_ch=20, sample="Scarborough"),
     Column("Category", "fit", min_ch=8, max_ch=22, sample="Roofing contractor"),
     # Blank for every site the crawl read, which is what makes it scannable:
@@ -344,8 +358,8 @@ _LEAD_COLUMNS = (
     Column("Status", "fit", min_ch=12, max_ch=16, sample="⊘ suppressed"),
 )
 
-(_COL_NAME, _COL_EMAIL, _COL_CITY, _COL_CATEGORY, _COL_SITE, _COL_SCORE,
- _COL_GAP, _COL_STATUS) = range(len(_LEAD_COLUMNS))
+(_COL_NAME, _COL_EMAIL, _COL_PHONE, _COL_CITY, _COL_CATEGORY, _COL_SITE,
+ _COL_SCORE, _COL_GAP, _COL_STATUS) = range(len(_LEAD_COLUMNS))
 
 # The eight names above are *fields*, not table columns, and that is the whole
 # of the column-visibility change. A field is a thing a lead has; a column is a
@@ -363,8 +377,8 @@ _FIXED_FIELDS = (_COL_NAME,)
 # What each field is called in the file that remembers the choice. Names and
 # not indices: a column added to the spec above must not silently renumber a
 # saved view written last month.
-_FIELD_KEYS = ("name", "email", "city", "category", "site", "score", "gap",
-               "status")
+_FIELD_KEYS = ("name", "email", "phone", "city", "category", "site", "score",
+               "gap", "status")
 _FIELD_OF_KEY = {key: index for index, key in enumerate(_FIELD_KEYS)}
 
 # The keys a stored column list could name before `site` existed. An entry that
@@ -381,8 +395,9 @@ _KNOWN_BEFORE = ("name", "email", "city", "category", "score", "gap", "status")
 # sort on the value behind the badge — an em dash compares greater than any
 # digit as text, so a Score column sorted as written floats every unaudited
 # lead above the best prospect.
-_COL_KEYS = {_COL_NAME: "name", _COL_EMAIL: "email", _COL_CITY: "city",
-             _COL_CATEGORY: "category", _COL_STATUS: "status"}
+_COL_KEYS = {_COL_NAME: "name", _COL_EMAIL: "email", _COL_PHONE: "phone",
+             _COL_CITY: "city", _COL_CATEGORY: "category",
+             _COL_STATUS: "status"}
 
 # What the filter box will accept in front of a colon, and the lead field it
 # then reads. The plain-English words are here because "business:" is what a
@@ -442,7 +457,14 @@ _WINDOW_KEEP = 120
 _STATUS_FILTERS = (
     ("All leads", ""), ("Not audited", "new"), ("Audited", "audited"),
     ("Unreachable sites", "~failed"), ("Personalised", "~personal"),
-    ("Generic email", "~generic"), ("Queued", "queued"), ("Sent", "sent"),
+    ("Generic email", "~generic"),
+    # Not "has a phone number": a number is only usable if `to_wa_id` can turn
+    # it into one, which for a Maps number scraped without a `+` depends on
+    # whether a default region has been set. The filter therefore moves when
+    # that setting does, which is the honest behaviour — the leads it hides are
+    # exactly the ones a WhatsApp campaign would leave out.
+    ("Has a usable number", "~phone"),
+    ("Queued", "queued"), ("Sent", "sent"),
     ("Replied", "replied"), ("Bounced", "bounced"), ("Suppressed", "suppressed"),
 )
 _STATUS_KEYS = [key for _label, key in _STATUS_FILTERS]
@@ -578,6 +600,38 @@ _TILES_PER_ROW = 4
 # button in both.
 _START_ICONS = {"primary": "play", "danger_primary": "send"}
 
+# ── The two channels ─────────────────────────────────────────────────────────
+# A channel is a choice on the Campaign tab and not a second screen. The same
+# leads, the same crawl, the same gap-to-service pitch and the same Sending tab
+# — what differs is the transport, the register the copy is written in, and
+# every limit, and all three of those are answered by `core.campaign` rather
+# than by a branch here.
+
+EMAIL = _campaign.EMAIL
+WHATSAPP = _campaign.WHATSAPP
+
+_CHANNELS = ((EMAIL, "Email"), (WHATSAPP, "WhatsApp"))
+_CHANNEL_INDEX = {key: index for index, (key, _label) in enumerate(_CHANNELS)}
+_CHANNEL_LABEL = dict(_CHANNELS)
+
+# What one message on each channel is called, in a sentence about a queue. The
+# Sending tab counts and holds and refuses on both, and "12 emails queued" over
+# a WhatsApp run is the sort of small untruth that makes a user distrust the
+# whole panel.
+_CHANNEL_NOUN = {EMAIL: "email", WHATSAPP: "message"}
+
+# And what the thing sending them is called. Gmail has as many accounts as the
+# user has added; WhatsApp has exactly one number, so "every account is at its
+# cap" is a sentence about a set of one and reads as a bug.
+_CHANNEL_SENDER = {EMAIL: "account", WHATSAPP: "number"}
+
+# How wide the chat bubble is allowed to get, in characters. Narrower than the
+# email paper's 76 because that is the difference being previewed: a WhatsApp
+# message is read in a column about forty characters wide on a phone held in one
+# hand, and sixty words laid out at inbox width does not look like the wall it
+# will actually be.
+_BUBBLE_CH = 40
+
 
 # ── Small helpers ────────────────────────────────────────────────────────────
 
@@ -613,19 +667,57 @@ def _paper_html(body: str, size: int, ink: str, *, monospace: bool = False) -> s
                "pre-wrap" if monospace else "normal", body))
 
 
-def _paint_paper(browser) -> None:
+def _paint_paper(browser, ground: str = "raised") -> None:
     """Paint the document itself, in the palette a reader will see it in.
 
     The QSS rule for `#email_paper` styles the well the document sits in; this
     is the page inside it. Both come from the theme — the light one,
     deliberately: the body carries near-black ink, and on the dark app's own
     surface it would be invisible.
+
+    `ground` is which of the light palette's surfaces the page is. An email is
+    `raised`, because a mail client draws a message on white paper. A WhatsApp
+    thread is `inset`: the bubble is the paper there, and a bubble drawn on the
+    same value as the page behind it stops being a bubble.
     """
     frame = browser.document().rootFrame()
     fmt = frame.frameFormat()
-    fmt.setBackground(QColor(_PAPER.color["raised"]))
+    fmt.setBackground(QColor(_PAPER.color[ground]))
     fmt.setMargin(_PAPER.space["5"])
     frame.setFrameFormat(fmt)
+
+
+def _bubble_html(lines: list, stamp: str = "") -> str:
+    """One WhatsApp message drawn as the chat bubble it will arrive in.
+
+    Not the email paper with the subject taken off, and the difference is the
+    whole reason this exists. A message on this channel is read in a chat
+    thread, on a phone, from a number the reader does not recognise, in a column
+    about forty characters wide — and the one question the preview has to answer
+    is whether sixty words reads as a note or as a wall. Laid out at inbox width
+    it answers a question nobody asked.
+
+    In the light palette for the reason the email preview is in it: this is the
+    recipient's phone and not this application's chrome.
+
+    Built as a table because Qt's rich text has no `border-radius`. A padded
+    cell with a fill is as close to a rounded corner as a QTextBrowser gets, and
+    the thing that has to read as a bubble is the block of tinted ground round
+    the words rather than the shape of its corners.
+    """
+    body = "<br>".join(lines)
+    tail = ("<div style=\"color:%s;font-size:%dpx;text-align:right;"
+            "margin-top:%dpx;\">%s</div>"
+            % (_PAPER.color["text.tertiary"], _PAPER.font["small"][0],
+               _PAPER.space["1"], html.escape(stamp))) if stamp else ""
+    return ('<div style="font-family:%s;">'
+            '<table width="100%%" cellspacing="0" cellpadding="%d" '
+            'style="background-color:%s;">'
+            '<tr><td style="color:%s;font-size:%dpx;line-height:1.5;">%s%s</td>'
+            '</tr></table></div>'
+            % (_MAIL_FAMILY, _PAPER.space["3"],
+               _PAPER.color["accent.subtle"], _PAPER.color["text.primary"],
+               _PAPER.font["body"][0], body, tail))
 
 
 def _loads(blob) -> dict:
@@ -1784,12 +1876,18 @@ class _PlanWorker(QThread):
     plan_signal = pyqtSignal(dict)
     progress_signal = pyqtSignal(int, int, str)
 
-    def __init__(self, campaign_id: int, leads: list, template_id: str, settings: dict):
+    def __init__(self, campaign_id: int, leads: list, template_id: str,
+                 settings: dict, channel: str = ""):
         super().__init__()
         self.campaign_id = _int_of(campaign_id)
         self.leads = list(leads or [])
         self.template_id = _text_of(template_id)
         self._settings = settings if isinstance(settings, dict) else {}
+        # Which transport this queue is being written for. `plan_campaign`
+        # takes it from here and nothing else about this worker changes: the
+        # audit, the personalisation and the scheduling are one implementation
+        # on both channels.
+        self.channel = _campaign._channel(channel or _campaign.EMAIL)
         self._running = True
 
     def stop(self) -> None:
@@ -1806,10 +1904,11 @@ class _PlanWorker(QThread):
                 template_id=self.template_id,
                 profile=self._settings.get("sender_profile") or {},
                 settings=self._settings, ai=ai, progress=self._progress,
-                should_stop=self._should_stop,
+                should_stop=self._should_stop, channel=self.channel,
             )
         except Exception as exc:
-            plan = {"error": "%s: %s" % (type(exc).__name__, exc), "queued": 0}
+            plan = {"error": "%s: %s" % (type(exc).__name__, exc), "queued": 0,
+                    "channel": self.channel}
         self.plan_signal.emit(plan if isinstance(plan, dict) else {})
 
     def _should_stop(self) -> bool:
@@ -1886,6 +1985,14 @@ class OutreachScreen(QWidget):
         # and wholesale when the list is re-read.
         self._gaps: dict[int, tuple] = {}
         self._blobs: dict[int, str] = {}
+        # lead id -> whether that lead's number can be messaged at all, and the
+        # default region the answer was worked out under. Cached for the reason
+        # the two above are: the Phone filter asks it of every row on every
+        # keystroke. Thrown away wholesale when the region moves, because the
+        # region is half the question — a number with no country code becomes
+        # usable the moment one is set.
+        self._phones: dict[int, bool] = {}
+        self._phone_region = None
         # lead id -> the fields those three are derived from, as they were when
         # the answers were worked out, and the same for the settings the
         # personalisation call reads. A reload compares these and forgets only
@@ -1931,6 +2038,17 @@ class OutreachScreen(QWidget):
         self._restoring = False
         self._campaign_id = 0
         self._plan: dict = {}
+        # Two channels and they are not the same question. `_channel` is what
+        # the Campaign tab is composing — which templates, which preview, which
+        # limits, which transport a Prepare writes for. `_send_channel` is the
+        # channel of the campaign selected on the Sending tab, read off its own
+        # queued rows, because that tab describes a campaign that may have been
+        # prepared days ago on the other one.
+        self._channel = EMAIL
+        self._send_channel = EMAIL
+        # The WhatsApp restriction this screen has already told the user about,
+        # so a standing one is announced once rather than on every tick.
+        self._ban_told = ""
         self._sending = False
         self._paused = False
         # (stamped line, level, message id) for every activity line, so a theme
@@ -2313,6 +2431,34 @@ class OutreachScreen(QWidget):
     def _build_campaign_column(self, t) -> QWidget:
         left = _rows(margin="0", spacing="3", t=t)
 
+        # First, because it decides what every card under it is about: the
+        # template list, the preview, the limits in the Schedule card and the
+        # transport a Prepare writes for all follow it. A campaign is
+        # single-channel — a lead reached by email is not also messaged on
+        # WhatsApp unless the user starts a WhatsApp campaign for it by name,
+        # because being contacted twice on two channels inside a week is what
+        # gets a sender reported.
+        channel_card = components.card(title="Channel")
+        picker = _cols(margin="0", spacing="2", t=t)
+        self.channel_group = QButtonGroup(self)
+        self.channel_group.setExclusive(True)
+        for index, (key, label) in enumerate(_CHANNELS):
+            tab = components.button(label, kind="tab", size="sm")
+            tab.setCheckable(True)
+            tab.setChecked(key == self._channel)
+            self.channel_group.addButton(tab, index)
+            picker.addWidget(tab)
+        picker.addStretch()
+        self.channel_group.idClicked.connect(self._on_channel_picked)
+        channel_card.body_layout.addLayout(picker)
+        self.channel_note = components.hint("", max_chars=_COLUMN_CH)
+        channel_card.body_layout.addWidget(self.channel_note)
+        self.channel_warning = components.body_label("", tone="danger",
+                                                     max_chars=_COLUMN_CH)
+        self.channel_warning.hide()
+        channel_card.body_layout.addWidget(self.channel_warning)
+        left.addWidget(channel_card)
+
         template_card = components.card(title="Template")
         self.template_combo = _combo(t)
         self._refresh_templates()
@@ -2429,7 +2575,11 @@ class OutreachScreen(QWidget):
         right = _rows(holder, margin="0", spacing="2", t=t)
 
         subject_row = _cols(margin="0", spacing="2", t=t)
-        subject_row.addWidget(components.section_label("Subject"))
+        # Named, because on WhatsApp there is no subject to caption. The counter
+        # beside it changes units with the channel too — an inbox measures a
+        # subject in characters and a chat bubble measures a message in words.
+        self.preview_kind = components.section_label("Subject")
+        subject_row.addWidget(self.preview_kind)
         subject_row.addStretch()
         self.subject_count = components.body_label("", tone="tertiary")
         self.subject_count.setWordWrap(False)
@@ -2445,11 +2595,16 @@ class OutreachScreen(QWidget):
         meta_row.addWidget(self.preview_meta, stretch=1)
         self.view_group = QButtonGroup(self)
         self.view_group.setExclusive(True)
+        # Kept as a list as well as in the group: a WhatsApp message has no HTML
+        # alternative, so the pair is hidden whole rather than left offering a
+        # view of something that does not exist.
+        self.view_tabs = []
         for index, label in enumerate(("Text", "HTML")):
             tab = components.button(label, kind="tab", size="sm")
             tab.setCheckable(True)
             tab.setChecked(index == 0)
             self.view_group.addButton(tab, index)
+            self.view_tabs.append(tab)
             meta_row.addWidget(tab)
         self.view_group.idClicked.connect(lambda _i: self._refresh_preview())
         right.addLayout(meta_row)
@@ -2463,9 +2618,19 @@ class OutreachScreen(QWidget):
         self.preview_hint = components.hint("")
         right.addWidget(self.preview_hint)
 
-        holder.setMaximumWidth(_measure(QFontMetrics(holder.font()), _PAPER_CH)
-                               + _PAPER.space["5"] * 2)
+        # Held, because the measure is the channel's. An inbox renders a message
+        # at roughly 76 characters and a phone at roughly 40, and previewing
+        # either at the other's width is previewing something nobody is sent.
+        self.preview_holder = holder
+        self._cap_preview()
         return holder
+
+    def _cap_preview(self) -> None:
+        """Cap the preview at the measure the current channel is read at."""
+        holder = self.preview_holder
+        chars = _BUBBLE_CH if self._channel == WHATSAPP else _PAPER_CH
+        holder.setMaximumWidth(_measure(QFontMetrics(holder.font()), chars)
+                               + _PAPER.space["5"] * 2)
 
     # ── Sending tab ──────────────────────────────────────────────────────────
 
@@ -4669,45 +4834,197 @@ class OutreachScreen(QWidget):
         profile = self.settings.get("sender_profile")
         return profile if isinstance(profile, dict) else {}
 
-    def _accounts(self) -> list[dict]:
+    # ── Which channel, and what that changes ─────────────────────────────────
+
+    def _channel_settings(self, channel: str = "") -> dict:
+        """`self.settings` with one channel's numbers under the scheduler's names.
+
+        `core.campaign.channel_settings` is the whole of "one scheduler, two
+        channels": every wa_* limit arrives under the key the email path already
+        used, so every sentence this screen writes about a window, a cap, a gap
+        or a ramp is written once and is right on both. Email is handed its own
+        dict back unchanged, so nothing about the email path shifts by having
+        been routed through here.
+        """
+        return _campaign.channel_settings(self.settings, channel or self._channel)
+
+    def _copy(self, channel: str = ""):
+        """The template source for a channel — the planner's own adapter, or None.
+
+        `plan_campaign` renders through exactly this object, so the preview and
+        the send are one call apart rather than two implementations of "what
+        does this lead receive". None means the build has no copy for that
+        channel at all, which is something to print rather than to crash on.
+        """
+        return _campaign.copy_for(channel or self._channel)
+
+    def _accounts(self, channel: str = "") -> list[dict]:
+        """Who may send on a channel, in the shape the cap rules read.
+
+        Gmail has as many rows as the user has added; WhatsApp has exactly one,
+        described the same way so that nothing downstream — the partition, the
+        cap check, the Accounts card — needs to know which channel it is on. An
+        empty list for WhatsApp is the channel being switched off in Settings.
+        """
         try:
-            return _settings.smtp_accounts(self.settings)
+            return _campaign.channel_accounts(self.settings, channel or self._channel)
         except Exception:
             return []
+
+    def _sender_noun(self, channel: str = "") -> str:
+        return _CHANNEL_SENDER.get(channel or self._channel, "account")
+
+    def _message_noun(self, channel: str = "") -> str:
+        return _CHANNEL_NOUN.get(channel or self._channel, "message")
+
+    def _wa_link(self):
+        """The one WhatsApp connection this process may have, or None.
+
+        Imported here rather than at the top of the file for one reason and it
+        is not the import cycle — there is none. The connection belongs to the
+        Settings screen, which is where a transport is set up; this screen only
+        borrows it, and a build that has somehow lost that module should carry
+        on sending email rather than fail to open the outreach screen.
+        """
+        try:
+            from ui.screen_settings import wa_link
+        except Exception:                            # noqa: BLE001 — email still works
+            return None
+        try:
+            return wa_link()
+        except Exception:                            # noqa: BLE001
+            return None
+
+    def _wa_ban_notice(self) -> str:
+        """The unacknowledged WhatsApp restriction, "" when there is none."""
+        if self.conn is None:
+            return ""
+        try:
+            return _text_of(_campaign.wa_ban_notice(self.conn))
+        except Exception:
+            return ""
+
+    def _on_channel_picked(self, index: int) -> None:
+        """Swap the channel this campaign is being composed for.
+
+        The plan is dropped rather than carried across, and that is deliberate:
+        a plan is a summary of a queue written for one transport, and showing it
+        under the other channel's heading would describe a campaign that does
+        not exist. Whatever was actually queued is untouched and is still on the
+        Sending tab, which reads each campaign's channel off its own rows.
+        """
+        key = _CHANNELS[index][0] if 0 <= index < len(_CHANNELS) else EMAIL
+        if key == self._channel:
+            return
+        self._channel = key
+        self._plan = {}
+        self.goto_sending_btn.hide()
+        self._cap_preview()
+        self._refresh_templates()
+        self._refresh_profile()
+        self._refresh_preview()
+        self._refresh_plan_summary()
+        self._refresh_channel_card()
+        self._refresh_lead_actions()
+
+    def _refresh_channel_card(self) -> None:
+        """What this channel is, and what is standing in the way of using it.
+
+        The warning half is the point. Every reason a WhatsApp campaign will not
+        send — the channel switched off, no connection, a standing restriction,
+        no copy in the build — is invisible from the Campaign tab otherwise, and
+        the user finds out by pressing Prepare and reading a skip count.
+        """
+        if not hasattr(self, "channel_note"):
+            return
+        index = _CHANNEL_INDEX.get(self._channel, 0)
+        button = self.channel_group.button(index)
+        if button is not None and not button.isChecked():
+            button.setChecked(True)
+
+        if self._channel == WHATSAPP:
+            self.channel_note.setText(
+                "Messages go to the lead's phone from the number connected in "
+                "Settings. Same leads and the same crawl as the email side, in "
+                "a chat register and under much tighter limits. A lead already "
+                "reached by email is left out of this campaign.")
+        else:
+            self.channel_note.setText(
+                "Mail goes from the Gmail accounts set up in Settings, with the "
+                "footer and the unsubscribe line every message is required to "
+                "carry. A lead already messaged on WhatsApp is left out of this "
+                "campaign.")
+
+        problems = self._channel_problems()
+        self.channel_warning.setText(" ".join(problems))
+        self.channel_warning.setVisible(bool(problems))
+
+    def _channel_problems(self) -> list:
+        """Everything that would stop this channel sending, in plain sentences."""
+        if self._channel != WHATSAPP:
+            return []
+        problems = []
+        if not self.settings.get("wa_enabled", False):
+            problems.append("WhatsApp is switched off in Settings, so nothing "
+                            "can be queued against the number.")
+        elif self._copy(WHATSAPP) is None:
+            problems.append("This build carries no WhatsApp copy, so there is "
+                            "nothing to write from.")
+        notice = self._wa_ban_notice()
+        if notice:
+            problems.append("%s Nothing will be sent on this channel until you "
+                            "acknowledge it in Settings." % notice)
+        link = self._wa_link()
+        if not problems and link is not None and link.session_for_send() is None:
+            problems.append("No WhatsApp connection is open. Preparing works "
+                            "either way, but Settings has to be connected and "
+                            "the QR scanned before a live run can send.")
+        problems.extend(_campaign.wa_warnings(self.settings))
+        return problems
 
     def _ai_summary(self) -> str:
         """Which provider writes the personalised lines, in a few words."""
         provider = _text_of(self.settings.get("ai_provider") or "auto").strip().lower()
         return _AI_PROVIDERS.get(provider, "AI: " + provider if provider else "AI: auto")
 
-    def _rules_summary(self) -> str:
+    def _rules_summary(self, channel: str = "") -> str:
         """The pacing rules in force, read off the settings themselves.
 
         Every one of these lives on the Settings screen and nowhere else, so a
         run that behaves unexpectedly — nothing going out on a Saturday, forty
         messages and then silence — has its explanation on the screen where it
         is happening rather than two screens away.
+
+        One function for both channels, because it reads the numbers through
+        `channel_settings` rather than by name: WhatsApp's window, caps, gaps,
+        ramp and single chaser arrive under the keys the email path already
+        used. Only the noun changes — Gmail has accounts and WhatsApp has one
+        number, and "per account" over a set of one reads as a bug.
         """
-        days = sorted({_int_of(d, -1) % 7 for d in (self.settings.get("send_days") or [])
+        channel = channel or self._channel
+        settings = self._channel_settings(channel)
+        noun = self._sender_noun(channel)
+        days = sorted({_int_of(d, -1) % 7 for d in (settings.get("send_days") or [])
                        if isinstance(d, (int, float))})
         when = ", ".join(_DAY_NAMES[d] for d in days) if days else "no days chosen"
-        start = _int_of(self.settings.get("send_start_hour"), 9)
-        end = _int_of(self.settings.get("send_end_hour"), 17)
-        zone = _text_of(self.settings.get("send_timezone") or "local").strip()
+        start = _int_of(settings.get("send_start_hour"), 9)
+        end = _int_of(settings.get("send_end_hour"), 17)
+        zone = _text_of(settings.get("send_timezone") or "local").strip()
 
-        daily = _int_of(self.settings.get("daily_cap_per_account"), 40)
-        hourly = _int_of(self.settings.get("hourly_cap_per_account"), 12)
+        daily = _int_of(settings.get("daily_cap_per_account"), 40)
+        hourly = _int_of(settings.get("hourly_cap_per_account"), 12)
         caps = "up to %d a day" % daily if daily > 0 else "no daily cap"
         caps += " and %d an hour" % hourly if hourly > 0 else " and no hourly cap"
 
-        parts = ["%s, %d:00–%d:00 %s" % (when, start, end, zone), caps + " per account"]
-        if self.settings.get("warmup_enabled", True):
-            parts.append("new accounts ramping from %d a day"
-                         % _int_of(self.settings.get("warmup_start"), 10))
-        steps = _int_of(self.settings.get("followup_max_steps"), 2)
-        if self.settings.get("followup_enabled", True) and steps > 0:
+        parts = ["%s, %d:00–%d:00 %s" % (when, start, end, zone),
+                 "%s per %s" % (caps, noun)]
+        if settings.get("warmup_enabled", True):
+            parts.append("a new %s ramping from %d a day"
+                         % (noun, _int_of(settings.get("warmup_start"), 10)))
+        steps = _int_of(settings.get("followup_max_steps"), 2)
+        if settings.get("followup_enabled", True) and steps > 0:
             parts.append("%s %d days apart" % (_plural(steps, "follow-up"),
-                                               _int_of(self.settings.get("followup_gap_days"), 4)))
+                                               _int_of(settings.get("followup_gap_days"), 4)))
         else:
             parts.append("no follow-ups")
         return " · ".join(parts)
@@ -4723,12 +5040,22 @@ class OutreachScreen(QWidget):
         profile = self._profile()
         problems = []
         if not self._accounts():
-            problems.append(("no Gmail account is set up to send from",
-                             "nothing can be queued until one is added in Settings"))
+            problems.append(
+                ("WhatsApp is switched off in Settings"
+                 if self._channel == WHATSAPP else
+                 "no Gmail account is set up to send from",
+                 "nothing can be queued until that is changed in Settings"))
         if not _text_of(profile.get("sender_name")).strip():
             problems.append(("your name is missing from the sign-off",
+                             "the message says who it is from and names nobody"
+                             if self._channel == WHATSAPP else
                              "the email closes with a company and no person behind it"))
-        if not _text_of(profile.get("postal_address")).strip():
+        if self._channel != WHATSAPP and not _text_of(profile.get("postal_address")).strip():
+            # Only on the email side, and that is not an oversight. The postal
+            # address is CAN-SPAM's requirement of a commercial email; a
+            # WhatsApp message carries its opt-out in the body instead, and a
+            # street address pasted into a chat bubble is four of its sixty
+            # words spent saying nothing to the reader.
             problems.append(("no postal address for the footer",
                              "CAN-SPAM requires one, and filters read a missing "
                              "address as bulk mail"))
@@ -4755,10 +5082,13 @@ class OutreachScreen(QWidget):
                         % (verb.capitalize(), listed), tone="warning")
             return True
 
-        tail = ("You can go ahead. Every one of these makes the spam folder more "
-                "likely." if self._accounts() else
-                "You can go ahead, but with no account to send from there is "
-                "nothing to queue the mail on.")
+        tail = ("You can go ahead. Every one of these makes a stranger likelier "
+                "to report the message, and a reported number is usually gone "
+                "for good." if self._channel == WHATSAPP else
+                "You can go ahead. Every one of these makes the spam folder more "
+                "likely.") if self._accounts() else (
+            "You can go ahead, but with no %s to send from there is nothing to "
+            "queue this on." % self._sender_noun())
         go, stop_asking = self._ask(
             "%s with an unfinished profile?" % verb.capitalize(),
             "The sender profile is missing:\n\n%s\n\n%s"
@@ -4834,7 +5164,17 @@ class OutreachScreen(QWidget):
         if company:
             lines.append(company)
         accounts = self._accounts()
-        if accounts:
+        if accounts and self._channel == WHATSAPP:
+            # The number itself, when the connection can say what it is. It
+            # cannot be read without a browser and planning must never open one,
+            # so the ledger is keyed on the channel rather than on the number —
+            # which is why this line asks the live connection instead of the
+            # account row, and says so plainly when nothing is connected.
+            link = self._wa_link()
+            number = link.me() if link is not None else ""
+            lines.append("Messaging from %s" % (number or "the WhatsApp number "
+                                                "connected in Settings"))
+        elif accounts:
             lines.append("Sending from "
                          + ", ".join(a["email"] for a in accounts[:_NAMED_IN_SUMMARY]))
 
@@ -4847,9 +5187,15 @@ class OutreachScreen(QWidget):
         for problem, cost in problems:
             lines.append("Needs attention: %s — %s." % (problem, cost))
         self.profile_summary.setText("\n".join(lines) or "Nothing set up yet.")
+        blocked = ("Nothing can be queued until WhatsApp is switched on in "
+                   "Settings." if self._channel == WHATSAPP else
+                   "Nothing can be queued until a Gmail account is added in "
+                   "Settings.")
         self.profile_problem.setText(
-            "Nothing can be queued until a Gmail account is added in Settings."
-            if not self._accounts() else
+            blocked if not self._accounts() else
+            "%s will get more of this campaign reported."
+            % _plural(len(problems), "thing").capitalize()
+            if self._channel == WHATSAPP else
             "%s will push more of this campaign into spam folders."
             % _plural(len(problems), "thing").capitalize())
         self.profile_problem.setVisible(bool(problems))
@@ -4857,12 +5203,14 @@ class OutreachScreen(QWidget):
         self.profile_fix_btn.setText(
             "Fix %s in Settings" % _plural(len(problems), "thing"))
 
-        steps = _int_of(self.settings.get("followup_max_steps"), 2)
-        gap = _int_of(self.settings.get("followup_gap_days"), 4)
-        if self.settings.get("followup_enabled", True) and steps > 0:
+        rules = self._channel_settings()
+        steps = _int_of(rules.get("followup_max_steps"), 2)
+        gap = _int_of(rules.get("followup_gap_days"), 4)
+        if rules.get("followup_enabled", True) and steps > 0:
             self.followup_hint.setText(
-                "%s queued alongside it, %d days apart, on the same thread."
-                % (_plural(steps, "follow-up"), gap))
+                "%s queued alongside it, %d days apart, in the same %s."
+                % (_plural(steps, "follow-up"), gap,
+                   "chat" if self._channel == WHATSAPP else "thread"))
         else:
             self.followup_hint.setText("Follow-ups are switched off in Settings.")
 
@@ -4878,8 +5226,11 @@ class OutreachScreen(QWidget):
         previous = combo.currentData()
         combo.blockSignals(True)
         combo.clear()
-        for tpl in _templates.templates_for_step(0):
-            combo.addItem(_text_of(tpl.name).strip() or _text_of(tpl.id), tpl.id)
+        copy = self._copy()
+        for tpl in (copy.for_step(0) if copy is not None else ()):
+            combo.addItem(_text_of(getattr(tpl, "name", "")).strip()
+                          or _text_of(getattr(tpl, "id", "")),
+                          getattr(tpl, "id", ""))
         index = combo.findData(previous) if previous is not None else -1
         if index < 0 and combo.count():
             index = 0
@@ -4888,7 +5239,9 @@ class OutreachScreen(QWidget):
         combo.blockSignals(False)
         combo.setEnabled(combo.count() > 0)
         combo.setToolTip(
-            "The first email each lead receives; follow-ups are chosen for you"
+            ("The first message each lead receives; the chaser is chosen for you"
+             if self._channel == WHATSAPP else
+             "The first email each lead receives; follow-ups are chosen for you")
             if combo.count() else "This build has no first-touch template")
 
     def _refresh_preview_choices(self) -> None:
@@ -4908,10 +5261,20 @@ class OutreachScreen(QWidget):
                          "Import leads on the Leads tab and they appear here")
         self._refresh_preview()
 
-    @staticmethod
-    def _preview_label(lead: dict) -> str:
+    def _preview_label(self, lead: dict) -> str:
+        """The lead as the picker names it — by whatever this channel reaches it at.
+
+        An address under a WhatsApp campaign is the wrong half of the record:
+        the thing that decides whether this lead can be in the campaign at all
+        is the number, and a picker that hides it is a picker whose selection
+        cannot be checked.
+        """
+        whatsapp = self._channel == WHATSAPP
+        reached = _text_of(lead.get("phone" if whatsapp else "email")).strip()
+        if whatsapp and not reached:
+            reached = "no number"
         return "%s — %s" % (_text_of(lead.get("name")).strip() or "Unnamed",
-                            _text_of(lead.get("email")).strip())
+                            reached)
 
     def _select_preview_lead(self, lead_id: int) -> None:
         lead_id = _int_of(lead_id)
@@ -4933,16 +5296,20 @@ class OutreachScreen(QWidget):
     def _first_touch_template(self):
         """The chosen template, or any first touch, or None.
 
-        The combo is filled from `templates_for_step(0)`, so a chosen id that no
-        longer resolves means the catalogue moved under a screen that was
-        already open. Falling back to a real first touch keeps the preview
-        drawing and the campaign preparable; None means there is no copy in the
-        build at all, which is not something the user did.
+        The combo is filled from this channel's own `for_step(0)`, so a chosen
+        id that no longer resolves means either the catalogue moved under a
+        screen that was already open or the channel just changed under it.
+        Falling back to a real first touch keeps the preview drawing and the
+        campaign preparable; None means there is no copy in the build for this
+        channel at all, which is not something the user did.
         """
-        template = _templates.get_template(self._template_id())
+        copy = self._copy()
+        if copy is None:
+            return None
+        template = copy.get(self._template_id())
         if template is not None:
             return template
-        options = _templates.templates_for_step(0)
+        options = copy.for_step(0)
         return options[0] if options else None
 
     def _preview_target(self) -> dict:
@@ -4960,6 +5327,19 @@ class OutreachScreen(QWidget):
         a preview that shows a shorter footer than the reader expects has to be
         the preview saying so, not a surprise found in a spam folder later.
         """
+        if self._channel == WHATSAPP:
+            # No footer to describe and no switch that can take it off. The
+            # opt-out is a line in the body, `render_wa` appends one to any
+            # message that does not already teach it, and it is named after the
+            # user's own `wa_opt_out_words` — so a reply matching it is one the
+            # reply watcher will actually honour.
+            words = [w for w in (self.settings.get("wa_opt_out_words") or []) if w]
+            self.preview_hint.setText(
+                "This is the message as it arrives, opt-out line included — "
+                "every first touch carries one, and a reply matching “%s” "
+                "suppresses that lead on both channels and cancels its chaser. "
+                "No subject, no footer, no HTML." % (words[0] if words else "stop"))
+            return
         missing = [name for name, key in (("unsubscribe line", "append_unsubscribe"),
                                           ("postal address", "append_postal_address"))
                    if not self.settings.get(key, True)]
@@ -4974,8 +5354,29 @@ class OutreachScreen(QWidget):
                        "it is" if len(missing) == 1 else "they are"))
         self.preview_hint.setText(note)
 
+    def _dress_preview(self) -> None:
+        """Put the pane into the shape the channel's message actually has.
+
+        A WhatsApp message has no subject to caption and no HTML alternative to
+        switch to, so neither control is left on screen offering a view of
+        something that does not exist. The counter changes units with it: an
+        inbox measures a subject in characters, and a chat bubble measures the
+        whole message in words, which is the number that decides whether it
+        reads as a note or as a wall.
+        """
+        whatsapp = self._channel == WHATSAPP
+        self.preview_kind.setText("Message" if whatsapp else "Subject")
+        self.subject_label.setVisible(not whatsapp)
+        for tab in self.view_tabs:
+            tab.setVisible(not whatsapp)
+        if whatsapp and self.view_group.checkedId() != 0:
+            self.view_group.button(0).setChecked(True)
+        self._cap_preview()
+
     def _refresh_preview(self) -> None:
         self._refresh_footer_hint()
+        self._dress_preview()
+        whatsapp = self._channel == WHATSAPP
         lead = self._preview_target()
         if not lead:
             self.subject_label.setText("—")
@@ -4984,12 +5385,16 @@ class OutreachScreen(QWidget):
             self._show_paper(
                 "Import some leads and this pane shows the exact message each "
                 "one would receive, rendered with their own business name, "
-                "their own headline gap and your footer.")
+                "their own headline gap and %s."
+                % ("their own opt-out line" if whatsapp else "your footer"))
             return
 
+        copy = self._copy()
         template = self._first_touch_template()
-        if template is None:
+        if copy is None or template is None:
             self._show_paper(
+                "This build has no first-touch WhatsApp message to preview."
+                if whatsapp and copy is None else
                 "This build has no first-touch template to preview. Reinstalling "
                 "restores them; nothing you did caused this.")
             return
@@ -5010,24 +5415,31 @@ class OutreachScreen(QWidget):
             self._show_paper(
                 "There is no message to preview: the crawl could not read this "
                 "site — %s.\n\n%s\n"
-                "This lead would still be mailed, but with a form letter that "
+                "This lead would still be %s, but with a form letter that "
                 "says nothing about the business. Retry the crawl from the "
                 "row's right-click menu, correct the address in the record, or "
                 "take the lead out before you prepare the campaign."
-                % (phrase, ("The crawl recorded: %s\n" % raw) if raw else ""))
+                % (phrase, ("The crawl recorded: %s\n" % raw) if raw else "",
+                   "messaged" if whatsapp else "mailed"))
             return
         ai = _loads(lead.get("ai_json"))
-        ctx = _campaign.apply_compliance(
-            _templates.build_context(lead, audit, ai, self._profile(), self.settings),
-            self.settings)
-        subject, body_text, body_html = _templates.render(template, ctx)
+        ctx = _templates.build_context(lead, audit, ai, self._profile(),
+                                       self.settings)
+        if not whatsapp:
+            # The same order the planner renders in, and the same condition: the
+            # compliance footers are an email's unsubscribe sentence and postal
+            # address, and a WhatsApp message carries its opt-out in the body
+            # where the reader will actually see it.
+            ctx = _campaign.apply_compliance(ctx, self.settings)
+        subject, body_text, body_html = copy.render(template, ctx)
 
-        if not subject or not body_text:
+        if not copy.usable(subject, body_text):
             self.subject_label.setText("—")
             self.subject_count.setText("")
             self._show_paper(
                 "This lead produced no usable copy. Audit it first — the "
-                "template needs at least a business name to write a subject.")
+                "template needs at least a business name to write %s."
+                % ("an opening line" if whatsapp else "a subject"))
             return
 
         # The renderer already strips surviving tokens; this is the second lock
@@ -5043,6 +5455,10 @@ class OutreachScreen(QWidget):
                 "it is not being shown and would not be sent. Fill in the sender "
                 "profile in Settings, or audit this lead, and check again."
                 % leak.group(0))
+            return
+
+        if whatsapp:
+            self._show_bubble(lead, body_text)
             return
 
         self.subject_label.setText(subject)
@@ -5065,6 +5481,50 @@ class OutreachScreen(QWidget):
             self.preview.setHtml(body_html)
         else:
             self.preview.setHtml(self._as_paper(body_text))
+        self._paint_paper()
+
+    def _show_bubble(self, lead: dict, body_text: str) -> None:
+        """The WhatsApp message, in the bubble and with the two facts about it.
+
+        The word count is not decoration. Sixty words is the ceiling the shipped
+        copy is written to and the number the whole register rests on: the same
+        pitch at an email's hundred and twenty arrives on a phone as a wall from
+        a number the reader does not recognise, which is what gets it reported.
+        So the count is stated against its budget and says when it is over.
+
+        The number is stated the way the transport will dial it, resolved
+        through the same `to_wa_id` the planner and the send loop use — a
+        preview showing the scraped text while the run refuses it would be the
+        preview lying about the one thing that decides whether this lead is in
+        the campaign at all.
+        """
+        words = (_wa_templates.word_count(body_text) if _wa_templates is not None
+                 else len(_text_of(body_text).split()))
+        budget = getattr(_wa_templates, "WA_MAX_WORDS", 0) if _wa_templates else 0
+        self.subject_count.setText(
+            "%s / %d%s" % (_plural(words, "word"), budget,
+                           " — long for a chat message" if words > budget else "")
+            if budget else _plural(words, "word"))
+
+        phone = _text_of(lead.get("phone")).strip()
+        region = _campaign.wa_region(self.settings)
+        wa_id = _wa.to_wa_id(phone, region)
+        if wa_id:
+            to = "+%s" % wa_id
+        elif phone:
+            to = "%s — no country code%s" % (
+                phone, "" if region else ", and no default region is set")
+        else:
+            to = "no number on this lead"
+        link = self._wa_link()
+        number = link.me() if link is not None else ""
+        self.preview_meta.setText("To %s  ·  %s  ·  From %s" % (
+            _text_of(lead.get("name")).strip() or "there", to,
+            number or "the number connected in Settings"))
+
+        lines = [html.escape(line.strip()) if line.strip() else "&nbsp;"
+                 for line in _text_of(body_text).strip().splitlines()]
+        self.preview.setHtml(_bubble_html(lines, "delivered"))
         self._paint_paper()
 
     def _as_paper(self, body_text: str) -> str:
@@ -5090,7 +5550,14 @@ class OutreachScreen(QWidget):
         self._paint_paper()
 
     def _paint_paper(self) -> None:
-        _paint_paper(self.preview)
+        """The page behind the message, on the ground its channel is read on.
+
+        White paper for an email, because that is what a mail client draws. The
+        chat ground for WhatsApp, because the bubble is the paper there and a
+        bubble on the same value as the page behind it stops being a bubble.
+        """
+        _paint_paper(self.preview,
+                     "inset" if self._channel == WHATSAPP else "raised")
 
     def _on_prepare_clicked(self) -> None:
         if self._planning or self._auditing or not self._retire(self.plan_worker):
@@ -5106,18 +5573,38 @@ class OutreachScreen(QWidget):
                         tone="warning")
             return
 
+        # Before the profile gate, because a standing restriction is not a
+        # warning the user can choose past: `OutreachWorker` refuses to start a
+        # WhatsApp run while one stands, so a campaign prepared now would sit in
+        # the queue unable to move and the schedule this screen printed for it
+        # would be fiction.
+        notice = self._wa_ban_notice() if self._channel == WHATSAPP else ""
+        if notice:
+            self._toast("%s Nothing can be queued for WhatsApp until you open "
+                        "Settings and acknowledge it." % notice, tone="danger",
+                        action="Open Settings",
+                        on_action=self.settings_signal.emit)
+            return
+
         if not self._profile_gate("prepare"):
             return
 
         template = self._first_touch_template()
         if template is None:
-            self._toast("There is no first-touch template to write from, so this "
-                        "install has no copy. Reinstalling restores them.",
-                        tone="danger")
+            self._toast(
+                "This build carries no first-touch WhatsApp message, so there "
+                "is nothing to write from." if self._channel == WHATSAPP else
+                "There is no first-touch template to write from, so this "
+                "install has no copy. Reinstalling restores them.",
+                tone="danger")
             return
 
-        name = "%s · %s · %s" % (template.name, _plural(len(leads), "lead"),
-                                 datetime.now().strftime("%d %b %H:%M"))
+        # The channel is first in the name because the campaign picker on the
+        # Sending tab is the one place the two are listed together, and a run
+        # started on the wrong one is refused by the worker rather than sent.
+        name = "%s · %s · %s · %s" % (
+            _CHANNEL_LABEL.get(self._channel, self._channel), template.name,
+            _plural(len(leads), "lead"), datetime.now().strftime("%d %b %H:%M"))
         campaign_id = _db.create_campaign(self.conn, name, template.id,
                                           self._profile(), self.settings, status="preparing")
         if not campaign_id:
@@ -5141,7 +5628,8 @@ class OutreachScreen(QWidget):
             "Auditing and queueing %s. This crawls each website, so it takes a "
             "while." % _plural(len(leads), "lead"))
 
-        worker = _PlanWorker(campaign_id, leads, template.id, self.settings)
+        worker = _PlanWorker(campaign_id, leads, template.id, self.settings,
+                             channel=self._channel)
         worker.progress_signal.connect(self._on_plan_progress)
         worker.plan_signal.connect(self._on_plan_ready)
         worker.finished.connect(self._on_plan_finished)
@@ -5223,6 +5711,9 @@ class OutreachScreen(QWidget):
         if not self._plan:
             summary = ("Nothing queued yet. When you prepare a campaign it "
                        "will send %s." % self._rules_summary())
+            if self._channel == WHATSAPP:
+                summary = ("Nothing queued yet. When you prepare a WhatsApp "
+                           "campaign it will message %s." % self._rules_summary())
         elif _text_of(self._plan.get("error")) and not _int_of(self._plan.get("queued")):
             summary = ""
             warning = "Nothing was queued: %s." % _text_of(self._plan.get("error"))
@@ -5242,10 +5733,16 @@ class OutreachScreen(QWidget):
         days = max(1, _int_of(plan.get("days")))
         accounts = [a for a in (plan.get("accounts") or []) if a]
         cap = _int_of(plan.get("daily_cap"))
+        # The plan's own channel and not the picker's: a summary is about the
+        # queue that was written, and the picker can have moved since.
+        channel = _campaign._channel(plan.get("channel"))
+        noun = _CHANNEL_NOUN.get(channel, "message")
 
-        head = "%s across %s" % (_plural(queued, "email"), _plural(days, "day"))
+        head = "%s across %s" % (_plural(queued, noun), _plural(days, "day"))
         if cap and accounts:
-            head += ", %d/day from %s" % (cap, _plural(len(accounts), "account"))
+            head += ", %d/day from %s" % (cap, _plural(len(accounts),
+                                                       _CHANNEL_SENDER.get(
+                                                           channel, "account")))
         first = plan.get("first_send")
         if first:
             head += ", first send %s" % _clock(first)

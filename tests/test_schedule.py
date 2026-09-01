@@ -2053,6 +2053,48 @@ def test_rate_limiting_buys_time_instead_of_retrying():
     print("rate limiting buys time instead of retrying: OK")
 
 
+def test_send_now_waives_the_whatsapp_window_and_not_its_spacing():
+    """Spec 7.5: Send now may waive the clock; it may not waive the number's limits.
+
+    On email the gap goes with the window, and that is documented: it is there
+    to make a mailbox look human and the user may take that risk. On WhatsApp
+    the gap is one of the number's own limits — the hourly cap bounds how many
+    messages go out and says nothing about how tightly they are packed, so
+    without this a Send now run puts eight messages on the wire inside a minute,
+    which is the shape the platform reads as a bot.
+    """
+    with temp_db() as conn:
+        worker, settings, row = _queued_wa_run(conn, 4)
+        worker.ignore_schedule = True
+        account = _wa_account(settings)
+
+        now = time.time()
+        worker._send(conn, row, account, now)
+        assert worker._pick_account(conn, row, now)[0] is None, \
+            "Send now waived the gap between two WhatsApp messages"
+        wait = worker._pick_account(conn, row, now)[1]
+        assert 90 <= wait <= 300, wait
+        # The window, though, is waived: that is what Send now is for. A
+        # one-hour window that cannot be the hour this suite is running in.
+        assert worker._waives_pacing() is False
+        shut = (time.localtime().tm_hour + 2) % 22
+        worker._settings = C.channel_settings(
+            dict(settings, wa_send_start_hour=shut, wa_send_end_hour=shut + 1),
+            C.WHATSAPP)
+        assert not C.in_send_window(now, worker._settings)
+
+        sent_before = len(worker._wa_session.sent)
+        worker._dispatch(conn, worker._due(conn, now + 400), now + 400)
+        assert len(worker._wa_session.sent) == sent_before + 1, \
+            "Send now did not waive the WhatsApp window"
+
+        # Email keeps the behaviour it documented.
+        email_worker = C.OutreachWorker(worker.campaign_id, _campaign_settings(),
+                                        dry_run=False, ignore_schedule=True)
+        assert email_worker._waives_pacing() is True
+    print("Send now waives the WhatsApp window and not its spacing: OK")
+
+
 def test_a_whatsapp_dry_run_opens_nothing_and_hands_the_queue_back():
     """`wa_dry_run` ships True, so this is what a first press of Start does."""
     with temp_db() as conn:
@@ -2138,7 +2180,7 @@ def test_a_crashed_whatsapp_send_is_not_sent_twice():
     """The browser may have delivered it a moment before the process died."""
     with temp_db() as conn:
         session = _StubSession()
-        worker, settings, row = _queued_wa_run(conn, 3, session)
+        worker, _s, row = _queued_wa_run(conn, 3, session)
         campaign_id = worker.campaign_id
         # What a crash between the claim and the outcome leaves behind.
         DB.mark_message(conn, row["id"], "sending", account_email=C.WA_ACCOUNT)

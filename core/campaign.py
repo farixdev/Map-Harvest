@@ -974,9 +974,9 @@ def plan_campaign(conn, *, campaign_id: int, leads: list[dict], template_id: str
     WhatsApped by the same stranger inside a week is what gets a sender
     reported, so the default is no and the override is explicit.
 
-    `copy` is the template source, and defaults to the one that belongs to the
-    channel. It is a seam for the tests, which drive a stub rather than the
-    shipped copy, exactly as they stub the SMTP sender and the WhatsApp session.
+    `copy` is the template source and defaults to the one that belongs to the
+    channel — a seam for a caller that has its own, and for the test that asks
+    what a build with no `core.wa_templates` in it does.
     """
     conn = conn if conn is not None else _db.connect()
     channel = _channel(channel)
@@ -1173,7 +1173,8 @@ def _eligible_leads(conn, leads: list, plan: dict, settings: dict = None,
                     allow_cross_channel: bool = False) -> list[dict]:
     """Stored lead rows for everything in `leads` that may still be contacted.
 
-    Four refusals, and the last two are what the second channel adds.
+    The second channel adds three refusals to the two email always had, and each
+    of them is a rule about the person rather than about the transport.
 
     A WhatsApp campaign needs a number this app can address, which is a stricter
     question than "has a phone": an unqualified number with no default region is
@@ -1218,7 +1219,7 @@ def _eligible_leads(conn, leads: list, plan: dict, settings: dict = None,
             if "@" not in email or _db.is_suppressed(conn, email, phone=phone):
                 _skip(plan, "no usable address, or suppressed")
                 continue
-            if channel == WHATSAPP and not _no_number(plan, phone, region):
+            if channel == WHATSAPP and not _usable_number(plan, phone, region):
                 continue
             lead_id = _int(lead.get("id")) or _db.upsert_lead(conn, lead)
             if not lead_id or lead_id in contacted or lead_id in seen:
@@ -1259,11 +1260,13 @@ def _messaged_numbers(conn) -> set[str]:
         "AND COALESCE(leads.phone_key, '') != ''", (WHATSAPP,)) if row.get("tail")}
 
 
-def _no_number(plan: dict, phone: str, region: str) -> bool:
-    """True when this number can be messaged. Counts the refusal when it cannot.
+def _usable_number(plan: dict, phone: str, region: str) -> bool:
+    """Can this number be messaged. Counts the refusal, with a reason, when not.
 
-    Named for the caller's guard rather than for the answer, which reads
-    backwards here and right at the call site.
+    Two refusals rather than one, because they are two different things for the
+    user to do: a lead with no number at all is not a WhatsApp lead, and a lead
+    whose number was scraped without a country code becomes one the moment a
+    default region is set.
     """
     if not _wa.is_plausible(phone):
         plan["no_phone"] += 1
@@ -2111,6 +2114,24 @@ class OutreachWorker(QThread):
                                       _int(row.get("lead_id")))
         return _text(parent.get("account_email")).strip().lower()
 
+    def _waives_pacing(self) -> bool:
+        """May Send now drop the gap between two messages on this channel.
+
+        On email, yes, and it is documented in `__init__`: the gap is there to
+        keep a mailbox looking human and a user who has decided to go now can
+        waive that for themselves.
+
+        On WhatsApp, no. The spec's rule is that Send now may waive the *clock*
+        and may not waive the number's own limits, and the gap is one of them
+        rather than part of the clock: eight messages inside a minute is the
+        shape the platform reads as a bot, and it is reachable under Send now
+        even with the hourly cap holding — the cap bounds the count and says
+        nothing about how tightly they are packed. The window is still waived,
+        so Send now means what it says; what it cannot do is put the number in
+        front of WhatsApp at machine speed.
+        """
+        return self.ignore_schedule and self.channel != WHATSAPP
+
     def _pick_account(self, conn, row: dict, now: float) -> tuple[dict | None, float]:
         """(account to send from, seconds to wait). Both empty means all capped."""
         accounts = self._live_accounts(now)
@@ -2131,7 +2152,7 @@ class OutreachWorker(QThread):
             email = _text(account["email"]).strip().lower()
             if not self._has_headroom(conn, account, now):
                 continue
-            ready = 0.0 if self.ignore_schedule else self._next_ok.get(email, 0.0)
+            ready = 0.0 if self._waives_pacing() else self._next_ok.get(email, 0.0)
             if ready > now:
                 waits.append(ready - now)
                 continue
