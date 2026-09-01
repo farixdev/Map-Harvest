@@ -27,12 +27,15 @@ from core import whatsapp as WA  # noqa: E402
 class _Element:
     """One DOM node, as much of one as this module ever touches."""
 
-    def __init__(self, text: str = "", png: bytes = b"", on_click=None) -> None:
+    def __init__(self, text: str = "", png: bytes = b"", on_click=None,
+                 attrs=None) -> None:
         self.text = text
         self.screenshot_as_png = png
+        self.attrs = dict(attrs or {})
         self._on_click = on_click
         self.clicks = 0
         self.keys: list = []
+        self.clears = 0
 
     def click(self) -> None:
         self.clicks += 1
@@ -43,6 +46,14 @@ class _Element:
         self.keys.append(value)
         if self._on_click is not None:
             self._on_click()
+
+    def clear(self) -> None:
+        self.clears += 1
+
+    def get_attribute(self, name):
+        """Selenium returns None for an attribute a node does not carry, and the
+        transport has to read that as "this build moved it" rather than as text."""
+        return self.attrs.get(name)
 
 
 class _Driver:
@@ -124,8 +135,14 @@ def _session(driver: _Driver, **kwargs) -> WA.WhatsAppSession:
     return session
 
 
-def _qr_page():
-    return {"div[data-ref]": [_Element(png=b"\x89PNG-qr")]}
+def _qr_page(ref: str = ""):
+    """The login screen. `ref` is WhatsApp's own QR payload in `data-ref`.
+
+    Blank by default so the tests written before the QR was encoded here still
+    exercise the screenshot fallback, which is exactly what it is for.
+    """
+    attrs = {"data-ref": ref} if ref else {}
+    return {"div[data-ref]": [_Element(png=b"\x89PNG-qr", attrs=attrs)]}
 
 
 def _ready_page():
@@ -134,6 +151,14 @@ def _ready_page():
 
 def _dialog(text: str):
     return {"div[data-testid='popup-contents']": [_Element(text=text)]}
+
+
+# A payload shaped like the real thing: WhatsApp's `data-ref` is four
+# comma-separated base64 fields. Nothing here talks to WhatsApp, so it only has
+# to be the right *shape* — the encoder does not care what the string says.
+_REF = ("2@nHkPuVdG5hK1qYbTz3RwLcXmJfSoAeIu9NpQrWvB0dCyEgZlMhTaKjXn4FsOiU7,"
+        "kL9mQpR2sT4uV6wX8yZ0aB1cD3eF5gH7iJ9kL1mN3o=,"
+        "pQ2rS4tU6vW8xY0zA1bC3dE5fG7hI9jK1lM3nO5pQ7r=,1")
 
 
 # ── Phone numbers ────────────────────────────────────────────────────────────
@@ -273,7 +298,18 @@ def test_matches_opt_out_is_word_boundaried():
 _SPEC_DEFAULTS = {
     "wa_enabled": False,
     "wa_default_region": "",
-    "wa_headless": False,
+    # Inverted, deliberately, and the spec line it came from is superseded.
+    # `docs/WHATSAPP_SPEC.md` §2 shipped this False with the note "the QR needs
+    # a visible window the first time" — and the first half of that is still
+    # true and is now enforced somewhere better than a default: `start()` opens
+    # a window whenever `has_login` says there is nothing to restore, whatever
+    # this setting says. What the False was really paying for was a QR that only
+    # rendered in a visible browser, and that is fixed — the QR is encoded from
+    # `data-ref` now and is identical either way. So the remaining question is
+    # what a *restored* session should do, and the answer is not "put a Chrome
+    # window over whatever the user is doing, once per campaign".
+    "wa_headless": True,
+    "wa_idle_close_sec": 600,
     "wa_daily_cap": 30,
     "wa_hourly_cap": 8,
     "wa_min_gap_sec": 90,
@@ -313,6 +349,12 @@ def test_the_whatsapp_defaults_are_the_spec_and_are_tighter_than_email():
     assert settings["wa_send_start_hour"] > settings["send_start_hour"], (
         "a message at 08:00 reads worse than an email does")
     assert settings["wa_dry_run"] is True, "a fresh install never surprise-sends"
+    # The one relationship the idle close depends on. An interval at or below
+    # the longest gap the pacer can pick would quit the browser between two
+    # ordinary sends and make a page load a per-message cost instead of a
+    # per-campaign one — which is the opposite of what closing it is for.
+    assert settings["wa_idle_close_sec"] > settings["wa_max_gap_sec"], (
+        "the browser would be torn down between two ordinary sends")
     assert settings["wa_default_region"] == "", (
         "blank is what makes an unqualified number a refusal, not a guess")
     print("WhatsApp defaults match the spec and are tighter than email: OK")
@@ -701,6 +743,876 @@ def test_importing_the_transport_pulls_in_no_browser_stack():
         assert "undetected" not in line, line
         assert "PyQt5" not in line, line
     print("core.whatsapp imports no browser stack at module scope: OK")
+
+
+# ── The login QR ─────────────────────────────────────────────────────────────
+
+def _png_pixels(png: bytes):
+    """(width, height, rows of greyscale bytes), parsed back out of the PNG.
+
+    Read here rather than trusted, and with the stdlib rather than with the
+    writer's own helpers: a rasteriser checked by calling itself proves nothing.
+    A QR that is off by a row, inverted, or missing its quiet zone is still a
+    perfectly valid PNG, and the only way to catch that is to look at pixels.
+    """
+    import struct
+    import zlib
+
+    assert png[:8] == b"\x89PNG\r\n\x1a\n", png[:8]
+    pos, width, height, idat = 8, 0, 0, b""
+    while pos < len(png):
+        length = struct.unpack(">I", png[pos:pos + 4])[0]
+        tag, body = png[pos + 4:pos + 8], png[pos + 8:pos + 8 + length]
+        if tag == b"IHDR":
+            width, height, depth, colour = struct.unpack(">IIBB", body[:10])
+            assert (depth, colour) == (8, 0), "8-bit greyscale, not %r" % ((depth, colour),)
+        elif tag == b"IDAT":
+            idat += body
+        pos += 12 + length
+    raw = zlib.decompress(idat)
+    stride = width + 1
+    rows = []
+    for y in range(height):
+        line = raw[y * stride:(y + 1) * stride]
+        assert line[0] == 0, "only filter type 0 is written"
+        rows.append(list(line[1:]))
+    assert len(rows) == height, (len(rows), height)
+    return width, height, rows
+
+
+def test_the_qr_is_encoded_from_whatsapps_payload_not_photographed():
+    """The headless QR did not scan, and this is why.
+
+    The QR used to be an element screenshot of the `<canvas>` the web client
+    paints into, and a headless Chrome renders that canvas blank or at the wrong
+    scale — so the one login that most needs no window was the one that could
+    not be completed. WhatsApp publishes the payload in `data-ref`; encoded from
+    that, the image does not depend on a renderer at all.
+    """
+    driver = _Driver(page=_qr_page(_REF))
+    with _session(driver) as session:
+        session.start()
+        assert session.status() == "qr"
+        png = session.qr_png()
+        assert png.startswith(b"\x89PNG\r\n\x1a\n"), png[:8]
+        assert png != b"\x89PNG-qr", "the screenshot was taken after all"
+        assert session.qr_payload() == _REF
+        # And it is the QR *for that payload*, not merely an image.
+        assert png == WA.qr_png_of(_REF)
+        modules = session.qr_modules()
+        assert modules and len(modules) == len(modules[0]), "a QR is square"
+    print("the QR is encoded from data-ref, not screenshotted: OK")
+
+
+def test_the_qr_image_is_black_on_white_with_a_real_quiet_zone():
+    """A themed or crowded QR is a QR a phone will not lock onto.
+
+    Three things a camera needs and a hand-rolled rasteriser gets wrong: two
+    tones and not an anti-aliased gradient, dark modules on light and not the
+    inverse, and the four-module quiet zone that lets the finder patterns be
+    found at all. Measured off the pixels, module by module.
+    """
+    png = WA.qr_png_of(_REF)
+    modules = WA.qr_matrix_of(_REF)
+    side, scale = len(modules), WA.QR_MODULE_PX
+    width, height, rows = _png_pixels(png)
+
+    assert width == height == side * scale, (width, height, side, scale)
+    assert {value for row in rows for value in row} == {0, 255}, (
+        "a QR is two tones; anything between them is a blurred module edge")
+
+    quiet = WA.QR_QUIET_MODULES * scale
+    assert quiet > 0
+    for y in range(quiet):
+        assert set(rows[y]) == {255}, "the top quiet zone has ink in it"
+        assert set(rows[height - 1 - y]) == {255}, "the bottom quiet zone has ink"
+    for row in rows:
+        assert set(row[:quiet]) == {255} and set(row[-quiet:]) == {255}
+
+    # Every module, at its own centre, is the colour the matrix says it is.
+    for my, module_row in enumerate(modules):
+        for mx, dark in enumerate(module_row):
+            pixel = rows[my * scale + scale // 2][mx * scale + scale // 2]
+            assert pixel == (0 if dark else 255), (mx, my, dark, pixel)
+
+    # The top-left finder pattern, which is what a scanner hunts for first: a
+    # 7×7 dark square with a light ring and a 3×3 dark core, at the quiet zone.
+    q = WA.QR_QUIET_MODULES
+    assert all(modules[q][q + i] for i in range(7)), "no finder pattern"
+    assert modules[q + 2][q + 2] and not modules[q + 1][q + 1]
+    print("the QR is %dx%d px, %d modules, black-on-white, %d-module quiet zone: OK"
+          % (width, height, side, WA.QR_QUIET_MODULES))
+
+
+def test_the_qr_is_the_same_image_hidden_or_visible():
+    """Which is the entire point of not screenshotting it.
+
+    Two sessions on the same payload: one whose element screenshot comes back as
+    a capture, one whose comes back empty the way a headless canvas does. The
+    bytes the phone is asked to read have to be identical, because the payload
+    is identical.
+    """
+    def scene(png_bytes):
+        return {"div[data-ref]": [_Element(png=png_bytes,
+                                           attrs={"data-ref": _REF})]}
+
+    visible, hidden = _Driver(page=scene(b"\x89PNG-a-real-capture")), _Driver(page=scene(b""))
+    with _session(visible) as one, _session(hidden) as two:
+        one.start()
+        two.start()
+        assert one.qr_png() == two.qr_png() != b""
+        assert one.qr_payload() == two.qr_payload() == _REF
+    print("the QR is byte-identical hidden or visible: OK")
+
+
+def test_the_qr_falls_back_to_the_screenshot_when_data_ref_is_gone():
+    """WhatsApp renames things. A build without `data-ref` still has to log in.
+
+    The fallback is the old path, blur and all — worse than the encoded QR and
+    much better than no QR, which is what a hard dependency on one attribute
+    would leave behind on the week they rename it.
+    """
+    driver = _Driver(page=_qr_page())            # no data-ref anywhere
+    with _session(driver) as session:
+        session.start()
+        assert session.status() == "qr"
+        assert session.qr_png() == b"\x89PNG-qr", "the screenshot fallback is gone"
+        assert session.qr_payload() == ""
+        assert session.qr_modules() == []
+    print("a missing data-ref falls back to the screenshot: OK")
+
+
+def test_the_raster_agrees_with_the_qr_librarys_own_renderer():
+    """The check the pixel test above cannot make: is it the right way round.
+
+    A transposed or mirrored QR is still square, still two-tone, still has three
+    finder patterns and still has its quiet zone — and no phone will read it.
+    Nothing in the shape of the image gives that away, so the module positions
+    are compared against `qrcode`'s own SVG output, which is a renderer this
+    module does not share a line of code with and whose QRs are known to scan.
+    `qrcode.image.svg` is pure Python, so this stays an offline test.
+    """
+    import io
+    import re
+
+    import qrcode
+    import qrcode.image.svg as svg_factory
+
+    drawn = qrcode.make(_REF, image_factory=svg_factory.SvgImage,
+                        border=WA.QR_QUIET_MODULES,
+                        error_correction=qrcode.constants.ERROR_CORRECT_L)
+    buffer = io.BytesIO()
+    drawn.save(buffer)
+    theirs = {(int(x), int(y)) for x, y in
+              re.findall(r'x="(\d+)mm" y="(\d+)mm"', buffer.getvalue().decode("utf-8"))}
+    assert theirs, "the reference renderer drew nothing; the check is vacuous"
+
+    modules = WA.qr_matrix_of(_REF)
+    ours = {(x, y) for y, row in enumerate(modules)
+            for x, dark in enumerate(row) if dark}
+    assert ours == theirs, "the matrix is transposed or mirrored"
+
+    scale = WA.QR_MODULE_PX
+    _width, height, rows = _png_pixels(WA.qr_png_of(_REF))
+    painted = {(x // scale, y // scale) for y in range(height)
+               for x, value in enumerate(rows[y]) if value == 0}
+    assert painted == theirs, "the raster does not match the modules it drew"
+    print("%d modules agree with qrcode's own renderer: OK" % len(theirs))
+
+
+def test_an_unencodable_payload_is_a_blank_qr_and_not_a_raise():
+    assert WA.qr_png_of("") == b""
+    assert WA.qr_matrix_of("") == []
+    assert WA.qr_png_of(None) == b""
+    assert WA.qr_png_of("x" * 5000) == b"", "past QR capacity, refused not raised"
+    print("an unencodable QR payload returns empty: OK")
+
+
+# ── Linking with a code ──────────────────────────────────────────────────────
+
+def _pairing_driver(code: str = "ABCD1234"):
+    """The login screen, with WhatsApp's "Log in with phone number" behind it.
+
+    Rendered the way the client does: the code arrives one character to a node,
+    which is why the reader squeezes out everything that is not alphanumeric
+    before it decides whether it has eight characters.
+    """
+    driver = _Driver(page=_qr_page(_REF))
+    field = _Element()
+
+    def show_code():
+        driver.page["div[aria-details*='link-device-phone-number-code']"] = [
+            _Element(text="\n".join(code))]
+
+    next_button = _Element(text="Next", on_click=show_code)
+
+    def offer_field():
+        driver.page["input[type='tel']"] = [field]
+        driver.page["div[role='button']"] = [next_button]
+
+    entry = _Element(text="Log in with phone number", on_click=offer_field)
+    driver.page["div[role='button']"] = [entry]
+    return driver, field, entry, next_button
+
+
+def test_a_pairing_code_is_the_other_way_in():
+    """The answer to a QR that will not scan, and quicker than fetching a phone."""
+    driver, field, entry, next_button = _pairing_driver()
+    with _session(driver, default_region="CA") as session:
+        session.start()
+        assert session.status() == "qr"
+
+        code, error = session.request_pairing_code("(416) 555-0142")
+        assert (code, error) == ("ABCD1234", ""), (code, error)
+        assert entry.clicks == 1 and next_button.clicks == 1
+        # The number goes in as the full international form the client parses,
+        # and it went through `to_wa_id` first like every other number here.
+        assert field.keys == ["+14165550142"], field.keys
+
+        assert session.status() == "pairing"
+        assert session.pairing_code() == "ABCD1234"
+        assert session.pairing_phone() == "14165550142"
+        assert 0 < session.pairing_expires_in() <= WA.PAIRING_CODE_TTL_SEC
+
+        # A code on screen is not a login. Sending has to keep saying so.
+        ok, why = session.send("(416) 555-0143", "hello")
+        assert ok is False and why.startswith("AUTH:"), why
+    print("a pairing code is asked for and read back: OK")
+
+
+def test_a_pairing_code_expires_and_another_can_be_asked_for():
+    """It dies on this app's clock, deliberately early — see PAIRING_CODE_TTL_SEC.
+
+    A code that has quietly expired is worse than no code: the user walks to
+    their phone, types eight characters, and is told they are wrong.
+    """
+    driver, _field, entry, next_button = _pairing_driver()
+    with _session(driver, default_region="CA") as session:
+        session.start()
+        assert session.request_pairing_code("+14165550142")[0] == "ABCD1234"
+        clock = session._clock_for_test
+
+        clock.sleep(WA.PAIRING_CODE_TTL_SEC / 2)
+        assert session.pairing_code() == "ABCD1234", "not expired yet"
+        clock.sleep(WA.PAIRING_CODE_TTL_SEC)
+        assert session.pairing_code() == "", "an expired code must not be shown"
+        assert session.pairing_expires_in() == 0.0
+        assert session.pairing_phone() == ""
+
+        # And the state underneath comes back, so the card offers the QR again.
+        session._poll_once()
+        assert session.status() == "qr"
+
+        # Another is one call, and does not walk the entry screen a second time
+        # because the client is already sitting on the number field.
+        again, error = session.request_pairing_code("+14165550142")
+        assert (again, error) == ("ABCD1234", ""), error
+        assert entry.clicks == 1, "the flow was re-entered from the start"
+        assert next_button.clicks == 2
+        assert session.status() == "pairing"
+    print("a pairing code expires and another can be asked for: OK")
+
+
+def test_the_pairing_code_reader_takes_the_code_and_not_the_word_beside_it():
+    """"WhatsApp" is eight letters, and squashed it is the shape of a code.
+
+    The reader squeezes out spacing and hyphens to survive three different
+    renderings of the same eight characters, and that squeeze is what makes a
+    word on the screen indistinguishable from an answer. A candidate with a
+    digit in it wins; an all-letter one is still taken when it is all there is,
+    because an all-letter code is rare rather than impossible.
+    """
+    for rendering in ("ABCD1234", "ABCD-1234", "ABCD 1234", "\n".join("ABCD1234"),
+                      "Enter this code on your phone\nABCD 1234"):
+        driver, _field, _entry, _next = _pairing_driver()
+        with _session(driver, default_region="CA") as session:
+            session.start()
+            driver.page["div[aria-details*='link-device-phone-number-code']"] = [
+                _Element(text=rendering)]
+            assert session._read_pairing_code() == "ABCD1234", rendering
+
+    driver = _Driver(page=_qr_page(_REF))
+    with _session(driver) as session:
+        session.start()
+        driver.page["div[aria-details*='link-device-phone-number-code']"] = [
+            _Element(text="WhatsApp\nAB7D1234")]
+        assert session._read_pairing_code() == "AB7D1234", "the word won"
+        driver.page["div[aria-details*='link-device-phone-number-code']"] = [
+            _Element(text="ABCDEFGH")]
+        assert session._read_pairing_code() == "ABCDEFGH", (
+            "an all-letter code is rare, not impossible")
+        driver.page["div[aria-details*='link-device-phone-number-code']"] = [
+            _Element(text="not a code at all")]
+        assert session._read_pairing_code() == ""
+    print("the pairing code reader prefers the code over the word: OK")
+
+
+def test_a_pairing_code_refuses_a_number_it_would_have_to_guess():
+    """Same refusal as `send`, and for a weaker reason than `send`'s.
+
+    A misread number here cannot message anybody — the code has to be typed on
+    the phone that owns the number, so the worst case is a pairing that never
+    happens. It is refused anyway, because a user who is told "no country code"
+    once learns it for the send path too.
+    """
+    driver, _field, entry, _next = _pairing_driver()
+    with _session(driver) as session:               # no default_region
+        session.start()
+        code, error = session.request_pairing_code("(416) 555-0142")
+        assert code == "" and error.startswith("RECIPIENT:"), error
+        assert "region" in error.lower(), error
+        assert entry.clicks == 0, "the client was driven before the number was read"
+
+        assert session.request_pairing_code("")[1].startswith("RECIPIENT:")
+    print("a pairing code refuses an unqualified number: OK")
+
+
+def test_a_pairing_code_is_refused_when_there_is_nothing_to_pair():
+    driver = _Driver(page=_ready_page())
+    with _session(driver, default_region="CA") as session:
+        # Already connected: asking would link a second number onto a profile
+        # that Chrome only has one login slot for.
+        session.start()
+        code, error = session.request_pairing_code("+14165550142")
+        assert code == "" and "already connected" in error, error
+
+    cold = _session(_Driver(page=_qr_page(_REF)), default_region="CA")
+    code, error = cold.request_pairing_code("+14165550142")
+    assert code == "" and error.startswith("CONN:"), error
+    cold.close()
+    print("a pairing code is refused when there is nothing to pair: OK")
+
+
+def test_a_pairing_screen_that_never_appears_is_a_sentence_not_a_raise():
+    driver = _Driver(page=_qr_page(_REF))           # no pairing entry at all
+    with _session(driver, default_region="CA") as session:
+        session.start()
+        code, error = session.request_pairing_code("+14165550142")
+        assert code == "" and error.startswith("OTHER:"), error
+        assert "QR" in error, "the user is left without the other option named"
+    print("a missing pairing flow degrades to a sentence: OK")
+
+
+# ── Logging out ──────────────────────────────────────────────────────────────
+
+def _linked_driver():
+    """A logged-in client whose menu can actually be driven to Log out."""
+    driver = _Driver(page=_ready_page())
+    confirm = _Element(text="Log out")
+
+    def confirmed():
+        driver.page = _qr_page(_REF)
+
+    confirm._on_click = confirmed
+
+    def chose_log_out():
+        driver.page.pop("div[role='menuitem']", None)
+        driver.page["div[role='button']"] = [confirm]
+
+    item = _Element(text="Log out", on_click=chose_log_out)
+
+    def opened():
+        driver.page["div[role='menuitem']"] = [item]
+
+    menu = _Element(text="", on_click=opened)
+    driver.page["span[data-icon='menu']"] = [menu]
+    return driver, menu, item, confirm
+
+
+def _plant_login(profile: str = "default") -> str:
+    """Write the marker that makes `has_login` true, and return the directory."""
+    directory = WA.state_dir(profile)
+    leveldb = os.path.join(directory, "Default", "Local Storage", "leveldb")
+    os.makedirs(leveldb, exist_ok=True)
+    with open(os.path.join(leveldb, "000003.log"), "wb") as handle:
+        handle.write(b"not really a leveldb")
+    return directory
+
+
+def test_log_out_unlinks_the_client_and_then_wipes_the_saved_session():
+    """Disconnect keeps the login. This is the one that lets a number change.
+
+    Both halves are checked because they answer different questions: driving the
+    client is what stops the phone listing this machine under Linked Devices,
+    and clearing the directory is what makes the next connect a fresh QR.
+    """
+    original = ST.SETTINGS_DIR
+    with tempfile.TemporaryDirectory() as tmp:
+        ST.SETTINGS_DIR = tmp
+        try:
+            driver, menu, item, confirm = _linked_driver()
+            session = _session(driver)
+            session.start()
+            directory = _plant_login()
+            assert WA.has_login("default") is True
+
+            ok, message = session.log_out()
+            assert ok is True, message
+            assert (menu.clicks, item.clicks, confirm.clicks) == (1, 1, 1)
+            assert "linked device" in message, message
+            assert driver.quits == 1, "the browser is quit as well"
+            assert not os.path.exists(directory), directory
+            assert WA.has_login("default") is False
+            assert session.status() == "offline"
+            assert session.me() == ""
+        finally:
+            ST.SETTINGS_DIR = original
+    print("log out unlinks the client and wipes the session: OK")
+
+
+def test_log_out_still_clears_the_login_when_the_client_cannot_be_driven():
+    """The directory is what decides, so a renamed menu cannot strand a user.
+
+    WhatsApp renames its menu; a log out that could only work by driving the UI
+    would be a log out that stopped working on their schedule, leaving the only
+    way to switch numbers a directory deleted by hand.
+    """
+    original = ST.SETTINGS_DIR
+    with tempfile.TemporaryDirectory() as tmp:
+        ST.SETTINGS_DIR = tmp
+        try:
+            driver = _Driver(page=_ready_page())     # ready, and no menu at all
+            session = _session(driver)
+            session.start()
+            directory = _plant_login()
+
+            ok, message = session.log_out()
+            assert ok is True, message
+            assert not os.path.exists(directory)
+            # And it says so, rather than implying the phone was told.
+            assert "Linked Devices" in message, message
+            assert "could not be logged out" in message, message
+        finally:
+            ST.SETTINGS_DIR = original
+    print("log out clears the login with no client to drive: OK")
+
+
+def test_log_out_never_removes_anything_but_its_own_session_directory():
+    """This function deletes a tree. The refusals are the whole of the test.
+
+    Two layers, and both are checked. The profile name is scrubbed on the way in
+    so a hostile one cannot name a path outside; and the resolved path is then
+    required to be a direct child of the app's own `wa-session` folder, so a
+    junction, a symlink, or a bug upstream in `state_dir` still cannot reach a
+    user's files.
+    """
+    original = ST.SETTINGS_DIR
+    with tempfile.TemporaryDirectory() as tmp:
+        ST.SETTINGS_DIR = tmp
+        try:
+            keep = os.path.join(tmp, "settings.json")
+            with open(keep, "w", encoding="utf-8") as handle:
+                handle.write("{}")
+            neighbour = os.path.join(tmp, "wa-session-elsewhere")
+            os.makedirs(neighbour, exist_ok=True)
+
+            for hostile in ("../../escape", r"..\..\escape", "a/b", "", ".", ".."):
+                WA._clear_state_dir(hostile, sleep=lambda _s: None)
+                assert os.path.exists(keep), hostile
+                assert os.path.exists(neighbour), hostile
+
+            # And the guard itself, with `state_dir` made to lie the way a bug
+            # or a symlink would.
+            outside = os.path.join(tmp, "not-a-session")
+            os.makedirs(outside, exist_ok=True)
+            os.makedirs(os.path.join(tmp, "wa-session"), exist_ok=True)
+            saved = WA.state_dir
+            try:
+                for lie in (outside, os.path.join(tmp, "wa-session"), tmp):
+                    WA.state_dir = lambda profile="default", _p=lie: _p
+                    ok, why = WA._clear_state_dir("default", sleep=lambda _s: None)
+                    assert ok is False, lie
+                    assert "refused" in why, why
+                    assert os.path.exists(lie), lie
+            finally:
+                WA.state_dir = saved
+
+            # A link where the session directory should be is refused rather
+            # than followed, whatever it points at. Windows only lets some
+            # accounts create one, so where it cannot the case is reported as
+            # unexercised instead of quietly passing.
+            # Pointed at a directory that *would* have passed every other check,
+            # so the refusal can only be coming from it being a link.
+            real = os.path.join(tmp, "wa-session", "real")
+            os.makedirs(real, exist_ok=True)
+            link = os.path.join(tmp, "wa-session", "linked")
+            try:
+                os.symlink(real, link, target_is_directory=True)
+            except (OSError, NotImplementedError, AttributeError) as why:
+                print("  (symlink case not exercised: %s)" % why)
+            else:
+                WA.state_dir = lambda profile="default", _p=link: _p
+                try:
+                    ok, refusal = WA._clear_state_dir("default", sleep=lambda _s: None)
+                    assert ok is False and "refused" in refusal, refusal
+                    assert os.path.exists(real), "a link was followed and deleted"
+                finally:
+                    WA.state_dir = saved
+                    os.unlink(link)
+
+            # A directory that is not there is success, because success means
+            # "no old login is left", not "something was deleted".
+            assert WA._clear_state_dir("default", sleep=lambda _s: None) == (True, "")
+        finally:
+            ST.SETTINGS_DIR = original
+    print("log out refuses every path but its own session directory: OK")
+
+
+def test_log_out_is_how_a_restricted_number_gets_swapped_out():
+    """The one place the ban latch is cleared, and the reason it may be.
+
+    `BANNED:` is sticky because continuing on a restricted number is how a
+    temporary block becomes permanent. But the latch is a fact about a *number*,
+    and this call is the user throwing that number's login away — leaving it set
+    would mean a restricted account could never be replaced without restarting
+    the app, which is exactly the corner this whole function exists to open up.
+    """
+    original = ST.SETTINGS_DIR
+    with tempfile.TemporaryDirectory() as tmp:
+        ST.SETTINGS_DIR = tmp
+        try:
+            driver = _Driver(page=_ready_page())
+            driver.on_get = lambda drv, url: drv.page.update(
+                _dialog("Your phone number is banned from using WhatsApp."))
+            session = _session(driver, default_region="CA")
+            session.start()
+            assert session.send("(416) 555-0142", "hello")[1].startswith("BANNED:")
+            assert session.banned is True
+            assert session.start()[0] is False, "still latched"
+
+            _plant_login()
+            ok, message = session.log_out()
+            assert ok is True, message
+            assert session.banned is False
+            assert session.status() == "offline"
+            # And the session is usable again, on whatever number is linked next.
+            fresh = _Driver(page=_qr_page(_REF))
+            session._new_driver = lambda directory, headless: fresh
+            assert session.start() == (True, "")
+            assert session.status() == "qr"
+            session.close()
+        finally:
+            ST.SETTINGS_DIR = original
+    print("log out is how a restricted number is swapped out: OK")
+
+
+# ── Headless, and not sitting there as a browser ─────────────────────────────
+
+def test_headless_is_the_default_once_there_is_a_login_to_restore():
+    """The old default was False on folklore. This is the shape that replaces it.
+
+    `headless=True` means "hidden whenever it can be", not "hidden always": a
+    profile with nothing to restore is opened with a window whatever the setting
+    says, because a first link needs one. What changed is the *restore*, which
+    is every start after the first, and which used to put a Chrome window over
+    whatever the user was doing once per campaign.
+    """
+    original = ST.SETTINGS_DIR
+    with tempfile.TemporaryDirectory() as tmp:
+        ST.SETTINGS_DIR = tmp
+        try:
+            seen = []
+
+            def build(profile, **kwargs):
+                driver = _Driver(page=_ready_page())
+                return WA.WhatsAppSession(
+                    profile=profile, poll_sec=60.0,
+                    driver_factory=lambda directory, headless: (
+                        seen.append(headless) or driver), **kwargs)
+
+            assert WA.WhatsAppSession().headless is True, "the constructor default"
+
+            first = build("default")
+            assert first.start() == (True, "")
+            assert seen == [False], "a first link must be watchable"
+            assert first.running_headless() is False
+            first.close()
+
+            _plant_login("default")
+            assert WA.has_login("default") is True
+            restored = build("default")
+            assert restored.start() == (True, "")
+            assert seen == [False, True], "a restored session must not need a window"
+            assert restored.running_headless() is True
+            restored.close()
+            assert restored.running_headless() is False, "no browser, nothing hidden"
+
+            # And the switch still pins a window open for watching the client.
+            pinned = build("default", headless=False)
+            assert pinned.start() == (True, "")
+            assert seen == [False, True, False]
+            pinned.close()
+        finally:
+            ST.SETTINGS_DIR = original
+    print("headless is the default once a login exists: OK")
+
+
+def test_has_login_needs_more_than_chrome_having_run_once():
+    """Chrome writes `Default/` on its first run, so its existence proves nothing.
+
+    A false yes costs a hidden browser that comes up on the QR screen, which the
+    UI then reports; a false no costs a window nobody needed. Neither loses a
+    login — but a `Default/` that means "logged in" would make the first ever
+    connect headless, which is the one that cannot be.
+    """
+    original = ST.SETTINGS_DIR
+    with tempfile.TemporaryDirectory() as tmp:
+        ST.SETTINGS_DIR = tmp
+        try:
+            assert WA.has_login("default") is False, "nothing on disk"
+            os.makedirs(os.path.join(WA.state_dir("default"), "Default"),
+                        exist_ok=True)
+            assert WA.has_login("default") is False, "Chrome ran; nobody logged in"
+            empty = os.path.join(WA.state_dir("default"), "Default",
+                                 "Local Storage", "leveldb")
+            os.makedirs(empty, exist_ok=True)
+            assert WA.has_login("default") is False, "an empty store is not a login"
+            _plant_login("default")
+            assert WA.has_login("default") is True
+            # Per profile, so one number's login says nothing about another's.
+            assert WA.has_login("second") is False
+        finally:
+            ST.SETTINGS_DIR = original
+    print("has_login needs a non-empty store, not just a Default folder: OK")
+
+
+def test_an_idle_session_puts_the_browser_down_and_the_next_send_picks_it_up():
+    """A campaign that is not sending must not be a Chrome sitting open.
+
+    The login is on disk, so the cost of being wrong about the interval is a
+    page load and never a scan — which is what makes this safe to do by default.
+    `status()` stays `"ready"` throughout, because from the user's side nothing
+    has happened and there is nothing for them to do.
+    """
+    warm = _Driver(page=_ready_page())
+    reopened = _Driver(page=_ready_page())
+    composer = _Element(text="typed")
+    button = _Element(on_click=lambda: setattr(composer, "text", ""))
+
+    def open_chat(drv, url):
+        drv.page = dict(_ready_page())
+        drv.page["div[contenteditable='true'][data-tab='10']"] = [composer]
+        drv.page["button[aria-label='Send']"] = [button]
+
+    reopened.on_get = open_chat
+    drivers = [warm, reopened]
+
+    session = WA.WhatsAppSession(
+        default_region="CA", poll_sec=60.0, send_timeout=5.0, idle_close_sec=30.0,
+        driver_factory=lambda directory, headless: drivers.pop(0))
+    clock = _Clock()
+    session._clock, session._sleep = clock, clock.sleep
+    try:
+        assert session.start() == (True, "")
+        assert session.browser_running() is True
+        assert session._should_idle_close() is False, "nothing has gone idle yet"
+
+        clock.sleep(31.0)
+        assert session.idle_for() >= 30.0
+        assert session._should_idle_close() is True
+        session._idle_close()
+
+        assert warm.quits == 1, "the idle browser was left running"
+        assert session.browser_running() is False
+        assert session.status() == "ready", (
+            "an asleep browser is not a logged-out one, and telling the user to "
+            "go and scan a QR would be a lie")
+
+        ok, error = session.send("(416) 555-0142", "hello")
+        assert (ok, error) == (True, ""), error
+        assert drivers == [], "the send did not reopen the browser"
+        assert session.browser_running() is True
+        assert "phone=14165550142" in reopened.urls[-1]
+    finally:
+        session.close()
+    print("an idle session closes its browser and a send reopens it: OK")
+
+
+def test_a_session_that_was_never_open_is_not_opened_by_a_send():
+    """Only a session that went idle is woken. A cold one stays a `CONN:`.
+
+    Opening a browser on the strength of a queued message would turn a campaign
+    started against no connection into one that silently launches Chrome behind
+    the user — and on this channel, launching a browser is the act that puts a
+    cold-outreach client on their own number.
+    """
+    opened = []
+    session = WA.WhatsAppSession(
+        default_region="CA", poll_sec=60.0,
+        driver_factory=lambda directory, headless: opened.append(1))
+    session._set_state(status="ready")               # as if it were connected
+    ok, error = session.send("(416) 555-0142", "hello")
+    assert ok is False and error.startswith("CONN:"), error
+    assert opened == [], "a send opened a browser nobody asked for"
+    session.close()
+    print("a never-opened session is not opened by a send: OK")
+
+
+def test_the_poller_is_what_actually_puts_an_idle_browser_down():
+    """The decision above, made by the thread that really makes it.
+
+    Driven on the wall clock at a tenth of a second rather than on the fake one,
+    because the bug this catches is a poll loop that computes the right answer
+    and never runs — and a stubbed clock cannot tell those apart.
+    """
+    import time as _time
+
+    driver = _Driver(page=_ready_page())
+    session = WA.WhatsAppSession(
+        poll_sec=0.02, idle_close_sec=0.05,
+        driver_factory=lambda directory, headless: driver)
+    try:
+        assert session.start() == (True, "")
+        started = _time.perf_counter()
+        while session.browser_running() and _time.perf_counter() - started < 5.0:
+            _time.sleep(0.02)
+        elapsed = _time.perf_counter() - started
+        assert session.browser_running() is False, (
+            "the poller never put the idle browser down")
+        assert driver.quits == 1
+        assert session.status() == "ready"
+    finally:
+        session.close()
+    print("the poller closed an idle browser after %.2fs: OK" % elapsed)
+
+
+def test_the_idle_close_is_off_while_anything_is_in_flight():
+    """Ready is the only state it may fire from.
+
+    Closing on a QR throws away the code the user is walking back to scan;
+    closing on `"loading"` interrupts a restore; closing on `"pairing"` kills a
+    code mid-type. Each of those reads to the user as the feature being broken.
+    """
+    driver, _field, _entry, _next = _pairing_driver()
+    session = WA.WhatsAppSession(
+        default_region="CA", poll_sec=60.0, send_timeout=5.0, idle_close_sec=10.0,
+        driver_factory=lambda directory, headless: driver)
+    clock = _Clock()
+    session._clock, session._sleep = clock, clock.sleep
+    try:
+        session.start()
+        clock.sleep(60.0)
+        assert session.status() == "qr"
+        assert session._should_idle_close() is False, "closed on a QR"
+
+        # Asking for a code counts as use, so the clock is walked past the
+        # interval again — otherwise every assertion below would pass for the
+        # uninteresting reason that nothing had gone idle yet.
+        session.request_pairing_code("+14165550142")
+        clock.sleep(20.0)
+        assert session.status() == "pairing"
+        assert session.idle_for() >= 10.0
+        assert session._should_idle_close() is False, "closed on a pairing code"
+
+        driver.page = {"div[data-testid='chat-list']": []}   # neither QR nor list
+        session._poll_once()
+        assert session.status() in ("loading", "pairing")
+        session._set_state(status="loading", pair=("", 0.0))
+        assert session._should_idle_close() is False, "closed mid-restore"
+
+        driver.page = _ready_page()
+        session._poll_once()
+        assert session.status() == "ready"
+        assert session._should_idle_close() is True, "ready and idle is the case"
+    finally:
+        session.close()
+    print("the idle close only fires from ready: OK")
+
+
+# ── What all of this costs ───────────────────────────────────────────────────
+
+def test_what_a_session_costs_is_measured_rather_than_assumed():
+    """The four numbers the change was asked for, and the two it cannot have.
+
+    Everything here is measured against the stub, because no test in this suite
+    may open a real WhatsApp session — the user is logged in on their own
+    machine and a stray session could log them out. So these are this module's
+    own costs with Chrome taken out of the picture, which is exactly the half
+    the change is responsible for; the browser's half is named below and left
+    unmeasured rather than guessed at.
+    """
+    import time as _time
+    import tracemalloc
+
+    def timed(call, runs=20):
+        best = None
+        for _ in range(runs):
+            started = _time.perf_counter()
+            call()
+            spent = _time.perf_counter() - started
+            best = spent if best is None else min(best, spent)
+        return best * 1000.0
+
+    # 1. Time to first QR — the part that changed. From WhatsApp's payload to
+    #    PNG bytes, which is now the whole of the work between the DOM read and
+    #    the image on screen.
+    encode_ms = timed(lambda: WA.qr_png_of(_REF))
+
+    # 2. Time from a stored session to ready, minus Chrome: the disk check that
+    #    decides headless, plus start() plus the wait for the restore.
+    original = ST.SETTINGS_DIR
+    with tempfile.TemporaryDirectory() as tmp:
+        ST.SETTINGS_DIR = tmp
+        try:
+            _plant_login("default")
+            has_login_ms = timed(lambda: WA.has_login("default"))
+
+            def restore():
+                driver = _Driver(page=_ready_page())
+                session = WA.WhatsAppSession(
+                    poll_sec=60.0,
+                    driver_factory=lambda directory, headless: driver)
+                session.start()
+                session._await_ready()
+                session.close()
+
+            restore_ms = timed(restore, runs=5)
+        finally:
+            ST.SETTINGS_DIR = original
+
+    # 3. Time to send one message on a warm session.
+    def warm_send():
+        composer = _Element(text="typed")
+        button = _Element(on_click=lambda: setattr(composer, "text", ""))
+        driver = _Driver(page=_ready_page())
+        driver.on_get = lambda drv, url: drv.page.update(
+            {"div[contenteditable='true'][data-tab='10']": [composer],
+             "button[aria-label='Send']": [button]})
+        session = _session(driver, default_region="CA")
+        session.start()
+        ok, error = session.send("(416) 555-0142", "hello there")
+        assert ok, error
+        session.close()
+
+    send_ms = timed(warm_send, runs=5)
+
+    # 4. What an idle session holds. The browser is the answer that matters and
+    #    after the idle close there is no browser — so what is left is the
+    #    Python object, measured rather than described.
+    tracemalloc.start()
+    before = tracemalloc.take_snapshot()
+    idle = [WA.WhatsAppSession(profile="p%d" % i, poll_sec=60.0)
+            for i in range(50)]
+    after = tracemalloc.take_snapshot()
+    grew = sum(stat.size_diff for stat in after.compare_to(before, "filename"))
+    tracemalloc.stop()
+    per_session = grew / float(len(idle))
+    for session in idle:
+        session.close()
+
+    print("\n  time to first QR (payload → PNG)   %8.3f ms" % encode_ms)
+    print("  has_login, the headless decision   %8.3f ms" % has_login_ms)
+    print("  stored session -> ready, no Chrome %8.3f ms" % restore_ms)
+    print("  one send on a warm session         %8.3f ms" % send_ms)
+    print("  an idle session, browser closed    %8.0f bytes" % per_session)
+    print("  NOT measured here: Chrome's own launch, the page load behind a")
+    print("  restore, and an idle browser's RSS — no test may open a real")
+    print("  WhatsApp session, so those numbers are the user's to take.")
+
+    # Loose, and only against a regression into something a user would feel.
+    assert encode_ms < 200.0, encode_ms
+    assert send_ms < 200.0, send_ms
+    assert per_session < 200_000, per_session
 
 
 if __name__ == "__main__":

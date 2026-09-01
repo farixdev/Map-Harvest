@@ -111,7 +111,24 @@ DEFAULT_SETTINGS = {
     # wrong one is not a bounce, it is a stranger abroad. See
     # `core.whatsapp.to_wa_id`.
     "wa_default_region": "",          # ISO code, e.g. "CA". Blank = require + prefix
-    "wa_headless": False,             # the QR needs a visible window the first time
+    # True means "hidden whenever it can be", not "hidden always". A profile
+    # with no stored login is opened with a visible window whatever this says,
+    # because the first link needs one — see `core.whatsapp.has_login`. Once the
+    # login is on disk there is nothing for the user to look at, and a Chrome
+    # window that steals focus mid-campaign is a worse default than a hidden
+    # one. False pins the window open, for watching what the client is doing.
+    "wa_headless": True,
+    # Seconds of nothing sending before the browser is quit. The login stays on
+    # disk and the next send reopens it, so this costs a page load rather than a
+    # scan. 0 keeps the browser up for as long as the session object lives.
+    #
+    # Twice `wa_max_gap_sec`, and that relationship is the whole of the choice.
+    # Set at or below the longest gap the pacer can pick and the browser would
+    # be torn down and restored between two ordinary sends, turning a page load
+    # into a per-message cost. Set far higher and a finished campaign leaves a
+    # Chrome sitting open all afternoon. Raising the send gap without raising
+    # this is what would break it.
+    "wa_idle_close_sec": 600,
     "wa_daily_cap": 30,               # deliberately lower than email's 40
     "wa_hourly_cap": 8,
     "wa_min_gap_sec": 90,             # slower than email's 60
