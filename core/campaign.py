@@ -191,6 +191,44 @@ def _report(progress, done: int, total: int, message: str) -> None:
         pass
 
 
+class _Meter:
+    """The three passes of a plan as one bar that only ever moves forwards.
+
+    Each pass used to report its own index against the whole lead count, so a
+    300-lead campaign drove the bar from 1 to 300, **back to 1**, to 300, back
+    to 1 again, and to 300 — measured on the Campaign tab, where a user watching
+    a bar reset to nothing twice has every reason to think the thing crashed and
+    started over. Nothing about the three passes was reported: which one was
+    running, or that there were three.
+
+    So one scale, and the units on it are honest. Auditing is only owed for the
+    leads that have no audit yet, which is why an already-audited list used to
+    leave the bar on zero for its whole first pass; rendering and queueing are
+    owed for every lead. `done` never decreases, `total` never changes, and
+    `finish` closes the gap left by leads that dropped out along the way — a
+    bar that stops at 94% because six sites could not be read is a bar that
+    looks stuck.
+    """
+
+    def __init__(self, sink, leads: int, pending: int):
+        self._sink = sink
+        self._done = 0
+        self.total = max(1, max(0, pending) + max(0, leads) * 2)
+
+    def step(self, message: str) -> None:
+        """One lead through one pass."""
+        self._done = min(self._done + 1, self.total)
+        _report(self._sink, self._done, self.total, message)
+
+    def skipped(self, count: int = 1) -> None:
+        """Work that will not be done after all, counted rather than left owed."""
+        self._done = min(self._done + max(0, count), self.total)
+
+    def finish(self, message: str) -> None:
+        self._done = self.total
+        _report(self._sink, self._done, self.total, message)
+
+
 # ── Channels ─────────────────────────────────────────────────────────────────
 
 EMAIL = _db.EMAIL
@@ -585,6 +623,62 @@ def account_daily_cap(account: dict, settings: dict, *, on_day: date | None = No
 
 def _hourly_cap(settings: dict) -> int:
     return _cap((settings or {}).get("hourly_cap_per_account"))
+
+
+def hour_stamps(conn, account_email: str, now: float, *, channel: str = EMAIL,
+                rehearsed=None) -> list[float]:
+    """Every send this account made on this channel in the trailing hour, ascending.
+
+    On this channel's ledger only: an hour of email must not read as an hour the
+    WhatsApp number has spent, or the other way about.
+
+    `rehearsed` is the dry run's own tally, which is never written to `sends` —
+    a rehearsal paces itself realistically without spending a live account's
+    real quota — so a caller holding one has to hand it over or its hour will
+    read as empty.
+    """
+    stamps = _db.recent_sends(conn, account_email, since_ts=now - _HOUR_SEC,
+                              channel=channel)
+    stamps += [ts for ts in ((rehearsed or {}).get(account_email) or [])
+               if ts > now - _HOUR_SEC]
+    stamps.sort()
+    return stamps
+
+
+def hourly_hold(conn, emails, settings: dict, now: float, *,
+                channel: str = EMAIL, rehearsed=None) -> float:
+    """Seconds until an hourly window frees for one of `emails`. 0 = none is held.
+
+    Module-level and shared, because two things have to answer this identically
+    and one of them is not the send loop. `OutreachWorker._dispatch` reads it to
+    decide how long to nap; the outreach screen reads it to decide what the
+    status line says. While it lived only on the worker the screen had no way to
+    ask, so a run parked for 48 minutes on a spent hour — with the log saying
+    exactly that — printed "Sending — 0 of 60 done" over a queue that was not
+    moving, which is the one sentence the whole of `_send_health` exists to stop.
+
+    `emails` is the set that still has room in the *day*, lowercased. Splitting
+    it out that way is what lets a positive answer mean "the hourly cap, and
+    only the hourly cap, is holding this queue": a caller hands in the accounts
+    the daily cap has not already taken out, and gets back either zero — one of
+    them can send now — or the exact instant the first of them may.
+    """
+    cap = _hourly_cap(settings)
+    if cap >= _NO_CAP:
+        return 0.0
+    waits = []
+    for email in emails:
+        email = _text(email).strip().lower()
+        if not email:
+            continue
+        stamps = hour_stamps(conn, email, now, channel=channel,
+                             rehearsed=rehearsed)
+        if len(stamps) < cap:
+            return 0.0
+        # The cap-th most recent send drops out of the trailing hour then,
+        # which is the instant this account may send again.
+        waits.append(max(1.0, stamps[-cap] + _HOUR_SEC - now))
+    return min(waits) if waits else 0.0
 
 
 def _gap_bounds(settings: dict) -> tuple[int, int]:
@@ -1074,14 +1168,17 @@ def _plan(conn, plan: dict, leads: list, template_id: str, profile: dict,
             "already, or is suppressed")
         return plan
 
-    total = len(rows)
+    # One bar for all three passes. The audit is owed only for the leads that
+    # have none yet, which is the number `_audit_pass` works from.
+    meter = _Meter(progress, len(rows),
+                   sum(1 for row in rows if not _loads(row.get("audit_json"))))
     rows = _audit_pass(conn, rows, settings, profile, ai,
                        _text(getattr(first_touch, "id", "")), plan,
-                       total, progress, should_stop)
+                       meter, should_stop)
     if plan["cancelled"]:
         return plan
-    prepared = _render_pass(rows, first_touch, profile, settings, plan, total,
-                            progress, should_stop, copy)
+    prepared = _render_pass(rows, first_touch, profile, settings, plan,
+                            meter, should_stop, copy)
     if plan["cancelled"]:
         return plan
     if not prepared:
@@ -1109,9 +1206,15 @@ def _plan(conn, plan: dict, leads: list, template_id: str, profile: dict,
     # from, and how much of the opening day is already spent.
     schedule = {"accounts": accounts, "ramp_start": ramp, "sent_today": sent_today,
                 "start_day": _local_date(now, _zone(settings))}
-    _queue_pass(conn, plan, prepared, slots, settings, profile, total, progress,
+    _queue_pass(conn, plan, prepared, slots, settings, profile, meter,
                 schedule, should_stop, channel, copy)
     plan["days"] = len(plan["per_day"])
+    if not plan["cancelled"]:
+        # Leads that dropped out of a pass never reached the queue, so the bar
+        # would stop short of the end by however many the crawl or the copy
+        # lost — which reads as a run that stalled at the last moment rather
+        # than one that finished with some skips. The summary carries the skips.
+        meter.finish("queued %d" % plan["queued"])
     if plan["queued"]:
         _db.set_campaign_status(conn, campaign_id, "scheduled")
         _db.log_event(conn, "planned",
@@ -1281,8 +1384,7 @@ def _usable_number(plan: dict, phone: str, region: str) -> bool:
 
 
 def _audit_pass(conn, rows: list, settings: dict, profile: dict, ai,
-                template_id: str, plan: dict, total: int, progress,
-                should_stop) -> list[dict]:
+                template_id: str, plan: dict, meter, should_stop) -> list[dict]:
     """Fill in the audit and AI blobs for leads that do not have them yet.
 
     Returns the rows still in the campaign. Results are collected as they land
@@ -1292,12 +1394,15 @@ def _audit_pass(conn, rows: list, settings: dict, profile: dict, ai,
     """
     pending = [row for row in rows if not _loads(row.get("audit_json"))]
     if not pending or not settings.get("audit_enabled", True):
+        # A list with nothing to crawl was never charged for one — the meter's
+        # audit share *is* `len(pending)`. What has to be given back is the
+        # crawl the user has switched off, which was counted and will not run.
+        meter.skipped(len(pending))
         return rows
 
-    workers = max(1, min(12, _int(settings.get("enrich_workers"), 6)))
-    done = 0
     dropped: set[int] = set()
-    pool = ThreadPoolExecutor(max_workers=workers)
+    pool = ThreadPoolExecutor(
+        max_workers=max(1, min(12, _int(settings.get("enrich_workers"), 6))))
     try:
         futures = {pool.submit(audit_lead, row, settings=settings, ai=ai,
                                profile=profile, template_id=template_id): row
@@ -1312,18 +1417,21 @@ def _audit_pass(conn, rows: list, settings: dict, profile: dict, ai,
             except Exception as exc:
                 _skip(plan, "could not be audited (%s)" % type(exc).__name__)
                 dropped.add(id(row))
+                # It was tried and it is over, so it counts as done. A crawl
+                # that lost sites otherwise left the bar short of the end of
+                # its own pass, which reads as a stall.
+                meter.skipped()
                 continue
             row["audit_json"] = audit
             row["ai_json"] = fields
-            done += 1
-            _report(progress, done, total, "audited %s" % (row.get("name") or row.get("email")))
+            meter.step("audited %s" % (row.get("name") or row.get("email")))
     finally:
         pool.shutdown(wait=True, cancel_futures=True)
     return [row for row in rows if id(row) not in dropped]
 
 
 def _render_pass(rows: list, template, profile: dict, settings: dict, plan: dict,
-                 total: int, progress, should_stop, copy=None) -> list[tuple]:
+                 meter, should_stop, copy=None) -> list[tuple]:
     """(lead, ctx, subject, text, html) per lead whose copy came out usable.
 
     Also where a form letter is counted. `core.templates` keeps a model sentence
@@ -1339,7 +1447,7 @@ def _render_pass(rows: list, template, profile: dict, settings: dict, plan: dict
     """
     copy = copy if copy is not None else _EmailCopy()
     prepared = []
-    for index, row in enumerate(rows, start=1):
+    for row in rows:
         if _stopped(should_stop, plan):
             return prepared
         try:
@@ -1351,14 +1459,18 @@ def _render_pass(rows: list, template, profile: dict, settings: dict, plan: dict
             subject, text, html = copy.render(template, ctx)
         except Exception as exc:
             _skip(plan, "could not be rendered (%s)" % type(exc).__name__)
+            # Two units, not one: this lead will not be queued either, and the
+            # bar must not hold a place open for work that cannot happen.
+            meter.skipped(2)
             continue
         if not copy.usable(subject, text):
             _skip(plan, "no usable copy")
+            meter.skipped(2)
             continue
         if not ctx.get("personalised"):
             _generic(plan, _text(ctx.get("generic_reason")))
         prepared.append((row, ctx, subject, text, html))
-        _report(progress, index, total, "prepared %s" % (row.get("name") or row.get("email")))
+        meter.step("prepared %s" % (row.get("name") or row.get("email")))
     return prepared
 
 
@@ -1391,14 +1503,13 @@ def _for_account(text: str, html: str, profile: dict, settings: dict,
 
 
 def _queue_pass(conn, plan: dict, prepared: list, slots: list, settings: dict,
-                profile: dict, total: int, progress, schedule: dict,
+                profile: dict, meter, schedule: dict,
                 should_stop, channel: str = EMAIL, copy=None) -> None:
     zone = _zone(settings)
     channel = _channel(channel)
     placed = []
 
-    for index, ((row, ctx, subject, text, html), (when, account_email)) in enumerate(
-            zip(prepared, slots), start=1):
+    for (row, ctx, subject, text, html), (when, account_email) in zip(prepared, slots):
         if _stopped(should_stop, plan):
             return
         try:
@@ -1413,6 +1524,7 @@ def _queue_pass(conn, plan: dict, prepared: list, slots: list, settings: dict,
             })
             if not message_id:
                 _skip(plan, "could not be queued")
+                meter.skipped()
                 continue
 
             plan["queued"] += 1
@@ -1421,9 +1533,10 @@ def _queue_pass(conn, plan: dict, prepared: list, slots: list, settings: dict,
 
             if _text(row.get("status")) in ("", "new", "audited"):
                 _db.upsert_lead(conn, {"email": row.get("email"), "status": "queued"})
-            _report(progress, index, total, "queued %s" % (row.get("name") or row.get("email")))
+            meter.step("queued %s" % (row.get("name") or row.get("email")))
         except Exception as exc:
             _skip(plan, "could not be queued (%s)" % type(exc).__name__)
+            meter.skipped()
 
     if placed and settings.get("followup_enabled", True):
         _queue_followups(conn, plan, placed, settings, profile, schedule,
@@ -1568,7 +1681,8 @@ def _sent_today(conn, accounts: list, settings: dict, now: float,
                            channel=_channel(channel)) for a in accounts}
 
 
-def campaign_start_day(conn, campaign_id: int, settings: dict, now: float = 0.0) -> date:
+def campaign_start_day(conn, campaign_id: int, settings: dict, now: float = 0.0,
+                       row: dict | None = None) -> date:
     """The day a campaign began, as the warm-up origin for undated accounts.
 
     Anchoring the ramp to the campaign rather than to "today" is what keeps the
@@ -1576,9 +1690,15 @@ def campaign_start_day(conn, campaign_id: int, settings: dict, now: float = 0.0)
     was never filled in. Re-deriving it from the current date on every replan
     would reset such an account to its first-day rate over and over, and the
     campaign would never finish.
+
+    `row` is the campaign record when the caller already has it. The outreach
+    screen reads that row for the campaign's status anyway, and asking for it
+    twice inside one repaint is both a wasted round trip and a second chance for
+    two labels to be painted from two different reads of the same row.
     """
     now = now or time.time()
-    created = _float(_db.get_campaign(conn, campaign_id).get("created_at")) or now
+    row = _db.get_campaign(conn, campaign_id) if row is None else row
+    created = _float((row or {}).get("created_at")) or now
     return _local_date(created, _zone(settings))
 
 
@@ -2183,17 +2303,9 @@ class OutreachWorker(QThread):
         return max(0, cap - today)
 
     def _hour_stamps(self, conn, account_email: str, now: float) -> list[float]:
-        """Every send this account has made in the trailing hour, ascending.
-
-        On this channel's ledger only: an hour of email must not read as an hour
-        the WhatsApp number has spent, or the other way about.
-        """
-        stamps = _db.recent_sends(conn, account_email, since_ts=now - _HOUR_SEC,
-                                  channel=self.channel)
-        stamps += [ts for ts in (self._rehearsed.get(account_email) or [])
-                   if ts > now - _HOUR_SEC]
-        stamps.sort()
-        return stamps
+        """Every send this account has made in the trailing hour, ascending."""
+        return hour_stamps(conn, account_email, now, channel=self.channel,
+                           rehearsed=self._rehearsed)
 
     def _has_headroom(self, conn, account: dict, now: float) -> bool:
         if self._daily_room(conn, account, now) <= 0:
@@ -2210,21 +2322,18 @@ class OutreachWorker(QThread):
         Zero is also the answer when something is free, so a caller can read a
         positive number as "the hourly cap, and only the hourly cap, is holding
         this queue" and park for exactly that long.
+
+        The arithmetic is `hourly_hold` below, shared with the outreach screen.
+        What is left here is the one thing the screen cannot know: which
+        accounts this run still has, and how many of the day each has spent
+        including the rehearsals only the worker is holding.
         """
-        cap = _hourly_cap(self._settings)
-        if cap >= _NO_CAP:
-            return 0.0
-        waits = []
-        for account in self._live_accounts(now):
-            if self._daily_room(conn, account, now) <= 0:
-                continue
-            stamps = self._hour_stamps(conn, _text(account["email"]).strip().lower(), now)
-            if len(stamps) < cap:
-                return 0.0
-            # The cap-th most recent send drops out of the trailing hour then,
-            # which is the instant this account may send again.
-            waits.append(max(1.0, stamps[-cap] + _HOUR_SEC - now))
-        return min(waits) if waits else 0.0
+        return hourly_hold(
+            conn,
+            [_text(account["email"]).strip().lower()
+             for account in self._live_accounts(now)
+             if self._daily_room(conn, account, now) > 0],
+            self._settings, now, channel=self.channel, rehearsed=self._rehearsed)
 
     def _thread_parent(self, conn, row: dict, account_email: str = "") -> str:
         """The first touch's Message-ID, for a chaser to reply into.

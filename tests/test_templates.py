@@ -177,6 +177,13 @@ def test_gap_services():
         # person answers by hand, a page printing praise that routes nobody to
         # leave any, and a site a browser marks as not secure.
         "email_only_intake", "whatsapp_manual", "no_review_capture", "no_ssl",
+        # And with the sweep that reads a whole crawl rather than a home page.
+        # None of these four can be seen from the front door: the fourteen-field
+        # form is on the page after the visitor decides to write, the twelve
+        # unrouted services are on the services page, the price list is behind a
+        # download link, and the shop with nowhere to leave an address is a fact
+        # about every page at once.
+        "long_intake_form", "services_no_route", "dated_document", "cart_no_recovery",
     }
     assert NO_OFFER_CODES < spec_codes
     assert spec_codes - NO_OFFER_CODES == set(T.GAP_SERVICES), \
@@ -233,11 +240,14 @@ def test_no_catalogue_heading_is_offered_to_a_prospect():
     cases = [(code, dict(entry, code=code, evidence="the page says so"))
              for code, entry in A.GAP_CATALOGUE.items()]
     cases.append(("<no gaps at all>", None))
-    # Every code in the catalogue plus the no-gap case. (Superseded: 19 while
-    # the catalogue held eighteen codes; four were added with the audit's
-    # second sweep. The count is here so a new gap cannot be added without a
-    # heading check being run against it.)
-    assert len(cases) == len(A.GAP_CATALOGUE) + 1 == 23, len(cases)
+    # Every code in the catalogue plus the no-gap case. (Superseded twice: 19
+    # while the catalogue held eighteen codes, then 23 when the audit's second
+    # sweep added four, and now 27 for the four the crawl-wide sweep added --
+    # a long intake form, an unrouted services list, a price list published as
+    # a dated PDF, and a shop with nowhere to leave an address. The count is
+    # here so a new gap cannot be added without a heading check being run
+    # against it, and that is exactly what it just did.)
+    assert len(cases) == len(A.GAP_CATALOGUE) + 1 == 27, len(cases)
 
     for code, gap in cases:
         ctx = T.build_context(LEAD, {"gaps": [gap]} if gap else {}, AI, PROFILE, SETTINGS)
@@ -784,11 +794,12 @@ def test_every_gap_reads_as_a_reason_in_the_question_template():
     Why the question is worth asking is not a finding about this reader, and it
     no longer claims to be one. Every code in the catalogue is rendered here.
 
-    (Superseded: this read `== 18` while the catalogue held eighteen codes. The
-    number moved to 22 when the audit's second sweep added four; the assertion
-    is unchanged in what it demands, which is that a code cannot join the
-    catalogue without being rendered through this template.)"""
-    assert len(A.GAP_CATALOGUE) == 22, len(A.GAP_CATALOGUE)
+    (Superseded twice: this read `== 18` while the catalogue held eighteen
+    codes, then 22 when the audit's second sweep added four, and now 26 for the
+    four the crawl-wide sweep added. The assertion is unchanged in what it
+    demands, which is that a code cannot join the catalogue without being
+    rendered through this template.)"""
+    assert len(A.GAP_CATALOGUE) == 26, len(A.GAP_CATALOGUE)
     seen = 0
     for code, spec in A.GAP_CATALOGUE.items():
         gap = dict(spec, code=code, evidence="what the crawl saw")
@@ -820,7 +831,7 @@ def test_every_gap_reads_as_a_reason_in_the_question_template():
         assert len(finding) == 1, (code, body)
         assert finding[0].endswith(ctx["gap_1"] + "."), (code, finding[0])
         assert finding[0] != reason[0], code
-    assert seen == len(A.GAP_CATALOGUE) == 22, seen
+    assert seen == len(A.GAP_CATALOGUE) == 26, seen
 
 
 def test_a_doubled_greeting_is_stripped_however_many_deep():

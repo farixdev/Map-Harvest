@@ -2305,6 +2305,343 @@ def _shown(screen, needle) -> set:
     return names
 
 
+# ── Lens 1: the Sending tab and Prepare campaign ────────────────────────────
+
+
+def test_every_lead_column_in_the_spec_has_a_cell_to_put_in_it():
+    """The crash, guarded by the shape that caused it rather than by the symptom.
+
+    `_LEAD_COLUMNS` grew a Phone column and `_lead_cells` did not, so the last
+    field indexed an eight-tuple and raised. The raise happened inside
+    `_paint_window`, which Qt calls from an event filter, and PyQt5 answers an
+    unhandled exception in a virtual with `qFatal` — the process died with
+    0xC0000409 the moment the lead table held one row. `pytest tests/` stopped
+    dead at test 62 of 933 and every UI file after it was unreachable.
+
+    Asserted against the spec's own length, because the defect was two lists
+    that had to be the same length and were not, and the symptom was a crash
+    with no traceback anywhere.
+    """
+    screen = _screen()
+    for lead in ({}, screen._leads[0], {"name": "X", "phone": "+1 416 555 0142"}):
+        assert len(screen._lead_cells(lead)) == len(screen._fields)
+    assert len(SO._LEAD_COLUMNS) == len(screen._fields), \
+        "the screen is not showing every column, so this proves less than it looks"
+
+
+def test_the_status_line_names_an_hourly_hold_the_log_is_reporting():
+    """The handover's open finding: daily headroom, and the hour spent.
+
+    `_send_health` covered "outside the window" and "every account capped" and
+    not the hourly cap, so a run the loop had parked for 48 minutes read
+    "Sending — 0 of N done" with no reason under it while the log beside it said
+    "Holding for the hourly limit". Driven: five sends inside the trailing hour
+    against a cap of five, with 15 of 20 a day still unspent.
+    """
+    screen = _screen()
+    app = _app()
+    with _sendable(screen):
+        screen.settings["hourly_cap_per_account"] = 5
+        _queued(screen, 2, when=time.time() - 60)
+        now = time.time()
+        for step in range(5):
+            DB.record_send(screen.conn, "rota@example.com", now - 600 - step * 30)
+
+        # The loop's own answer, so the two cannot be measured apart.
+        held = SO._campaign.hourly_hold(screen.conn, ["rota@example.com"],
+                                        screen.settings, now)
+        assert held > 0, "the bench did not actually spend the hour"
+        assert screen._account_room()[0] == ["rota@example.com"], \
+            "the day is spent too, so this is not the hourly branch"
+
+        screen._sending = True
+        screen.send_worker = _FakeWorker(dry=False)
+        screen._on_tick()
+        app.processEvents()
+        head, why = screen.send_status.text(), screen.send_reason.text()
+        assert head.startswith("Holding"), head
+        assert "hour" in why, why
+        # `isHidden` rather than `isVisible`: this page is not the one on screen
+        # in a suite that never opened it, and what is being asserted is that
+        # `_refresh_send_controls` did not hide the reason itself.
+        assert not screen.send_reason.isHidden(), "the reason was written and not shown"
+        # And the clock three lines above it, which used to say "Sending now"
+        # over the same queue.
+        clock = screen.next_send_label.text()
+        assert clock.startswith("Held"), clock
+        assert "Sending now" not in clock
+
+
+def test_a_rehearsal_that_spends_the_day_is_reported_as_spending_it():
+    """The same lie as the hourly hold, one cap up and only in a dry run.
+
+    `OutreachWorker._daily_room` counts the run's own rehearsals against the
+    day — pacing a dry run realistically is the point of it — and none of them
+    reach `sends`, so this screen could not see them. Driven with five
+    rehearsed against a cap of five: the loop's `_daily_room` was 0 and the
+    screen read "Rehearsing — 0 of 30 built" with no reason and "Sending now".
+    """
+    screen = _screen()
+    app = _app()
+    with _sendable(screen):
+        screen.settings["smtp_accounts"][0]["daily_cap"] = 5
+        _queued(screen, 2, when=time.time() - 60)
+        now = time.time()
+        worker = _FakeWorker(dry=True)
+        worker._rehearsed = {"rota@example.com": [now - 60 * k for k in range(5)]}
+        screen._sending = True
+        screen.send_worker = worker
+
+        assert screen._account_room() == ([], ["rota@example.com"], []), \
+            screen._account_room()
+        screen._on_tick()
+        app.processEvents()
+        assert screen.send_status.text().startswith("Holding"), \
+            screen.send_status.text()
+        assert "cap" in screen.send_reason.text()
+        # And the clock names midnight rather than "Sending now": a spent day
+        # does not free when the window next opens, it frees when the day does.
+        clock = screen.next_send_label.text()
+        assert clock.startswith("Held"), clock
+        assert screen._day_frees(now) > now
+
+
+def test_one_repaint_asks_the_store_each_question_once():
+    """The clock and the status line are painted from one reading, not two.
+
+    Both used to ask independently — the due row, the campaign row and
+    `sent_today` per account, twice each per tick — and two readings of a store
+    a send loop is writing to can disagree. The count is the cheap half of the
+    contract; the guarantee is that they are the same numbers.
+    """
+    screen = _screen()
+    with _sendable(screen):
+        _queued(screen, 2, when=time.time() + 600)
+        asked = []
+        screen.conn.set_trace_callback(asked.append)
+        try:
+            screen._on_tick()
+        finally:
+            screen.conn.set_trace_callback(None)
+        for sql in set(asked):
+            assert asked.count(sql) == 1, (
+                "one tick ran this %d times:\n%s" % (asked.count(sql), sql))
+
+        # And the memo is not a cache: it does not outlive the repaint.
+        assert screen._reading is None
+
+
+def test_an_arriving_log_line_leaves_the_reader_where_they_were():
+    """The console inserts at the top, so a reader has to be pushed down by one.
+
+    By *one line*, in the units the scrollbar counts in. It used to add the row
+    height in pixels to a bar in `ScrollPerItem` mode, which moved the reader
+    nineteen lines for every line that arrived: parked at "line 107" of 200, ten
+    new lines took them to "line 014" with the bar pinned to its maximum.
+    """
+    screen = _screen()
+    app = _app()
+    screen._goto_tab(2)
+    screen._clear_log()
+    for index in range(200):
+        screen._append_log("line %03d" % index, "info", 0)
+    app.processEvents()
+
+    listing = screen.log_list
+    bar = listing.verticalScrollBar()
+    bar.setValue(bar.maximum() // 2)
+    app.processEvents()
+
+    def top():
+        item = listing.item(listing.indexAt(listing.viewport().rect().topLeft()).row())
+        return item.text() if item is not None else ""
+
+    was = top()
+    assert was, "nothing is on screen to be scrolled away from"
+    for index in range(10):
+        screen._append_log("NEW %02d" % index, "info", 0)
+    app.processEvents()
+    assert top() == was, "the reader was moved from %r to %r" % (was, top())
+
+    # Unscrolled, the newest line is still the one on screen.
+    bar.setValue(0)
+    app.processEvents()
+    screen._append_log("NEWEST", "info", 0)
+    app.processEvents()
+    assert "NEWEST" in top()
+    screen._clear_log()
+
+
+def test_a_log_line_costs_the_same_into_a_full_console_as_an_empty_one():
+    """`append` used to redraw every line for each line that arrived.
+
+    A send loop logs two lines a message, so the cost of watching a run grew
+    with how long you had watched it: 0.12ms into an empty console and 5.97ms
+    into a full one, measured on this tab. The ratio is asserted rather than a
+    millisecond count, because a wall-clock figure on a busy machine is noise.
+    """
+    screen = _screen()
+    screen._clear_log()
+
+    def cost() -> float:
+        best = None
+        for _ in range(20):
+            start = time.perf_counter()
+            screen._append_log("Business 0001 — first touch", "done", 1)
+            taken = time.perf_counter() - start
+            best = taken if best is None else min(best, taken)
+        return best
+
+    empty = cost()
+    while len(screen._log_lines) < SO._LOG_LIMIT:
+        screen._append_log("filler", "info", 0)
+    full = cost()
+    assert len(screen._log_lines) == SO._LOG_LIMIT, "the console stopped trimming"
+    assert full < empty * 8, (
+        "a line into a full console costs %.3fms against %.3fms into an empty "
+        "one — the redraw is back" % (full * 1000, empty * 1000))
+    screen._clear_log()
+
+
+def test_the_accounts_card_is_repainted_rather_than_rebuilt():
+    """It runs once per message a run sends, so it may not build widgets.
+
+    Rebuilding cost 4.51ms a call and it was called twice a message, which is
+    most of why a burst of send signals froze the window for 624ms at a stretch.
+    The widgets are the contract: same objects, new numbers.
+    """
+    screen = _screen()
+    app = _app()
+    with _sendable(screen):
+        screen._refresh_accounts()
+        app.processEvents()
+        cards = dict(screen._account_cards)
+        assert cards, "no account card was built to keep"
+
+        DB.record_send(screen.conn, "rota@example.com", time.time())
+        screen._benched_at = 0.0
+        screen._refresh_accounts()
+        app.processEvents()
+        assert screen._account_cards == cards, \
+            "the card was rebuilt for a number that changed"
+        counter, bar = cards["rota@example.com"]
+        assert "1 / " in counter.text(), counter.text()
+        assert bar.value() == 1, bar.value()
+
+        # A different set of addresses is the one thing that does rebuild it.
+        screen.settings["smtp_accounts"] = [
+            {"email": "other@example.com", "app_password": "x" * 16,
+             "enabled": True, "daily_cap": 20}]
+        screen._refresh_accounts()
+        app.processEvents()
+        assert set(screen._account_cards) == {"other@example.com"}
+
+
+def test_prepare_says_what_is_running_instead_of_promising_to_queue_itself():
+    """The toast used to promise something nothing in the screen does.
+
+    "A crawl is still running — this starts the moment it finishes" covered all
+    three reasons Prepare can refuse, and no press is ever remembered. Driven
+    with the Leads tab's audit running, the button said that and then never
+    prepared anything.
+    """
+    screen = _screen()
+    assert screen._prepare_blocked() == ""
+
+    screen._auditing = True
+    try:
+        blocked = screen._prepare_blocked()
+    finally:
+        screen._auditing = False
+    assert "Leads tab" in blocked, blocked
+    assert "press Prepare again" in blocked, blocked
+    assert "the moment it finishes" not in blocked, blocked
+
+    screen._planning = True
+    try:
+        assert "already being prepared" in screen._prepare_blocked()
+    finally:
+        screen._planning = False
+
+
+def test_a_refused_press_does_not_hang_the_window_first():
+    """`_retire` waited two seconds to report that it had done nothing.
+
+    Measured: 2,007ms of frozen GUI thread and then a toast. Both callers refuse
+    and say so, so the wait bought nothing; what is left is the millisecond a
+    thread whose `run` has returned needs to finish letting go.
+    """
+    from PyQt5.QtCore import QThread
+
+    class _Busy(QThread):
+        def run(self):
+            self.msleep(1500)
+
+    screen = _screen()
+    worker = _Busy()
+    worker.start()
+    try:
+        start = time.perf_counter()
+        assert screen._retire(worker) is False
+        taken = (time.perf_counter() - start) * 1000.0
+    finally:
+        worker.wait(5000)
+    assert taken < 500, "a refused press held the GUI thread for %.0fms" % taken
+    assert screen._retire(None) is True
+    assert screen._retire(worker) is True, "a finished worker is still refused"
+
+
+def test_the_plan_bar_only_ever_moves_forwards():
+    """Three passes, one bar. It used to fill and reset once per pass.
+
+    Each pass reported its own index against the whole lead count, so a 300-lead
+    campaign drove the bar to the end, back to 1, to the end, back to 1, and to
+    the end — which reads as a run that crashed and started over, twice.
+    """
+    from core import campaign as CA
+
+    seen = []
+    conn = DB.connect(os.path.join(_TMP, "outreach.db"))
+    campaign = DB.create_campaign(conn, "meter", "gap_direct", {}, {})
+    settings = {"smtp_accounts": [{"email": "rota@example.com",
+                                  "app_password": "x" * 16, "enabled": True,
+                                  "daily_cap": 50}],
+                "send_days": [0, 1, 2, 3, 4, 5, 6], "send_start_hour": 0,
+                "send_end_hour": 24, "audit_enabled": False,
+                "followup_enabled": False,
+                "sender_profile": {"name": "Sam", "company": "Auto Army",
+                                   "email": "rota@example.com",
+                                   "sign_off": "Sam",
+                                   "postal_address": "1 King St W"}}
+    leads = [dict(lead) for lead in DB.list_leads(conn, limit=50)]
+    was = {SO._text_of(lead.get("email")): SO._text_of(lead.get("status"))
+           for lead in leads}
+    for lead in leads:
+        lead["audit_json"] = json.dumps(_audit(gap="No HTTPS"))
+    try:
+        CA.plan_campaign(conn, campaign_id=campaign, leads=leads,
+                         template_id="gap_direct",
+                         profile=settings["sender_profile"], settings=settings,
+                         ai=None, progress=lambda d, t, m: seen.append((d, t)))
+    finally:
+        # This one plans against the module's shared store rather than a
+        # throwaway, because the bar's scale is a property of a real pass over
+        # real leads. What it may not do is leave those leads marked 'queued'
+        # for whatever runs next.
+        DB.delete_campaign_messages(conn, campaign)
+        DB.set_campaign_status(conn, campaign, "failed")
+        for email, status in was.items():
+            DB.upsert_lead(conn, {"email": email, "status": status})
+
+    assert seen, "the plan reported no progress at all"
+    assert len({total for _done, total in seen}) == 1, \
+        "the bar was rescaled mid-run: %s" % sorted({t for _d, t in seen})
+    for (was, _t1), (now, _t2) in zip(seen, seen[1:]):
+        assert now >= was, "the bar went from %d back to %d" % (was, now)
+    assert seen[-1][0] == seen[-1][1], \
+        "the bar stopped at %d of %d" % seen[-1]
+
+
 def test_close_all_at_exit():
     """Not a test — Windows will not delete the temp dir with the db open."""
     DB.close_all()

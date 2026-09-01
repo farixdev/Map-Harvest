@@ -548,7 +548,15 @@ def test_a_dry_run_shows_on_the_accounts_card_without_spending_quota():
     screen.send_worker = worker
     try:
         for _ in range(2):
+            # Both halves of what a message actually emits. `_emit_progress`
+            # follows `message_sent_signal` on every message the loop sends, so
+            # the pair is the real sequence and driving only the first was a
+            # test that happened to pass while the screen refreshed the Accounts
+            # card twice per message — 4.51ms a rebuild, on the signal that
+            # arrives fastest. The card is repainted by the stats signal now,
+            # and the assertions below are unchanged.
             screen._on_message_sent({"lead_id": 0, "step": 0, "account_email": ACCOUNT})
+            screen._on_stats_signal(None)
     finally:
         screen.send_worker = None
     app.processEvents()

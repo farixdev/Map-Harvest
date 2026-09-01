@@ -241,6 +241,18 @@ GAP_SERVICES: dict[str, list[str]] = {
     "no_review_capture": ["automatic follow-ups", "social media workflows",
                           "customer segmentation"],
     "quote_by_form": ["AI lead scoring", "AI decision/triage systems", "approval systems"],
+    # Nobody wants a shorter form for its own sake. The offer is that the form
+    # asks two questions and the rest is looked up and filed on the way past.
+    "long_intake_form": ["AI lead qualification", "lead categorization",
+                         "automatic data entry"],
+    # Twelve services, one inbox. The work is deciding which of the twelve an
+    # enquiry is about and putting it in front of the person who does that one.
+    "services_no_route": ["lead categorization", "lead assignment", "AI decision/triage systems"],
+    "cart_no_recovery": ["email campaigns", "automatic follow-ups", "customer segmentation"],
+    # The price list itself is the deliverable: built from whatever the business
+    # already keeps its prices in, rebuilt whenever those change.
+    "dated_document": ["automatic document generation", "PDF/document data extraction",
+                       "contract/document classification"],
     "stale_blog": ["AI content generation", "content pipelines"],
     "no_analytics": ["automated reports", "competitor monitoring", "data collection and cleaning"],
     "careers_manual": ["employee onboarding", "AI document/data extraction",

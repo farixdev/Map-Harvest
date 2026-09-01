@@ -636,7 +636,9 @@ def _fire_every_gap() -> dict:
     """Every code in the catalogue, fired once, with the facts it quotes.
 
     Two passes: on a real site `no_lead_capture` and the three form gaps cannot
-    both be true, and reading all eighteen means firing both halves.
+    both be true, and reading all of them means firing both halves. The second
+    pass also drops the price document, because a business that publishes a
+    price list is the one business `price_opaque` may never be said about.
     """
     tech = {"cms": "custom", "ecommerce": "shopify", "analytics": [], "chat": "",
             "booking": "", "crm": "", "forms": 3, "frameworks": []}
@@ -648,14 +650,19 @@ def _fire_every_gap() -> dict:
                    has_testimonials=True)
     facts = {"quote_phrase": "request a quote", "latest_date": "March 2022",
              "pdf_form": "the employment application form",
-             "appointment_shaped": True, "call_cta": False, "plain_http": True}
+             "appointment_shaped": True, "call_cta": False, "plain_http": True,
+             # The five facts only a crawl of more than one page can produce.
+             "form_fields": 14, "listed_services": 12, "services_routed": False,
+             "price_document": True, "price_doc_year": 2019,
+             "shop_email_route": False}
     fired = A._gaps(tech, signals, facts)
     # `email_only_intake` needs the second pass too: it is what happens to the
     # enquiries a site with no form still receives, so it cannot be true while
     # the form gaps are.
     fired += A._gaps(dict(tech, forms=0, ecommerce=""),
                      dict(signals, has_contact_form=False, has_quote_form=False,
-                          has_email=True), facts)
+                          has_email=True),
+                     dict(facts, price_document=False, price_doc_year=0))
     return {gap["code"]: gap for gap in fired}
 
 
@@ -1888,7 +1895,11 @@ def _corpus_rates(corpus) -> dict:
         else:
             name, html, expected = row
             url = "https://%s.test/" % re.sub(r"[^a-z]+", "-", name.lower())
-        fired = set(_codes(A.audit_from_html({url: html}, url)))
+        # The third slot may also be a whole crawl -- the `{url: html}` dict
+        # `harvest_site` hands over -- which is the only shape the findings
+        # that live across a site can be graded in at all.
+        fired = set(_codes(A.audit_from_html(
+            html if isinstance(html, dict) else {url: html}, url)))
         for code in A.GAP_CATALOGUE:
             hit, want = code in fired, code in expected
             if hit and want:
@@ -2574,7 +2585,12 @@ _platform("french-ecwid-crisp", "https://cavesaintjulien.test/", """<!doctype ht
 <p>Bordeaux 2019 &mdash; 24,00 &euro;. Sancerre 2021 &mdash; 19,50 &euro;.</p>
 <p>T&eacute;l&eacute;phone 05 56 55 44 33.</p>
 """ + _FOOT % ("Cave Saint-Julien", "8 cours du Chapeau Rouge, 33000 Bordeaux."),
-     {"ecommerce_manual", "no_analytics", "no_schema"})
+     # `cart_no_recovery` was added to this label rather than to a rule: the
+     # page carries a storefront, no mailing tool and no field asking for an
+     # address anywhere, header to footer. That is the gap, and it was true of
+     # this page before there was a code for it. Nothing here changed except
+     # that the audit can now see it.
+     {"ecommerce_manual", "cart_no_recovery", "no_analytics", "no_schema"})
 
 # ── 33. A brochure whose only form is a Typeform embed ──
 _platform("typeform-brochure", "https://calderstonelaw.test/", """<!doctype html>
@@ -2664,6 +2680,745 @@ PLATFORM_CORPUS: tuple = tuple(_PLATFORM_CORPUS)
 # the docstring below, because a rule that did not exist cannot have had a rate.
 PLATFORM_NEW_CODES = frozenset({"no_ssl", "whatsapp_manual", "email_only_intake",
                                 "no_review_capture"})
+
+
+# ── A fourth corpus: whole crawls, not single pages ──
+
+# Sixty-three pages across twenty-four sites, every label written down from
+# reading the pages before a rule was run against them. The three corpora above
+# are one page each, which is the shape that can only ever grade what a home
+# page says: everything a business does badly *across* a site is invisible to
+# them. The page headed Book Online that turns out to be a contact form, the
+# quote form fourteen fields deep two clicks in, the services page listing
+# twelve things with one form under all of them, the price list that is a PDF
+# from 2019, the shop with nowhere at all to leave an email — five findings a
+# crawl already had in memory and no rule had ever opened.
+#
+# A row is (name, base url, {url: html}, gaps, reason). `reason` is "" unless
+# the honest answer is that nobody could read the site.
+SITE_CORPUS: list = []
+
+
+def _crawl(name, base, pages, gaps, reason=""):
+    SITE_CORPUS.append((name, base, pages, frozenset(gaps), reason))
+
+
+def _shead(title, extra=""):
+    return ('<!doctype html>\n<html lang="en"><head><meta charset="utf-8">\n'
+            '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+            '<title>%s</title>\n%s</head><body>\n' % (title, extra))
+
+
+def _sfoot(name, addr, phone="(905) 555-0134"):
+    return ('\n<footer><p>&copy; %d %s. %s Call %s</p></footer>\n</body></html>'
+            % (TODAY.year, name, addr, phone))
+
+
+def _asks(*names):
+    """A form body of `names`, each rendered the way a builder renders it."""
+    out = []
+    for spec in names:
+        kind, label = spec.split(":", 1)
+        key = label.lower().replace(" ", "_")
+        if kind == "t":
+            out.append('<label>%s<input type="text" name="%s"></label>' % (label, key))
+        elif kind == "e":
+            out.append('<label>%s<input type="email" name="%s"></label>' % (label, key))
+        elif kind == "p":
+            out.append('<label>%s<input type="tel" name="%s"></label>' % (label, key))
+        elif kind == "d":
+            out.append('<label>%s<input type="date" name="%s"></label>' % (label, key))
+        elif kind == "s":
+            out.append('<label>%s<select name="%s"><option>Choose</option>'
+                       '<option>Other</option></select></label>' % (label, key))
+        elif kind == "a":
+            out.append('<label>%s<textarea name="%s"></textarea></label>' % (label, key))
+    return "".join(out)
+
+
+# ── 1. WordPress + Elementor: the page headed Book Online is a contact form ──
+
+_D = "https://bloorwestdental.test"
+_dent_head = (
+    '<meta name="generator" content="WordPress 6.5.2">\n'
+    '<link rel="stylesheet" href="/wp-content/plugins/elementor/assets/css/frontend.min.css">\n'
+    '<script src="/wp-includes/js/jquery/jquery.min.js"></script>\n'
+    '<script async src="https://www.googletagmanager.com/gtag/js?id=G-7QK2L9"></script>\n'
+    '<script type="application/ld+json">{"@context":"https://schema.org","@type":"Dentist",'
+    '"name":"Bloor West Dental"}</script>\n')
+_dent_nav = ('<nav><a href="/">Home</a> <a href="/services/">Services</a> '
+             '<a href="/book-online/">Book Online</a> <a href="/contact/">Contact</a></nav>\n')
+_dent_addr = "2180 Bloor St W, Toronto, ON M6S 1N3."
+
+_crawl("wp-elementor-dentist", _D + "/", {
+    _D + "/": _shead("Bloor West Dental", _dent_head) + _dent_nav + """
+<h1>Bloor West Dental</h1>
+<p>A family practice on Bloor Street since 1996. New patients are welcome and there
+is parking behind the building.</p>
+<p><a href="https://www.facebook.com/bloorwestdental/">Facebook</a></p>
+""" + _sfoot("Bloor West Dental", _dent_addr),
+    _D + "/services/": _shead("Services", _dent_head) + _dent_nav + """
+<h1>What we look after</h1>
+<h2>Our Services</h2>
+<ul><li>Dental cleaning and check-ups</li><li>White fillings</li>
+<li>Root canal treatment</li><li>Teeth whitening</li>
+<li>Emergency dental repair</li><li>Dentures and repairs</li></ul>
+""" + _sfoot("Bloor West Dental", _dent_addr),
+    _D + "/book-online/": _shead("Book Online", _dent_head) + _dent_nav + """
+<h1>Book Online</h1>
+<p>Tell us when suits you and the front desk will call you back to confirm the time.</p>
+<form action="/book-online/" method="post">
+<input type="text" name="name"><input type="email" name="email">
+<input type="tel" name="phone"><textarea name="message"></textarea>
+<button type="submit">Request a time</button></form>
+""" + _sfoot("Bloor West Dental", _dent_addr),
+    _D + "/contact/": _shead("Contact", _dent_head) + _dent_nav + """
+<h1>Contact the practice</h1>
+<p>2180 Bloor St W, Toronto. Open Monday to Friday.</p>
+""" + _LEAD_FORM + _sfoot("Bloor West Dental", _dent_addr),
+}, {"no_online_booking", "no_crm_signals", "no_live_chat", "price_opaque"})
+
+
+# ── 2. WordPress + Divi: a thirteen-field quote form and a careers mailto ──
+
+_R = "https://summitroofing.test"
+_roof_head = ('<link rel="stylesheet" href="/wp-content/themes/Divi/style.css">\n'
+              '<script src="/wp-content/themes/Divi/js/custom.js"></script>\n')
+_roof_nav = ('<nav><a href="/">Home</a> <a href="/quote/">Get a free quote</a> '
+             '<a href="/careers/">Careers</a></nav>\n')
+_roof_addr = "44 Mill Street, Guelph, ON N1H 2A9."
+
+_crawl("wp-divi-roofer", _R + "/", {
+    _R + "/": _shead("Summit Roofing", _roof_head) + '<div class="et_pb_section">' + _roof_nav + """
+<h1>Summit Roofing</h1>
+<h2>What we do</h2>
+<ul><li>Roof replacement</li><li>Flat roofing</li><li>Emergency repairs</li>
+<li>Gutter cleaning</li></ul>
+<p>Twenty-two years on roofs across the county.</p></div>
+""" + _sfoot("Summit Roofing", _roof_addr),
+    _R + "/quote/": _shead("Get a free quote", _roof_head) + _roof_nav + """
+<h1>Get a free quote</h1>
+<p>Fill this in and we will price the job.</p>
+<form action="/quote/" method="post">""" + _asks(
+        "t:Your name", "e:Email", "p:Telephone", "t:Street address", "t:Town",
+        "t:Postcode", "s:Roof type", "s:Roof age", "t:Approximate area",
+        "d:Preferred date", "s:Budget", "s:How did you hear about us",
+        "a:Tell us about the job") + """
+<button type="submit">Send</button></form>
+""" + _sfoot("Summit Roofing", _roof_addr),
+    _R + "/careers/": _shead("Careers", _roof_head) + _roof_nav + """
+<h1>Careers</h1>
+<h2>Current openings</h2>
+<ul><li>Roofer, full time, year round</li><li>Crew lead, five years on the tools</li></ul>
+<p>Send your CV to <a href="mailto:jobs@summitroofing.test">jobs@summitroofing.test</a>
+and we will call you in for a chat.</p>
+""" + _sfoot("Summit Roofing", _roof_addr),
+}, {"no_online_booking", "no_crm_signals", "quote_by_form", "long_intake_form",
+    "careers_manual", "no_live_chat", "no_analytics", "no_schema",
+    "no_social_presence", "price_opaque"})
+
+
+# ── 3. Wix, with Wix Bookings, Wix Chat and a price beside every service ──
+
+_W = "https://bloomhair.test"
+_wix_head = ('<meta name="generator" content="Wix.com Website Builder">\n'
+             '<script src="https://static.parastorage.com/services/wix-thunderbolt/dist/main.js">'
+             '</script>\n'
+             '<script>window.wixVisitorChat={};/* wix-visitor-chat */</script>\n'
+             '<script src="https://static.wixstatic.com/tag-manager-client.js"></script>\n')
+_wix_nav = ('<nav><a href="/">Home</a> <a href="/services">Services</a> '
+            '<a href="https://bookings.wixapps.net/bloomhair">Book now</a> '
+            '<a href="/contact">Contact</a></nav>\n')
+_wix_addr = "18 Queen Street West, Toronto, ON M5H 3S5."
+
+_crawl("wix-salon", _W + "/", {
+    _W + "/": _shead("Bloom Hair Studio", _wix_head) + _wix_nav + """
+<h1>Bloom Hair Studio</h1>
+<p>A six-chair studio off Queen Street. Colour, cutting and bridal work.</p>
+<p><a href="https://www.instagram.com/bloomhairstudio/">Instagram</a></p>
+""" + _sfoot("Bloom Hair Studio", _wix_addr),
+    _W + "/services": _shead("Services", _wix_head) + _wix_nav + """
+<h1>Price list</h1>
+<h2>Our Services</h2>
+<ul><li>Cut and blow dry &mdash; $65</li><li>Balayage &mdash; from $180</li>
+<li>Keratin treatment &mdash; $220</li><li>Colour correction &mdash; from $250</li>
+<li>Bridal styling &mdash; $150</li></ul>
+""" + _sfoot("Bloom Hair Studio", _wix_addr),
+    _W + "/contact": _shead("Contact", _wix_head) + _wix_nav + """
+<h1>Find us</h1>
+<p>Two minutes from Osgoode station.</p>
+""" + _LEAD_FORM + _sfoot("Bloom Hair Studio", _wix_addr),
+}, {"no_crm_signals", "no_schema"})
+
+
+# ── 4. Squarespace with Acuity, Mailchimp and Google Analytics ──
+
+_Y = "https://riverbendyoga.test"
+_yoga_head = ('<link rel="stylesheet" href="https://static1.squarespace.com/static/site.css">\n'
+              '<script src="https://assets.squarespace.com/universal/scripts.js"></script>\n'
+              '<script async src="https://www.googletagmanager.com/gtag/js?id=G-88AA1"></script>\n'
+              '<script src="//riverbend.us18.list-manage.com/subscribe/post.js"></script>\n')
+_yoga_nav = ('<nav><a href="/">Home</a> <a href="/schedule">Schedule</a> '
+             '<a href="/blog">Blog</a></nav>\n')
+_yoga_addr = "301 Water Street, Guelph, ON N1G 1A7."
+_RECENT_POST = (TODAY - datetime.timedelta(days=20))
+_MAILCHIMP_FORM = ('<form action="https://riverbend.us18.list-manage.com/subscribe/post" '
+              'method="post"><input type="email" name="EMAIL" placeholder="Your email">'
+              '<button type="submit">Join the list</button></form>')
+
+_crawl("squarespace-yoga", _Y + "/", {
+    _Y + "/": _shead("Riverbend Yoga", _yoga_head) + _yoga_nav + """
+<h1>Riverbend Yoga</h1>
+<p>Drop-in class $22, ten-class pass $180, unlimited month $145.</p>
+<p><a href="https://app.acuityscheduling.com/schedule.php?owner=8871">Reserve a mat</a></p>
+<p><a href="https://www.instagram.com/riverbendyoga/">Instagram</a></p>
+""" + _MAILCHIMP_FORM + _sfoot("Riverbend Yoga", _yoga_addr),
+    _Y + "/schedule": _shead("Schedule", _yoga_head) + _yoga_nav + """
+<h1>This week</h1>
+<p>Morning flow, lunchtime restore and an evening beginners class.</p>
+<iframe src="https://app.acuityscheduling.com/schedule.php?owner=8871"></iframe>
+""" + _sfoot("Riverbend Yoga", _yoga_addr),
+    _Y + "/blog": _shead("Blog", _yoga_head) + _yoga_nav + """
+<h1>Blog</h1>
+<article><h2>What to bring to your first class</h2>
+<time datetime="%s">%s</time>
+<p>A mat, water and nothing else. We keep spare blocks at the studio.</p></article>
+""" % (_RECENT_POST.isoformat(), _RECENT_POST.strftime("%B %d, %Y")) + _sfoot("Riverbend Yoga", _yoga_addr),
+}, {"no_live_chat", "no_schema"})
+
+
+# ── 5. Shopify: a checkout, a chat box and nowhere at all to leave an email ──
+
+_S = "https://northsidesupply.test"
+_shop_head = ('<script>var Shopify=Shopify||{};Shopify.theme={"name":"Dawn","id":9};</script>\n'
+              '<link href="https://cdn.shopify.com/s/files/1/0001/theme.css" rel="stylesheet">\n'
+              '<script src="https://cdn.shopify.com/shopifycloud/web-pixels-manager/v1.js">'
+              '</script>\n'
+              '<script src="https://cdn.shopify.com/shopifycloud/chat/assets/chat.js"></script>\n')
+_shop_nav = ('<nav><a href="/">Home</a> <a href="/collections/all">Shop</a> '
+             '<a href="/pages/contact">Contact</a></nav>\n')
+_shop_addr = "77 Barton Street East, Hamilton, ON L8L 2W9."
+_CART_FORM = ('<form action="/cart/add" method="post"><input type="hidden" name="id" value="1">'
+         '<button type="submit">Add to cart</button></form>')
+
+_crawl("shopify-workwear", _S + "/", {
+    _S + "/": _shead("Northside Supply", _shop_head) + _shop_nav + """
+<h1>Northside Supply</h1>
+<p>Workwear and hand tools, shipped from Hamilton.</p>
+<p>Boots from $129.00, jackets $189.00, gloves $24.99.</p>
+""" + _CART_FORM + _sfoot("Northside Supply", _shop_addr),
+    _S + "/collections/all": _shead("Shop", _shop_head) + _shop_nav + """
+<h1>Everything</h1>
+<ul><li>Steel toe boots &mdash; $129.00</li><li>Insulated jacket &mdash; $189.00</li>
+<li>Rigger gloves &mdash; $24.99</li></ul>
+""" + _CART_FORM + _sfoot("Northside Supply", _shop_addr),
+    _S + "/pages/contact": _shead("Contact", _shop_head) + _shop_nav + """
+<h1>Talk to us</h1>
+<p>The counter is open weekdays. Write to
+<a href="mailto:orders@northsidesupply.test">orders@northsidesupply.test</a>
+and we will come back the same day.</p>
+""" + _sfoot("Northside Supply", _shop_addr),
+}, {"ecommerce_manual", "cart_no_recovery", "email_only_intake", "no_schema",
+    "no_social_presence"})
+
+
+# ── 6. Webflow agency: twelve services on one page and one form under all of them ──
+
+_A = "https://northfieldstudio.test"
+_agy_head = ('<script src="https://assets.website-files.com/webflow.js" data-wf-site="abc">'
+             '</script>\n'
+             '<script src="https://js.hs-scripts.com/4455661.js"></script>\n'
+             '<script type="application/ld+json">{"@context":"https://schema.org",'
+             '"@type":"Organization","name":"Northfield Studio"}</script>\n')
+_agy_nav = ('<nav><a href="/">Home</a> <a href="/what-we-do/">What we do</a> '
+            '<a href="/work/">Work</a> <a href="/contact/">Contact</a></nav>\n')
+_agy_addr = "5 Camden Row, Toronto, ON M5V 2K4."
+
+_crawl("webflow-agency", _A + "/", {
+    _A + "/": _shead("Northfield Studio", _agy_head) + _agy_nav + """
+<h1>Northfield Studio</h1>
+<p>A studio of nine working with challenger brands.</p>
+<p><a href="https://www.linkedin.com/company/northfieldstudio/">LinkedIn</a></p>
+""" + _sfoot("Northfield Studio", _agy_addr),
+    _A + "/what-we-do/": _shead("What we do", _agy_head) + _agy_nav + """
+<h1>How we can help</h1>
+<h2>What we do</h2>
+<ul><li>Brand strategy</li><li>Visual identity</li><li>Web design</li>
+<li>Web development</li><li>Motion graphics</li><li>Content production</li>
+<li>Copywriting</li><li>Photography</li><li>Paid social</li>
+<li>Search marketing</li><li>Email marketing</li><li>Analytics and reporting</li></ul>
+<p>Tell us what you have in mind and we will come back with a plan.</p>
+""" + _sfoot("Northfield Studio", _agy_addr),
+    _A + "/work/": _shead("Work", _agy_head) + _agy_nav + """
+<h1>Selected work</h1>
+<p>Nine years of brand and product work for food, finance and fitness.</p>
+""" + _sfoot("Northfield Studio", _agy_addr),
+    _A + "/contact/": _shead("Contact", _agy_head) + _agy_nav + """
+<h1>Start something</h1>
+""" + _LEAD_FORM + _sfoot("Northfield Studio", _agy_addr),
+}, {"services_no_route", "price_opaque"})
+
+
+# ── 7. GoDaddy one-page brochure: an address and a telephone, nothing else ──
+
+_G = "https://ashworthsurveyors.test"
+_crawl("godaddy-brochure", _G + "/", {
+    _G + "/": _shead("Ashworth Chartered Surveyors",
+                    '<script src="https://img1.wsimg.com/site/builder.js"></script>\n') + """
+<h1>Ashworth Chartered Surveyors</h1>
+<p>Four decades of party wall, boundary and dilapidations work across the county.</p>
+<p>Telephone the practice and ask for Mr Ashworth, or write to
+<a href="mailto:office@ashworthsurveyors.test">office@ashworthsurveyors.test</a>.</p>
+""" + _sfoot("Ashworth Chartered Surveyors", "9 Bridge Street, Chester CH1 1NN.",
+            "01244 555 012"),
+}, {"no_lead_capture", "email_only_intake", "no_live_chat", "no_analytics",
+    "no_schema", "no_social_presence", "price_opaque"})
+
+
+# ── 8. Duda: a three-branch physiotherapy chain ──
+
+_P = "https://lakeshorephysio.test"
+_phys_head = ('<script src="https://irp.cdn-website.com/runtime.js"></script>\n'
+              '<script async src="https://www.googletagmanager.com/gtag/js?id=G-4455"></script>\n')
+_phys_nav = ('<nav><a href="/">Home</a> <a href="/locations/">Locations</a> '
+             '<a href="/contact/">Contact</a></nav>\n')
+_phys_addr = "120 Lakeshore Road, Oakville, ON L6K 1E3."
+
+_crawl("duda-physio-chain", _P + "/", {
+    _P + "/": _shead("Lakeshore Physiotherapy", _phys_head) + _phys_nav + """
+<h1>Lakeshore Physiotherapy</h1>
+<h2>Treatments</h2>
+<ul><li>Sports injury treatment</li><li>Manual therapy</li>
+<li>Post-surgical rehabilitation</li></ul>
+""" + _sfoot("Lakeshore Physiotherapy", _phys_addr),
+    _P + "/locations/": _shead("Locations", _phys_head) + _phys_nav + """
+<h1>Three clinics</h1>
+<address>120 Lakeshore Road, Oakville, ON L6K 1E3</address>
+<address>88 Dundas Street, Burlington, ON L7R 3N4</address>
+<address>15 Main Street North, Milton, ON L9T 1N1</address>
+""" + _sfoot("Lakeshore Physiotherapy", _phys_addr),
+    _P + "/contact/": _shead("Contact", _phys_head) + _phys_nav + """
+<h1>Get in touch</h1>
+<p>Send us a note and the clinic nearest you will answer.</p>
+""" + _LEAD_FORM + _sfoot("Lakeshore Physiotherapy", _phys_addr),
+}, {"no_online_booking", "no_crm_signals", "multi_location", "no_live_chat",
+    "no_schema", "no_social_presence", "price_opaque"})
+
+
+# ── 9. Framer ──
+
+_F = "https://meridiandesign.test"
+_fr_head = ('<meta name="generator" content="Framer 2f8a">\n'
+            '<script src="https://framerusercontent.com/sites/9aB/script_main.js"></script>\n')
+_fr_nav = ('<nav><a href="/">Home</a> <a href="/work/">Work</a> '
+           '<a href="/contact/">Contact</a></nav>\n')
+_fr_addr = "22 Ossington Avenue, Toronto, ON M6J 2Y7."
+
+_crawl("framer-design-studio", _F + "/", {
+    _F + "/": _shead("Meridian Design", _fr_head) + '<div data-framer-name="Hero">' + _fr_nav + """
+<h1>Meridian Design</h1>
+<h2>What we do</h2>
+<ul><li>Product design</li><li>Design systems</li><li>Prototyping</li></ul></div>
+""" + _sfoot("Meridian Design", _fr_addr),
+    _F + "/work/": _shead("Work", _fr_head) + _fr_nav + """
+<h1>Work</h1>
+<p>Six years of interface work for software teams in Toronto and Berlin.</p>
+""" + _sfoot("Meridian Design", _fr_addr),
+    _F + "/contact/": _shead("Contact", _fr_head) + _fr_nav + """
+<h1>Say hello</h1>
+""" + _LEAD_FORM + _sfoot("Meridian Design", _fr_addr),
+}, {"no_crm_signals", "no_live_chat", "no_analytics", "no_schema",
+    "no_social_presence", "price_opaque"})
+
+
+# ── 10. An AMP page ──
+
+_M = "https://trattoriabella.test"
+_amp_head = ('<script async src="https://cdn.ampproject.org/v0.js"></script>\n'
+             '<script async custom-element="amp-analytics" '
+             'src="https://cdn.ampproject.org/v0/amp-analytics-0.1.js"></script>\n'
+             '<script type="application/ld+json">{"@context":"https://schema.org",'
+             '"@type":"Restaurant","name":"Trattoria Bella"}</script>\n')
+_amp_nav = '<nav><a href="/">Home</a> <a href="/menu/">Menu</a></nav>\n'
+_amp_tag = ('<amp-analytics type="gtag" data-credentials="include">'
+            '<script type="application/json">{"vars":{"gtag_id":"G-9911"}}</script>'
+            '</amp-analytics>\n')
+_amp_addr = "410 College Street, Toronto, ON M5T 1T3."
+
+_crawl("amp-restaurant", _M + "/", {
+    _M + "/": _shead("Trattoria Bella", _amp_head) + _amp_tag + _amp_nav + """
+<h1>Trattoria Bella</h1>
+<p>Reservations by telephone only. Call the restaurant and we will hold a table.</p>
+<form method="post" action-xhr="/enquiry"><input type="email" name="email">
+<textarea name="message"></textarea><input type="submit" value="Send"></form>
+""" + _sfoot("Trattoria Bella", _amp_addr),
+    _M + "/menu/": _shead("Menu", _amp_head) + _amp_tag + _amp_nav + """
+<h1>Menu</h1>
+<ul><li>Antipasti &mdash; $12.00</li><li>Pasta &mdash; $22.00</li>
+<li>Secondi &mdash; $31.00</li></ul>
+""" + _sfoot("Trattoria Bella", _amp_addr),
+}, {"no_online_booking", "no_crm_signals", "no_live_chat", "no_social_presence"})
+
+
+# ── 11-13. Three crawls nobody could read ──
+
+_C = "https://claremontjoinery.test"
+_crawl("cloudflare-challenge", _C + "/", {
+    _C + "/": """<!doctype html><html><head><title>Just a moment...</title>
+<script src="/cdn-cgi/challenge-platform/h/b/orchestrate/jsch/v1"></script></head>
+<body class="no-js"><div id="cf-wrapper"><h1>Checking your browser before accessing
+claremontjoinery.test</h1><p>Please enable JavaScript and cookies to continue.</p>
+<p>Ray ID: 8a1f2c</p></div></body></html>""",
+}, set(), "challenge")
+
+_N = "https://vantageclinic.test"
+_crawl("nextjs-shell", _N + "/", {
+    _N + "/": """<!doctype html><html><head><title>Vantage Clinic</title>
+<link rel="preload" href="/_next/static/chunks/main.js" as="script"></head>
+<body><div id="__next"></div>
+<script id="__NEXT_DATA__" type="application/json">{"props":{}}</script>
+<script src="/_next/static/chunks/main.js"></script></body></html>""",
+}, set(), "js_only")
+
+_K = "https://dekruidenier.test"
+_crawl("dutch-cookie-wall", _K + "/", {
+    _K + "/": """<!doctype html><html lang="nl"><head><title>De Kruidenier</title></head>
+<body><div class="consent"><h1>Wij gebruiken cookies</h1>
+<p>Wij en onze partners plaatsen cookies om de website te verbeteren. U kunt uw
+toestemming altijd intrekken.</p><button>Accepteer alle cookies</button>
+<button>Instellingen</button></div></body></html>""",
+}, set(), "cookie_wall")
+
+
+# ── 14. A French plumber whose price list is a PDF from 2019 ──
+
+_FR = "https://plomberiemartin.test"
+_fr2_head = '<link rel="stylesheet" href="/wp-content/themes/artisan/style.css">\n'
+_fr2_nav = ('<nav><a href="/">Accueil</a> <a href="/nos-services/">Nos services</a> '
+            '<a href="/contact/">Contact</a></nav>\n')
+_fr2_addr = "14 rue des Lilas, Lyon."
+
+_crawl("fr-plombier", _FR + "/", {
+    _FR + "/": _shead("Plomberie Martin", _fr2_head) + _fr2_nav + """
+<h1>Plomberie Martin</h1>
+<p>Artisan plombier à Lyon depuis 1998. Intervention rapide sur toute la métropole.</p>
+<p><a href="/media/tarifs-2019.pdf">Nos tarifs</a></p>
+""" + _sfoot("Plomberie Martin", _fr2_addr, "04 78 55 01 34"),
+    _FR + "/nos-services/": _shead("Nos services", _fr2_head) + _fr2_nav + """
+<h1>Ce que nous faisons</h1>
+<h2>Nos services</h2>
+<ul><li>Dépannage plomberie</li><li>Installation chauffe-eau</li>
+<li>Recherche de fuite</li><li>Rénovation salle de bain</li></ul>
+""" + _sfoot("Plomberie Martin", _fr2_addr, "04 78 55 01 34"),
+    _FR + "/contact/": _shead("Contact", _fr2_head) + _fr2_nav + """
+<h1>Nous écrire</h1>
+""" + _LEAD_FORM + _sfoot("Plomberie Martin", _fr2_addr, "04 78 55 01 34"),
+}, {"no_online_booking", "no_crm_signals", "dated_document", "no_live_chat",
+    "no_analytics", "no_schema", "no_social_presence"})
+
+
+# ── 15. A German dentist on plain http with no mobile layout ──
+
+_DE = "http://zahnarzt-baumgartner.test"
+_de_head = ('<script src="/media/system/js/core.js"></script>\n'
+            '<meta name="generator" content="Joomla! - Open Source Content Management">\n')
+_de_nav = ('<nav><a href="/">Startseite</a> <a href="/leistungen/">Leistungen</a> '
+           '<a href="/kontakt/">Kontakt</a></nav>\n')
+_de_addr = "Hauptstrasse 14, Berlin."
+
+
+def _de_page(title, body):
+    return ('<!doctype html>\n<html lang="de"><head><meta charset="utf-8">\n'
+            '<title>%s</title>\n%s</head><body>\n%s%s' %
+            (title, _de_head, _de_nav + body,
+             _sfoot("Zahnarztpraxis Baumgartner", _de_addr, "030 555 0134")))
+
+
+_crawl("de-zahnarzt-http", _DE + "/", {
+    _DE + "/": _de_page("Zahnarztpraxis Baumgartner", """
+<h1>Zahnarztpraxis Baumgartner</h1>
+<p>Ihre Praxis in Berlin Mitte. Wir freuen uns auf neue Patienten.</p>
+<p><a href="https://www.doctolib.de/zahnarzt/berlin/baumgartner">Termin online buchen</a></p>
+"""),
+    _DE + "/leistungen/": _de_page("Leistungen", """
+<h1>Was wir anbieten</h1>
+<h2>Unsere Leistungen</h2>
+<ul><li>Professionelle Zahnreinigung</li><li>Implantologie</li>
+<li>Bleaching</li><li>Kinderzahnheilkunde</li></ul>
+"""),
+    _DE + "/kontakt/": _de_page("Kontakt", """
+<h1>Kontakt</h1>
+""" + _LEAD_FORM),
+}, {"no_ssl", "no_mobile", "no_crm_signals", "no_live_chat", "no_analytics",
+    "no_schema", "no_social_presence", "price_opaque"})
+
+
+# ── 16. A Spanish clinic with a WhatsApp button ──
+
+_ES = "https://clinicasanmarcos.test"
+_es_head = ('<link rel="stylesheet" href="/wp-content/themes/clinica/style.css">\n'
+            '<script async src="https://www.googletagmanager.com/gtag/js?id=G-2211"></script>\n')
+_es_nav = ('<nav><a href="/">Inicio</a> <a href="/servicios/">Servicios</a> '
+           '<a href="/contacto/">Contacto</a></nav>\n')
+_es_addr = "Calle Mayor 8, Valencia."
+
+_crawl("es-clinica-whatsapp", _ES + "/", {
+    _ES + "/": _shead("Clínica San Marcos", _es_head) + _es_nav + """
+<h1>Clínica San Marcos</h1>
+<p>Odontología familiar en el centro de Valencia.</p>
+<p><a href="https://wa.me/34600111222">Escríbenos por WhatsApp</a></p>
+<p><a href="https://www.pedircitaonline.test/sanmarcos">Pedir cita online</a></p>
+""" + _sfoot("Clínica San Marcos", _es_addr, "961 55 01 34"),
+    _ES + "/servicios/": _shead("Servicios", _es_head) + _es_nav + """
+<h1>Tratamientos</h1>
+<h2>Nuestros servicios</h2>
+<ul><li>Limpieza dental</li><li>Ortodoncia invisible</li>
+<li>Implantes dentales</li><li>Blanqueamiento</li></ul>
+""" + _sfoot("Clínica San Marcos", _es_addr, "961 55 01 34"),
+    _ES + "/contacto/": _shead("Contacto", _es_head) + _es_nav + """
+<h1>Escríbenos</h1>
+""" + _LEAD_FORM + _sfoot("Clínica San Marcos", _es_addr, "961 55 01 34"),
+}, {"whatsapp_manual", "no_crm_signals", "no_live_chat", "no_schema",
+    "no_social_presence", "price_opaque"})
+
+
+# ── 17. A Dutch dentist whose Afspraak maken page is a telephone number ──
+
+_NL = "https://tandartsdeboer.test"
+_nl_head = ('<link rel="stylesheet" href="/wp-content/themes/praktijk/style.css">\n'
+            '<script type="application/ld+json">{"@context":"https://schema.org",'
+            '"@type":"Dentist","name":"Tandartspraktijk De Boer"}</script>\n')
+_nl_nav = ('<nav><a href="/">Home</a> <a href="/afspraak-maken/">Afspraak maken</a> '
+           '<a href="/contact/">Contact</a></nav>\n')
+_nl_addr = "Keizersgracht 210, Amsterdam."
+
+_crawl("nl-tandarts", _NL + "/", {
+    _NL + "/": _shead("Tandartspraktijk De Boer", _nl_head) + _nl_nav + """
+<h1>Tandartspraktijk De Boer</h1>
+<p>Een kleine praktijk aan de gracht. Nieuwe patiënten zijn welkom.</p>
+""" + _sfoot("Tandartspraktijk De Boer", _nl_addr, "020 555 0134"),
+    _NL + "/afspraak-maken/": _shead("Afspraak maken", _nl_head) + _nl_nav + """
+<h1>Afspraak maken</h1>
+<p>Bel ons op 020 555 0134 en wij plannen uw afspraak in. Tussen negen en vijf staat
+er altijd iemand aan de balie.</p>
+""" + _sfoot("Tandartspraktijk De Boer", _nl_addr, "020 555 0134"),
+    _NL + "/contact/": _shead("Contact", _nl_head) + _nl_nav + """
+<h1>Contact</h1>
+""" + _LEAD_FORM + _sfoot("Tandartspraktijk De Boer", _nl_addr, "020 555 0134"),
+}, {"no_online_booking", "no_crm_signals", "no_live_chat", "no_analytics",
+    "no_social_presence", "price_opaque"})
+
+
+# ── 18. A four-branch German optician whose addresses live in JSON-LD ──
+
+_OP = "https://optikwerner.test"
+_op_schema = ('<script type="application/ld+json">{"@context":"https://schema.org",'
+              '"@type":"Optician","name":"Optik Werner","location":['
+              '{"@type":"PostalAddress","streetAddress":"Marktplatz 3",'
+              '"postalCode":"70173","addressLocality":"Stuttgart"},'
+              '{"@type":"PostalAddress","streetAddress":"Bahnhofstrasse 9",'
+              '"postalCode":"71032","addressLocality":"Boeblingen"},'
+              '{"@type":"PostalAddress","streetAddress":"Hauptstrasse 44",'
+              '"postalCode":"73728","addressLocality":"Esslingen"},'
+              '{"@type":"PostalAddress","streetAddress":"Koenigstrasse 12",'
+              '"postalCode":"70563","addressLocality":"Vaihingen"}]}</script>\n')
+_op_nav = ('<nav><a href="/">Startseite</a> <a href="/filialen/">Filialen</a> '
+           '<a href="/kontakt/">Kontakt</a></nav>\n')
+_op_addr = "Marktplatz 3, Stuttgart."
+
+_crawl("de-optiker-chain", _OP + "/", {
+    _OP + "/": _shead("Optik Werner", _op_schema) + _op_nav + """
+<h1>Optik Werner</h1>
+<p>Vier Filialen in der Region Stuttgart. Meisterbetrieb seit 1974.</p>
+""" + _sfoot("Optik Werner", _op_addr, "0711 555 0134"),
+    _OP + "/filialen/": _shead("Filialen", _op_schema) + _op_nav + """
+<h1>Unsere Filialen</h1>
+<p>Stuttgart, Böblingen, Esslingen und Vaihingen.</p>
+""" + _sfoot("Optik Werner", _op_addr, "0711 555 0134"),
+    _OP + "/kontakt/": _shead("Kontakt", _op_schema) + _op_nav + """
+<h1>Kontakt</h1>
+""" + _LEAD_FORM + _sfoot("Optik Werner", _op_addr, "0711 555 0134"),
+}, {"no_online_booking", "no_crm_signals", "multi_location", "no_live_chat",
+    "no_analytics", "no_social_presence", "price_opaque"})
+
+
+# ── 19. A WooCommerce bakery that does collect email addresses ──
+
+_B = "https://mapleleafbakery.test"
+_bk_head = ('<link rel="stylesheet" href="/wp-content/plugins/woocommerce/assets/css/woo.css">\n'
+            '<script>var wc_add_to_cart_params={"ajax_url":"/?wc-ajax=x"};</script>\n'
+            '<script src="//maple.us4.list-manage.com/subscribe/post.js"></script>\n'
+            '<script async src="https://www.googletagmanager.com/gtag/js?id=G-3311"></script>\n')
+_bk_nav = ('<nav><a href="/">Home</a> <a href="/shop/">Shop</a> '
+           '<a href="/contact/">Contact</a></nav>\n')
+_bk_addr = "62 Locke Street South, Hamilton, ON L8P 4A8."
+
+_crawl("woocommerce-bakery", _B + "/", {
+    _B + "/": _shead("Maple Leaf Bakery", _bk_head) + _bk_nav + """
+<h1>Maple Leaf Bakery</h1>
+<p>Sourdough, rye and pastry, baked overnight on Locke Street.</p>
+<p>Sourdough loaf $8.50, rye $9.00, croissant $4.25.</p>
+<form action="/?wc-ajax=add_to_cart"><button type="submit">Add to cart</button></form>
+""" + _sfoot("Maple Leaf Bakery", _bk_addr),
+    _B + "/shop/": _shead("Shop", _bk_head) + _bk_nav + """
+<h1>Order online</h1>
+<ul><li>Sourdough loaf &mdash; $8.50</li><li>Rye &mdash; $9.00</li>
+<li>Croissant &mdash; $4.25</li></ul>
+""" + _sfoot("Maple Leaf Bakery", _bk_addr),
+    _B + "/contact/": _shead("Contact", _bk_head) + _bk_nav + """
+<h1>Say hello</h1>
+""" + _LEAD_FORM + _sfoot("Maple Leaf Bakery", _bk_addr),
+}, {"ecommerce_manual", "no_live_chat", "no_schema", "no_social_presence"})
+
+
+# ── 20. A chiropractor with a fourteen-field intake form and a PDF of the same ──
+
+_CH = "https://bayviewchiro.test"
+_ch_head = '<link rel="stylesheet" href="/wp-content/themes/clinic/style.css">\n'
+_ch_nav = ('<nav><a href="/">Home</a> <a href="/services/">Services</a> '
+           '<a href="/new-patient/">New patients</a></nav>\n')
+_ch_addr = "31 Bayview Avenue, Toronto, ON M4W 2G8."
+
+_crawl("chiro-long-intake", _CH + "/", {
+    _CH + "/": _shead("Bayview Family Chiropractic", _ch_head) + _ch_nav + """
+<h1>Bayview Family Chiropractic</h1>
+<p>Three practitioners, open six days.</p>
+""" + _sfoot("Bayview Family Chiropractic", _ch_addr),
+    _CH + "/services/": _shead("Services", _ch_head) + _ch_nav + """
+<h1>What we treat</h1>
+<h2>Our Services</h2>
+<ul><li>Chiropractic adjustment</li><li>Massage therapy</li>
+<li>Custom orthotics</li><li>Sports rehabilitation</li></ul>
+""" + _sfoot("Bayview Family Chiropractic", _ch_addr),
+    _CH + "/new-patient/": _shead("New patients", _ch_head) + _ch_nav + """
+<h1>Before your first visit</h1>
+<p>Please <a href="/forms/new-patient-form.pdf">download the new patient form</a>
+and bring it with you, or fill it in here.</p>
+<form action="/new-patient/" method="post">""" + _asks(
+        "t:First name", "t:Last name", "e:Email", "p:Telephone", "d:Date of birth",
+        "t:Street address", "t:City", "t:Postal code", "s:How did you hear about us",
+        "t:Family doctor", "t:Insurance provider", "t:Policy number",
+        "a:Reason for your visit", "a:Previous injuries") + """
+<button type="submit">Send</button></form>
+""" + _sfoot("Bayview Family Chiropractic", _ch_addr),
+}, {"no_online_booking", "no_crm_signals", "long_intake_form", "pdf_forms",
+    "no_live_chat", "no_analytics", "no_schema", "no_social_presence", "price_opaque"})
+
+
+# ── 21. A law firm listing twelve practice areas with one form under them ──
+
+_L = "https://hendersonlaw.test"
+_law_head = '<link rel="stylesheet" href="/wp-content/themes/firm/style.css">\n'
+_law_nav = ('<nav><a href="/">Home</a> <a href="/practice-areas/">Practice areas</a> '
+            '<a href="/contact/">Contact</a></nav>\n')
+_law_addr = "200 King Street West, Kitchener, ON N2G 1B2."
+
+_crawl("law-firm-services-list", _L + "/", {
+    _L + "/": _shead("Henderson Law", _law_head) + _law_nav + """
+<h1>Henderson Law</h1>
+<p>A four-partner firm in Kitchener, in practice since 1988.</p>
+""" + _sfoot("Henderson Law", _law_addr),
+    _L + "/practice-areas/": _shead("Practice areas", _law_head) + _law_nav + """
+<h1>Practice areas</h1>
+<h2>Our services</h2>
+<ul><li>Wills and estates</li><li>Estate administration</li><li>Family law</li>
+<li>Separation agreements</li><li>Residential real estate</li>
+<li>Commercial real estate</li><li>Corporate formation</li>
+<li>Shareholder agreements</li><li>Employment law</li><li>Civil litigation</li>
+<li>Landlord and tenant</li><li>Notary services</li></ul>
+<p>Write to us and one of the partners will come back to you.</p>
+""" + _sfoot("Henderson Law", _law_addr),
+    _L + "/contact/": _shead("Contact", _law_head) + _law_nav + """
+<h1>Contact</h1>
+""" + _LEAD_FORM + _sfoot("Henderson Law", _law_addr),
+}, {"services_no_route", "no_crm_signals", "no_live_chat", "no_analytics",
+    "no_schema", "no_social_presence", "price_opaque"})
+
+
+# ── 22. The same shape with a page behind every service ──
+
+_H = "https://clearviewhvac.test"
+_hv_head = '<link rel="stylesheet" href="/wp-content/themes/trade/style.css">\n'
+_hv_nav = ('<nav><a href="/">Home</a> <a href="/services/">Services</a> '
+           '<a href="/contact/">Contact</a></nav>\n')
+_hv_addr = "8 Industrial Road, Barrie, ON L4N 8Z4."
+
+_crawl("hvac-linked-services", _H + "/", {
+    _H + "/": _shead("Clearview Heating and Cooling", _hv_head) + _hv_nav + """
+<h1>Clearview Heating and Cooling</h1>
+<p>Furnaces, air conditioning and ductwork across Simcoe County.</p>
+""" + _sfoot("Clearview Heating and Cooling", _hv_addr),
+    _H + "/services/": _shead("Services", _hv_head) + _hv_nav + """
+<h1>What we do</h1>
+<h2>Our Services</h2>
+<ul><li><a href="/services/furnace-repair/">Furnace repair</a></li>
+<li><a href="/services/furnace-installation/">Furnace installation</a></li>
+<li><a href="/services/air-conditioning/">Air conditioning</a></li>
+<li><a href="/services/heat-pumps/">Heat pumps</a></li>
+<li><a href="/services/duct-cleaning/">Duct cleaning</a></li>
+<li><a href="/services/water-heaters/">Water heaters</a></li>
+<li><a href="/services/maintenance-plans/">Maintenance plans</a></li>
+<li><a href="/services/indoor-air-quality/">Indoor air quality</a></li>
+<li><a href="/services/emergency-service/">Emergency service</a></li></ul>
+""" + _sfoot("Clearview Heating and Cooling", _hv_addr),
+    _H + "/contact/": _shead("Contact", _hv_head) + _hv_nav + """
+<h1>Book a visit with us</h1>
+""" + _LEAD_FORM + _sfoot("Clearview Heating and Cooling", _hv_addr),
+}, {"no_online_booking", "no_crm_signals", "no_live_chat", "no_analytics",
+    "no_schema", "no_social_presence", "price_opaque"})
+
+
+# ── 23. A quote form one field under the line ──
+
+_LS = "https://meadowlandscape.test"
+_ls_head = '<link rel="stylesheet" href="/wp-content/themes/garden/style.css">\n'
+_ls_nav = ('<nav><a href="/">Home</a> <a href="/quote/">Request a quote</a></nav>\n')
+_ls_addr = "77 Concession Road, Ancaster, ON L9G 3K9."
+
+_crawl("landscaper-short-quote", _LS + "/", {
+    _LS + "/": _shead("Meadow Landscape", _ls_head) + _ls_nav + """
+<h1>Meadow Landscape</h1>
+<h2>What we do</h2>
+<ul><li>Garden design</li><li>Lawn maintenance</li><li>Patio and paving</li>
+<li>Seasonal clean-ups</li></ul>
+""" + _sfoot("Meadow Landscape", _ls_addr),
+    _LS + "/quote/": _shead("Request a quote", _ls_head) + _ls_nav + """
+<h1>Request a quote</h1>
+<form action="/quote/" method="post">""" + _asks(
+        "t:Name", "e:Email", "p:Telephone", "t:Address", "s:Type of work",
+        "s:Approximate size", "d:When would you like it done", "s:Budget",
+        "a:Anything else") + """
+<button type="submit">Send</button></form>
+""" + _sfoot("Meadow Landscape", _ls_addr),
+}, {"no_online_booking", "no_crm_signals", "quote_by_form", "no_live_chat",
+    "no_analytics", "no_schema", "no_social_presence", "price_opaque"})
+
+
+# ── 24. A price list that is a PDF, and a report that only looks like one ──
+
+_T = "https://trailsideworkwear.test"
+_tw_head = '<link rel="stylesheet" href="/wp-content/themes/trade/style.css">\n'
+_tw_addr = "5 Front Street, Sarnia, ON N7T 5S5."
+
+_crawl("dated-document-negatives", _T + "/", {
+    _T + "/": _shead("Trailside Workwear", _tw_head) + """
+<nav><a href="/">Home</a> <a href="/contact/">Contact</a></nav>
+<h1>Trailside Workwear</h1>
+<p>Crew outfitting and embroidery for contractors.</p>
+<p>Download the <a href="/downloads/price-list.pdf">price list</a>, or read our
+<a href="/docs/annual-report-2019.pdf">annual report 2019</a>.</p>
+""" + _LEAD_FORM + _sfoot("Trailside Workwear", _tw_addr),
+    _T + "/contact/": _shead("Contact", _tw_head) + """
+<nav><a href="/">Home</a> <a href="/contact/">Contact</a></nav>
+<h1>Contact</h1>
+<p>The counter is open weekdays from seven.</p>
+""" + _LEAD_FORM + _sfoot("Trailside Workwear", _tw_addr),
+}, {"no_crm_signals", "no_live_chat", "no_analytics", "no_schema",
+    "no_social_presence"})
+
+
+SITE_PAGE_COUNT = sum(len(pages) for _n, _b, pages, _g, _r in SITE_CORPUS)
+
 
 def test_no_rule_stands_a_substring_in_for_the_fact_it_claims():
     """Precision on the corpus, rule by rule, because a wrong headline is dear.
@@ -3224,6 +3979,289 @@ def test_a_printed_number_survives_its_own_brackets():
     print("a printed number survives its own brackets: OK")
 
 
+# ── What a crawl knows and a home page cannot ──
+
+
+def test_a_site_is_more_than_its_home_page():
+    """Precision and recall over twenty-four whole crawls, rule by rule.
+
+    The corpora above are one page each, so every rule in the catalogue was a
+    rule about a home page. Five findings that are worth more than most of them
+    are two clicks in, and this is the corpus that grades those: sixty-three
+    pages, labelled before a line was written, across WordPress under Elementor
+    and under Divi, Wix, Squarespace, Shopify, Webflow, GoDaddy, Duda, Framer,
+    an AMP page, WooCommerce, Joomla, a Cloudflare challenge, a Next.js shell, a
+    Dutch cookie wall, and sites in French, German, Spanish and Dutch.
+
+    Over these crawls, before -> after:
+
+        rule                 precision            recall
+        no_online_booking    1.000 -> 1.000       0.800 -> 1.000
+        price_opaque         0.875 -> 1.000       1.000 -> 1.000
+        no_analytics         0.923 -> 1.000       1.000 -> 1.000
+        long_intake_form        --  -> 1.000       0.000 -> 1.000
+        services_no_route       --  -> 1.000       0.000 -> 1.000
+        dated_document          --  -> 1.000       0.000 -> 1.000
+        cart_no_recovery        --  -> 1.000       0.000 -> 1.000
+        every rule together  0.975 -> 1.000       0.935 -> 1.000
+
+    The three false claims were a restaurant on AMP told nobody counts its
+    visits (an `amp-analytics` component writes no gtag call, so every marker in
+    the table missed it) and two businesses told they publish no prices at all,
+    both of whom link a price list from their own home page. The eight misses
+    were a dentist and a Dutch practice whose Book Online pages are contact
+    forms, and the six the new codes are for. A dash means the rule did not
+    exist to have a rate.
+    """
+    wrong = {}
+    for name, base, pages, expected, _reason in SITE_CORPUS:
+        fired = set(_codes(A.audit_from_html(pages, base)))
+        if fired != expected:
+            wrong[name] = {"claimed but false": sorted(fired - expected),
+                           "true but missed": sorted(expected - fired)}
+    assert not wrong, wrong
+
+    assert len(SITE_CORPUS) >= 20, len(SITE_CORPUS)
+    assert SITE_PAGE_COUNT >= 40, SITE_PAGE_COUNT
+    # More than one page per site, or this corpus is the one above with extra
+    # steps and grades nothing it was built for.
+    assert sum(1 for _n, _b, p, _g, _r in SITE_CORPUS if len(p) > 1) >= 18
+
+    # Every code this corpus exists to grade, graded both ways.
+    rates = _corpus_rates([(n, b, p, g) for n, b, p, g, _r in SITE_CORPUS])
+    for code in ("long_intake_form", "services_no_route", "dated_document",
+                 "cart_no_recovery", "no_online_booking", "price_opaque",
+                 "no_analytics"):
+        tp, fp, fn = rates[code]
+        assert tp >= 1 and fp == 0 and fn == 0, (code, rates[code])
+        assert tp < len(SITE_CORPUS), (code, rates[code])
+    print("a site is more than its home page: OK")
+
+
+def test_a_booking_page_that_is_a_form_is_not_a_booking_system():
+    """A Book Online button is a promise. The page behind it is the answer.
+
+    `no_online_booking` is the catalogue's headline gap and it was suppressed by
+    a link: any anchor whose path or label said booking counted as a calendar,
+    on the reasoning that a business with a Book button probably has one. Over
+    a crawl that reasoning is no longer needed, and it was wrong twice in
+    twenty-four sites -- a dentist and a Dutch practice whose booking pages hold
+    a contact form and a telephone number and nothing else. Those are not sites
+    that need no calendar; they are the sites the gap was written for.
+
+    It stays a promise wherever the crawl cannot check it: a link out to
+    somebody else's calendar, a vendor script anywhere on the site, or an
+    iframe, a date field or the word calendar on the page itself. All three
+    cost a finding rather than buying a false one.
+    """
+    booking = "https://practice.test"
+    home = _shead("Practice") + """
+<nav><a href="/">Home</a> <a href="/book-online/">Book Online</a></nav>
+<h1>Practice</h1><h2>Our Services</h2><ul><li>Dental cleaning</li>
+<li>Teeth whitening</li></ul>
+""" + _LEAD_FORM + _sfoot("Practice", "1 Mill St, Guelph, ON N1H 2A9.")
+
+    # The page behind the button is a form, and the crawl has it.
+    a_form = A.audit_from_html({
+        booking + "/": home,
+        booking + "/book-online/": _shead("Book Online") + "<h1>Book Online</h1>"
+        "<p>Tell us when suits and we will call you back.</p>" + _LEAD_FORM
+        + _sfoot("Practice", "1 Mill St, Guelph, ON N1H 2A9."),
+    }, booking + "/")
+    assert a_form["signals"]["has_online_booking"] is False, a_form["signals"]
+    assert "no_online_booking" in _codes(a_form), _codes(a_form)
+    headline = next(g for g in a_form["gaps"] if g["code"] == "no_online_booking")
+    assert headline["evidence"].startswith("clicking through to book"), headline
+
+    # And the three shapes that keep the benefit of the doubt.
+    kept = {
+        "a calendar of its own":
+            "<h1>Book Online</h1><div class=\"datepicker\"></div>",
+        "an embed this table has never heard of":
+            "<h1>Book Online</h1><iframe src=\"https://booking.example/widget\"></iframe>",
+        "a vendor":
+            "<h1>Book Online</h1><a href=\"https://calendly.com/practice\">Pick a time</a>",
+    }
+    for why, body in kept.items():
+        result = A.audit_from_html({
+            booking + "/": home,
+            booking + "/book-online/": _shead("Book Online") + body
+            + _sfoot("Practice", "1 Mill St, Guelph, ON N1H 2A9."),
+        }, booking + "/")
+        assert result["signals"]["has_online_booking"] is True, (why, result["signals"])
+        assert "no_online_booking" not in _codes(result), (why, _codes(result))
+
+    # The page was never fetched, so nothing here has an opinion about it.
+    unseen = A.audit_from_html({booking + "/": home}, booking + "/")
+    assert unseen["signals"]["has_online_booking"] is True, unseen["signals"]
+    print("a booking page that is a form is not a booking system: OK")
+
+
+def test_a_form_is_measured_in_questions_and_not_in_input_tags():
+    """"the form asks for fourteen separate things" has to be countable by hand.
+
+    A builder ships a nonce, two hidden ids and a honeypot with every form, and
+    a row of radio buttons is one question asked once. Counting `<input>` tags
+    reads a four-question contact form as a nine-part interrogation, and the
+    sentence this gap sends is about how much the reader is asking of a
+    stranger -- a number they will check against their own page.
+    """
+    dressed = ('<form action="/contact" method="post">'
+               '<input type="hidden" name="_wpnonce" value="a1b2c3">'
+               '<input type="hidden" name="form_id" value="14">'
+               '<input type="text" name="honeypot" style="display:none">'
+               '<input type="text" name="name"><input type="email" name="email">'
+               '<input type="radio" name="contact_by" value="phone">'
+               '<input type="radio" name="contact_by" value="email">'
+               '<textarea name="message"></textarea>'
+               '<input type="submit" value="Send"></form>')
+    assert A._form_fields(dressed) == 4, A._form_fields(dressed)
+
+    fourteen = ('<form action="/intake" method="post">'
+                + _asks("t:First name", "t:Last name", "e:Email", "p:Telephone",
+                        "d:Date of birth", "t:Street", "t:City", "t:Postal code",
+                        "s:How did you hear", "t:Doctor", "t:Insurer", "t:Policy",
+                        "a:Reason", "a:History")
+                + '<button type="submit">Send</button></form>')
+    assert A._form_fields(fourteen) == 14, A._form_fields(fourteen)
+
+    # The threshold, from either side, through the whole audit.
+    for count, fires in ((A.LONG_FORM_FIELDS - 1, False), (A.LONG_FORM_FIELDS, True)):
+        body = ('<h1>Enquiries</h1><form action="/enquiry" method="post">'
+                + _asks(*(["t:Question %d" % i for i in range(count - 1)] + ["a:Message"]))
+                + '<button type="submit">Send</button></form>')
+        result = _built(body)
+        assert result["signals"]["has_contact_form"] is True, count
+        assert ("long_intake_form" in _codes(result)) is fires, (count, _codes(result))
+
+    # And a search box is not an enquiry however many fields it has.
+    assert "long_intake_form" not in _codes(_built(_SEARCH_BOX))
+    print("a form is measured in questions and not in input tags: OK")
+
+
+def test_a_price_list_on_the_site_is_not_no_pricing_anywhere():
+    """Two sentences that cannot both be sent, and one of them was.
+
+    `price_opaque` says "not a rate, a range or a starting figure on any page".
+    To a business whose home page links its price list that is a sentence the
+    reader disproves in one click, and it went out to two of the twenty-four
+    sites in the corpus above. What is true about that business is the other
+    sentence: the file was last put together in 2019.
+
+    Only the nouns that mean what it costs, and only a year two behind. A
+    uniform catalogue is a list of what a supplier stocks and a 2019 annual
+    report is a report, and reading either as a rate card would silence
+    `price_opaque` on the sites it was written for.
+    """
+    dated = _built('<p>Download our <a href="/files/price-list-2019.pdf">price list</a>.</p>'
+                   + _LEAD_FORM)
+    assert "dated_document" in _codes(dated), _codes(dated)
+    assert "price_opaque" not in _codes(dated), _codes(dated)
+    evidence = next(g for g in dated["gaps"] if g["code"] == "dated_document")["evidence"]
+    assert evidence.endswith("2019"), evidence
+
+    # Published, current: no claim either way about the price of anything.
+    current = _built('<p>Our <a href="/files/price-list-%d.pdf">price list</a>.</p>'
+                     % TODAY.year + _LEAD_FORM)
+    assert "dated_document" not in _codes(current), _codes(current)
+    assert "price_opaque" not in _codes(current), _codes(current)
+
+    # Not a price list, so `price_opaque` is still the true finding.
+    for body in ('<p>Read the <a href="/docs/annual-report-2019.pdf">annual report</a>.</p>',
+                 '<p>Browse the <a href="/dl/uniform-catalogue-2019.pdf">uniform '
+                 'catalogue</a>.</p>',
+                 '<p>Please <a href="/forms/intake-2019.pdf">print the intake form</a>.</p>'):
+        result = _built(body + _LEAD_FORM)
+        assert "dated_document" not in _codes(result), (body, _codes(result))
+        assert "price_opaque" in _codes(result), (body, _codes(result))
+    print("a price list on the site is not no pricing anywhere: OK")
+
+
+def test_a_service_with_a_page_behind_it_has_a_route():
+    """Twelve services and one form is a finding. Twelve services and twelve
+    pages is a website working properly, and the two look identical in a list of
+    words -- the difference is in the markup of the `<li>`, which is why the
+    count of linked items is taken on the pass that reads the list.
+    """
+    def _listing(count, linked):
+        items = "".join(
+            ('<li><a href="/services/item-%d/">Service number %d</a></li>' % (i, i))
+            if linked else ("<li>Service number %d</li>" % i)
+            for i in range(count))
+        return "<h2>Our Services</h2><ul>%s</ul>" % items
+
+    bare = _built(_listing(12, False) + _LEAD_FORM)
+    assert "services_no_route" in _codes(bare), _codes(bare)
+    routed = _built(_listing(12, True) + _LEAD_FORM)
+    assert "services_no_route" not in _codes(routed), _codes(routed)
+
+    # The threshold from either side, and a site with no way in at all, where
+    # the finding is that nothing asks for a name rather than how it is routed.
+    for count, fires in ((A.MANY_SERVICES - 1, False), (A.MANY_SERVICES, True)):
+        result = _built(_listing(count, False) + _LEAD_FORM)
+        assert ("services_no_route" in _codes(result)) is fires, (count, _codes(result))
+    assert "services_no_route" not in _codes(_built(_listing(12, False)))
+    print("a service with a page behind it has a route: OK")
+
+
+def test_a_shop_that_asks_for_an_address_is_not_told_it_asks_for_none():
+    """"nowhere at all for a shopper to leave an email" is a claim about the
+    whole crawl, and a shop that has a signup in its footer disproves it on
+    every page. Both halves are measured: the vendor script that renders the box
+    in JavaScript, and a plain email field wherever it sits."""
+    shop = ('<h1>Northside Supply</h1><p>Boots from $129.00.</p>'
+            '<form action="/cart/add"><input type="hidden" name="id" value="1">'
+            '<button>Add to cart</button></form>'
+            '<script src="https://cdn.shopify.com/s/files/1/0001/theme.css"></script>')
+    alone = _built(shop)
+    assert alone["tech"]["ecommerce"] == "shopify", alone["tech"]
+    assert "cart_no_recovery" in _codes(alone), _codes(alone)
+
+    for why, extra in (
+        ("a mailing tool", '<script src="//x.us4.list-manage.com/subscribe/post.js"></script>'),
+        ("a signup field", '<form action="/subscribe"><input type="email" name="EMAIL">'
+                           '<button>Join</button></form>'),
+        ("a contact form", _LEAD_FORM),
+    ):
+        result = _built(shop + extra)
+        assert result["tech"]["ecommerce"] == "shopify", (why, result["tech"])
+        assert "cart_no_recovery" not in _codes(result), (why, _codes(result))
+
+    # No shop, no claim: a brochure site with no newsletter is a different gap.
+    assert "cart_no_recovery" not in _codes(_built("<h1>A business</h1>" + _LEAD_FORM))
+    print("a shop that asks for an address is not told it asks for none: OK")
+
+
+def test_a_crawl_costs_no_more_than_the_page_it_already_had():
+    """Depth has to be free, or it is paid on every lead in a five-hundred lead
+    run. Every rule added here reads pages `harvest_site` already fetched and
+    `_audit` already parsed: the form fields come out of the blocks
+    `_lead_forms` was walking anyway, the linked-item count off the pass
+    `_listed_services` already makes, the price document out of the loop that
+    was already looking at every PDF link, and the booking page out of the list
+    of pages `_order_pages` had already built.
+
+    So the guard is structural rather than a stopwatch: no new pass over the
+    crawl, and `audit_site` still touches the network zero times when it is
+    handed HTML.
+    """
+    calls = []
+    original = A._fetch
+    A._fetch = lambda url, timeout: (calls.append(url), ("", "", 0, "blocked"))[1]
+    try:
+        name, base, pages, _gaps, _reason = next(
+            row for row in SITE_CORPUS if len(row[2]) >= 4)
+        result = A.audit_site(base, prefetched=pages)
+    finally:
+        A._fetch = original
+    assert not calls, calls
+    assert result["reachable"] is True, result
+    assert result["page_count"] == len(pages), (name, result["page_count"])
+    # Every page it was handed, read once and only once.
+    assert sorted(result["pages"]) == sorted(pages), name
+    print("a crawl costs no more than the page it already had: OK")
+
+
 if __name__ == "__main__":
     test_catalogue_services_are_real()
     test_subject_phrases_are_neutral()
@@ -3268,4 +4306,11 @@ if __name__ == "__main__":
     test_an_unreachable_site_says_why()
     test_a_vendor_name_inside_a_longer_host_is_not_that_vendor()
     test_a_printed_number_survives_its_own_brackets()
+    test_a_site_is_more_than_its_home_page()
+    test_a_booking_page_that_is_a_form_is_not_a_booking_system()
+    test_a_form_is_measured_in_questions_and_not_in_input_tags()
+    test_a_price_list_on_the_site_is_not_no_pricing_anywhere()
+    test_a_service_with_a_page_behind_it_has_a_route()
+    test_a_shop_that_asks_for_an_address_is_not_told_it_asks_for_none()
+    test_a_crawl_costs_no_more_than_the_page_it_already_had()
     print("\nALL AUDIT TESTS PASSED")

@@ -255,6 +255,7 @@ without any of it, and one visit to the Campaign tab costs 12ms.
 
 from __future__ import annotations
 
+import contextlib
 import csv
 import html
 import json
@@ -525,6 +526,11 @@ _DELETE_BATCH = 500
 _TOKEN_RE = re.compile(r"\{\{[^{}]*\}\}")
 
 _LOG_LIMIT = 400
+
+# How long Start and Prepare may hold the GUI thread waiting for the last
+# worker to let go. Long enough for a thread whose `run` has already returned,
+# short enough that a press is never felt as a hang — see `_retire`.
+_RETIRE_GRACE_MS = 50
 
 # How far back the "which accounts are out of action today" question reads the
 # event log. Every send writes an event, so a busy day is thousands of rows and
@@ -1969,6 +1975,12 @@ class OutreachScreen(QWidget):
         # was last read off the event log. See `_benched_today`.
         self._benched: set = set()
         self._benched_at = 0.0
+        # The store's answers for the repaint that is running now, or None when
+        # none is. See `_one_reading`.
+        self._reading: dict | None = None
+        # email -> the account card's counter label and its bar, so the once-a-
+        # message repaint sets three values instead of rebuilding six widgets.
+        self._account_cards: dict = {}
 
         self._leads: list[dict] = []
         # lead id -> why that lead's email would be a form letter, "" when it
@@ -2709,6 +2721,9 @@ class OutreachScreen(QWidget):
         middle = _cols(margin="0", spacing="4", t=t)
         accounts_card = components.card(title="Accounts today")
         self.accounts_holder = _rows(margin="0", spacing="3", t=t)
+        # New holder, so whatever `_refresh_accounts` was keeping is a set of
+        # widgets that no longer exist. A palette change comes through here.
+        self._account_cards = {}
         accounts_card.body_layout.addLayout(self.accounts_holder)
         accounts_card.body_layout.addStretch()
         accounts_card.setFixedWidth(
@@ -3505,6 +3520,16 @@ class OutreachScreen(QWidget):
             Cell(text=_text_of(lead.get("name")).strip() or "—",
                  sort=_text_of(lead.get("name")).strip().lower()),
             Cell(text=_text_of(lead.get("email")).strip()),
+            # The Phone column joined `_LEAD_COLUMNS` with the WhatsApp channel
+            # and this tuple did not follow it, so `every[8]` — Status, the
+            # last field — indexed an eight-tuple and raised. The raise landed
+            # inside `_paint_window`, which Qt calls from an event filter, and
+            # PyQt5 answers an exception in a virtual with `qFatal`: the app
+            # aborted with 0xC0000409 the instant the lead table had one row in
+            # it. Anything that reads a column by its number has to be as long
+            # as the spec; `_COL_KEYS` is the shape that cannot drift.
+            Cell(text=_text_of(lead.get("phone")).strip(),
+                 tip=self._phone_tip(lead)),
             Cell(text=_text_of(lead.get("city")).strip()),
             Cell(text=_text_of(lead.get("category")).strip()),
             Cell(text=site, sort=site,
@@ -3549,6 +3574,34 @@ class OutreachScreen(QWidget):
         lines.append("Its email will say nothing about the business. Right-click "
                      "to retry the crawl, open the site, or take the lead out.")
         return "\n".join(lines)
+
+    def _phone_tip(self, lead: dict) -> str:
+        """What the Phone cell says on hover: whether WhatsApp can dial it.
+
+        The cell shows the number as it was scraped, which is the only thing a
+        user can compare against the listing. Whether that number is *sendable*
+        is a second question with a different answer — "(416) 555-0142" is
+        unqualified, and `to_wa_id` refuses it outright until a default region
+        is set — and the hover is where that belongs, because a column of forty
+        rows is scanned rather than read.
+
+        Resolved through the same `to_wa_id` the planner and the send loop use,
+        so a row that says it can be messaged is one the run will accept.
+        """
+        phone = _text_of(lead.get("phone")).strip()
+        if not phone:
+            return ""
+        region = _campaign.wa_region(self.settings)
+        wa_id = _wa.to_wa_id(phone, region)
+        if wa_id:
+            return "WhatsApp would message +%s." % wa_id
+        if not _wa.is_plausible(phone):
+            return ("Too few digits to be a phone number, so a WhatsApp "
+                    "campaign cannot include this lead.")
+        return ("No country code, and %s — WhatsApp cannot dial it. Set a "
+                "default region in Settings, or correct the number."
+                % ("the default region does not qualify it" if region
+                   else "no default region is set"))
 
     def _set_badge(self, row: int, field: int, key) -> None:
         """Put the value a badge column paints onto its cell.
@@ -4754,10 +4807,24 @@ class OutreachScreen(QWidget):
         self._refresh_lead_actions()
 
     def _retire(self, worker) -> bool:
-        """True once `worker` is safe to drop — finished, or never started."""
+        """True once `worker` is safe to drop — finished, or never started.
+
+        A moment, not two seconds. This is called from Start and from Prepare,
+        both of which refuse and say so when it comes back false — so the two
+        seconds it used to wait bought nothing but a frozen window: measured,
+        pressing Prepare while a plan thread was still unwinding blocked the GUI
+        thread for **2,007ms** and then put up a toast saying nothing had
+        happened. A button that hangs the app for two seconds to tell you it did
+        nothing is worse than one that says so at once.
+
+        The grace is for the only case waiting can actually settle: a thread
+        whose `run` has returned and which is milliseconds from `finished`.
+        Anything longer than that is a crawl or an SMTP hand-off still in
+        flight, and the honest answer to that is the sentence the caller prints.
+        """
         if worker is None or not worker.isRunning():
             return True
-        return bool(worker.wait(2000))
+        return bool(worker.wait(_RETIRE_GRACE_MS))
 
     def _on_audit_done(self) -> None:
         self._auditing = False
@@ -5559,11 +5626,35 @@ class OutreachScreen(QWidget):
         _paint_paper(self.preview,
                      "inset" if self._channel == WHATSAPP else "raised")
 
+    def _prepare_blocked(self) -> str:
+        """Why Prepare cannot start right now, "" when it can.
+
+        One sentence per cause, and each of them true. The one this replaces
+        covered all three and promised something none of them does: "A crawl is
+        still running — this starts the moment it finishes, and nothing is lost
+        by waiting." Nothing queues the press. Driven with the Leads tab's audit
+        running, the button said that and then never prepared anything, so a
+        user who took it at its word waited out a crawl for a campaign that was
+        never going to begin. Each of these says what to do instead, and every
+        one of them is "press it again", which is the truth.
+        """
+        if self._planning:
+            return ("A campaign is already being prepared. Cancel it first if "
+                    "you want to prepare a different set of leads.")
+        if self._auditing:
+            return ("The site audit on the Leads tab is still running. A "
+                    "campaign prepared now would be written from the audits "
+                    "that have landed so far — press Prepare again when it "
+                    "finishes.")
+        if not self._retire(self.plan_worker):
+            return ("The last preparation is still closing down. Press Prepare "
+                    "again in a moment; nothing has been lost.")
+        return ""
+
     def _on_prepare_clicked(self) -> None:
-        if self._planning or self._auditing or not self._retire(self.plan_worker):
-            self._toast("A crawl is still running — this starts the moment it "
-                        "finishes, and nothing is lost by waiting.",
-                        tone="warning")
+        busy = self._prepare_blocked()
+        if busy:
+            self._toast(busy, tone="warning")
             return
 
         leads = self._target_leads()
@@ -5620,8 +5711,12 @@ class OutreachScreen(QWidget):
         self.cancel_prepare_btn.setText("Cancel preparation")
         self.cancel_prepare_btn.show()
         self.goto_sending_btn.hide()
-        self.plan_progress.setRange(0, max(1, len(leads)))
-        self.plan_progress.setValue(0)
+        # Busy rather than "0 of N" until the plan says what N is. The bar
+        # measures three passes over the leads that are still *eligible*, which
+        # this side cannot know — the planner drops the suppressed and the
+        # already-contacted first — so a range guessed from the selection here
+        # would be replaced by a different one the moment the first crawl landed.
+        self.plan_progress.setRange(0, 0)
         self.plan_progress.show()
         self.plan_warning.hide()
         self.plan_summary.setText(
@@ -5859,8 +5954,11 @@ class OutreachScreen(QWidget):
 
     def _on_campaign_changed(self, _index: int) -> None:
         self._campaign_id = _int_of(self.campaign_combo.currentData())
-        self._refresh_stats()
-        self._refresh_send_controls()
+        # One reading, so the tiles and the status line describe the campaign
+        # the picker has just moved to at the same instant rather than at two.
+        with self._one_reading():
+            self._refresh_stats()
+            self._refresh_send_controls()
 
     def _ramp_start(self):
         """The warm-up origin the send loop is using for this campaign, or None.
@@ -5872,11 +5970,33 @@ class OutreachScreen(QWidget):
         """
         if not self._campaign_id:
             return None
-        try:
-            return _campaign.campaign_start_day(self.conn, self._campaign_id,
-                                                self.settings)
-        except Exception:
-            return None
+
+        def read():
+            try:
+                return _campaign.campaign_start_day(
+                    self.conn, self._campaign_id, self.settings,
+                    row=self._campaign_row())
+            except Exception:
+                return None
+
+        return self._once("ramp", read)
+
+    def _campaign_row(self) -> dict:
+        """This campaign's record, read once per repaint.
+
+        Two things on the Sending tab come out of it — the status and the
+        warm-up origin — and each used to fetch it for itself.
+        """
+        if not self._campaign_id or self.conn is None:
+            return {}
+
+        def read():
+            try:
+                return _db.get_campaign(self.conn, self._campaign_id) or {}
+            except Exception:
+                return {}
+
+        return self._once("campaign", read)
 
     def _benched_today(self) -> set:
         """Accounts the run took out of service today, lowercased.
@@ -5921,7 +6041,9 @@ class OutreachScreen(QWidget):
         causes and they need three different sentences: raise the cap, wait for
         midnight, or go and fix a password.
         """
-        zone = self.settings.get("send_timezone")
+        return self._once("room", self._read_account_room)
+
+    def _read_account_room(self) -> tuple:
         ramp = self._ramp_start()
         benched_today = self._benched_today()
         free, spent, benched = [], [], []
@@ -5932,9 +6054,77 @@ class OutreachScreen(QWidget):
                 continue
             cap = max(1, _campaign.account_daily_cap(account, self.settings,
                                                      ramp_start=ramp))
-            used = _db.sent_today(self.conn, email, zone)
+            used = self._sent_today(email) + self._rehearsed_today(email)
             (spent if used >= cap else free).append(email)
         return free, spent, benched
+
+    def _rehearsed_today(self, email: str) -> int:
+        """What a dry run has spent of this account's day, as the loop counts it.
+
+        `OutreachWorker._daily_room` adds the run's rehearsals to `sent_today`
+        before deciding whether an account has room, because pacing a dry run
+        realistically is the point of it — and none of them are written to
+        `sends`, so this screen could not see them. Measured: a rehearsal that
+        filled a five-a-day account left the loop with `_daily_room` of 0 and
+        the screen reading "Rehearsing — 0 of 30 built" with no reason under it
+        and "Sending now" on the clock, over a run that would not send another
+        message today. The same lie `_send_health` closes for the hour, one cap
+        up.
+
+        Read off the worker rather than off this screen's own tally, because
+        the worker's is stamped and a day boundary is the whole question: a run
+        started before midnight has rehearsals that no longer count against
+        today.
+        """
+        worker = self.send_worker if self._sending else None
+        stamps = getattr(worker, "_rehearsed", None)
+        if not isinstance(stamps, dict):
+            return 0
+        try:
+            midnight = _db._day_start(time.time(),
+                                      self.settings.get("send_timezone"))
+        except Exception:
+            return 0
+        return sum(1 for ts in (stamps.get(email.strip().lower()) or [])
+                   if _float_of(ts) >= midnight)
+
+    def _hourly_hold(self, free, now: float) -> float:
+        """Seconds until an hourly window frees for one of `free`. 0 = none held.
+
+        The screen's half of a rule it must not own a second copy of.
+        `core.campaign.hourly_hold` is the arithmetic and the send loop reads
+        the same function, so the status line and the log cannot come to
+        different answers about the same hour — which is exactly what they did
+        while this question could only be asked of the worker.
+
+        `free` is what `_account_room` already worked out: the accounts with
+        room in the day and not benched, which is what makes a positive answer
+        mean "the hour, and only the hour, is holding this queue".
+
+        The run's own rehearsal tally goes with it while a worker exists. A dry
+        run paces itself against messages it never wrote to `sends`, so without
+        it the screen would read an empty hour and print "Sending" over a
+        rehearsal that was holding for exactly the same reason a live run does.
+
+        Asked in the channel's own numbers, because the set of accounts it is
+        asked about is the channel's — `_accounts()` is `channel_accounts` — and
+        WhatsApp's hourly cap is eight against email's. A question about the
+        number's hour, answered from the mailbox's cap, is a wrong answer.
+        """
+        if self.conn is None or not free:
+            return 0.0
+        worker = self.send_worker if self._sending else None
+        try:
+            return _campaign.hourly_hold(
+                self.conn, free, self._channel_settings(), now,
+                channel=self._channel,
+                rehearsed=getattr(worker, "_rehearsed", None))
+        except Exception:
+            return 0.0
+
+    def _hourly_cap(self) -> int:
+        """This channel's per-sender hourly cap, for the sentence that names it."""
+        return _campaign._hourly_cap(self._channel_settings())
 
     def _rehearsing(self) -> bool:
         """Whether what is running (or about to) is a dry run.
@@ -6023,6 +6213,23 @@ class OutreachScreen(QWidget):
                 return ("Holding — %s" % done, self._no_account_reason(
                     spent, benched, "This run cannot send another message "
                                     "until that changes."))
+            hourly = self._hourly_hold(free, now)
+            if hourly > 0:
+                # The hold the handover left open. Every account has room in the
+                # day and none has room in the *hour*, so `_account_room` says
+                # "free" and the loop sends nothing: measured, a run with 35 of
+                # 40 a day left and a spent hour napped 48 minutes under
+                # "Sending — 0 of 60 done" while the log beside it said
+                # "Holding for the hourly limit". The screen contradicted its
+                # own log, and the count it printed was the one the user was
+                # watching to decide whether to stop the run.
+                return ("Holding — %s" % done,
+                        "Every %s has sent its %s for the hour. The next can go "
+                        "%s; the day's allowance is untouched, so nothing is "
+                        "lost by leaving it."
+                        % (self._sender_noun(),
+                           _plural(self._hourly_cap(), "message"),
+                           _clock(now + hourly)))
             due = self._next_due_ts()
             if due > now:
                 # The pacing gap. The loop is awake and the account is free;
@@ -6080,6 +6287,22 @@ class OutreachScreen(QWidget):
                     "The window reopens %s. Widen the days or the hours in "
                     "Settings to send sooner."
                     % _clock(_campaign.next_window_open(now, self.settings)))
+        hourly = self._hourly_hold(free, now)
+        if hourly > 0:
+            # Not running, and the hour is spent anyway. The old line here said
+            # "there is room on the account", which is true of the day and false
+            # of the hour — so a user who pressed Start on the strength of it
+            # got a run that logged an hourly hold and sent nothing. Start is
+            # still the right button; what changes is that the screen says what
+            # will happen when it is pressed.
+            return ("Not sending — %s overdue since %s"
+                    % (_plural(queued, "message"), _clock(due)),
+                    "Every %s has sent its %s for the hour, so a run started "
+                    "now waits until %s for the first one. The day's allowance "
+                    "is untouched."
+                    % (self._sender_noun(),
+                       _plural(self._hourly_cap(), "message"),
+                       _clock(now + hourly)))
         return ("Not sending — %s overdue since %s"
                 % (_plural(queued, "message"), _clock(due)),
                 "The window is open and there is room on the account. Nothing "
@@ -6131,13 +6354,7 @@ class OutreachScreen(QWidget):
 
     def _campaign_status(self) -> str:
         """What the store says this campaign is doing, or "" if it cannot say."""
-        if not self._campaign_id or self.conn is None:
-            return ""
-        try:
-            return _text_of(_db.get_campaign(self.conn,
-                                             self._campaign_id).get("status"))
-        except Exception:
-            return ""
+        return _text_of(self._campaign_row().get("status"))
 
     def _nothing_due(self, queued: int) -> tuple:
         """Queued, with an account free, and `due_messages` returns nothing.
@@ -6240,8 +6457,9 @@ class OutreachScreen(QWidget):
         self.send_now_btn.setEnabled(not waived)
         self.send_now_btn.setToolTip(waived or (
             "Ignore the sending window and the gap between messages, and send "
-            "the next %s now. Daily caps still apply."
-            % _plural(min(room, queued), "message")))
+            "the next %s now. %s"
+            % (_plural(min(room, queued), "message"),
+               self._caps_still_apply(min(room, queued)))))
 
         self.send_progress.setRange(0, max(1, total))
         self.send_progress.setValue(total - queued if total else 0)
@@ -6250,6 +6468,23 @@ class OutreachScreen(QWidget):
         self.send_status.setText(headline)
         self.send_reason.setText(why)
         self.send_reason.setVisible(bool(why))
+
+    def _caps_still_apply(self, offered: int) -> str:
+        """What Send now cannot waive, naming the one that will actually bind.
+
+        "Daily caps still apply" was the whole sentence, and on a mailbox with
+        thirty-five of forty left and an hourly cap of eight it was the wrong
+        cap: the press moves thirty-five rows to the front and eight of them
+        leave in the next hour. That is the loop working exactly as designed and
+        the button having promised something else — the same overpromise
+        `_room_today` was fixed for one cap up.
+        """
+        hourly = self._hourly_cap()
+        if hourly < _campaign._NO_CAP and hourly < max(0, offered):
+            return ("Daily caps still apply, and the hourly cap of %d a %s "
+                    "paces them from there."
+                    % (hourly, self._sender_noun()))
+        return "Daily caps still apply."
 
     def _on_send_now_clicked(self) -> None:
         """Go now: waive the clock, keep the caps.
@@ -6312,7 +6547,6 @@ class OutreachScreen(QWidget):
         and thirty of them sat there.
         """
         ramp = self._ramp_start()
-        zone = _campaign._zone(self.settings)
         benched = self._benched_today()
         total = 0
         for account in self._accounts():
@@ -6321,8 +6555,15 @@ class OutreachScreen(QWidget):
                 continue
             try:
                 cap = account_daily_cap(account, self.settings, ramp_start=ramp)
-                used = _db.sent_today(self.conn, email, zone)
-                total += max(0, _int_of(cap) - _int_of(used))
+                # Through `_sent_today`, which is the same answer `_account_room`
+                # and the Accounts card get: this asked the ledger for itself and
+                # in its own timezone object, so a tick counted every account
+                # twice to reach two numbers that had to agree. The run's own
+                # rehearsals go with it for the same reason they do there — the
+                # loop counts them against the day, so an offer that ignores
+                # them is an offer the loop will not honour.
+                total += max(0, _int_of(cap) - _int_of(self._sent_today(email))
+                             - self._rehearsed_today(email))
             except Exception:
                 continue
         return total
@@ -6446,8 +6687,12 @@ class OutreachScreen(QWidget):
         if rehearsal:
             key = _text_of(row.get("account_email")).strip().lower()
             if key:
+                # The tally only; the card is repainted by the stats signal the
+                # worker emits in the same breath as this one — `_emit_progress`
+                # follows `message_sent_signal` on every message. Refreshing it
+                # here too meant the Accounts card was rebuilt twice per message
+                # for one number, which cost 9ms of every message's 14.
                 self._rehearsed[key] = self._rehearsed.get(key, 0) + 1
-                self._refresh_accounts()
         lead = _db.get_lead(self.conn, _int_of(row.get("lead_id")))
         who = _text_of(lead.get("name")).strip() or _text_of(lead.get("email")).strip()
         step = _int_of(row.get("step"))
@@ -6459,21 +6704,53 @@ class OutreachScreen(QWidget):
                          message_id=0 if rehearsal else _int_of(row.get("id")))
 
     def _on_stats_signal(self, stats: dict) -> None:
-        if isinstance(stats, dict):
-            self._paint_stats(stats)
-        self._refresh_send_controls()
-        self._refresh_accounts()
-        self._publish_state()
+        """The run's own count, once per message. Everything it moves, once.
+
+        Under one reading, because the three below ask the store the same five
+        questions and this is the signal that arrives fastest — a send loop with
+        the gap waived emits one per message, and each of them cost 7.2ms of the
+        GUI thread before the reading and the account cards were shared.
+        """
+        with self._one_reading():
+            if isinstance(stats, dict):
+                # The worker's own tally, so the tiles cannot be a query behind
+                # the run — and it seeds the reading, so nothing below asks again.
+                self._seed("stats", stats)
+                self._paint_stats(stats)
+            self._refresh_send_controls()
+            self._refresh_accounts()
+            self._publish_state()
 
     def _on_send_done(self) -> None:
+        """The run has unwound. Repaint what is being looked at, mark the rest.
+
+        The two expensive pages are refreshed only when the user is on one of
+        them, which is the rule `_on_plan_ready` already follows and this did
+        not: a run finishing while the user watched the Sending tab reloaded all
+        five hundred leads and rebuilt the whole Stats page behind it, for a
+        **148ms** freeze on the one control the user was about to press. It is
+        7ms now, and both pages still repaint — on the tab change, off the flag
+        this sets, which is what the flags are for.
+        """
         self._sending = False
         self._paused = False
         self._stopping = False
         self.pause_btn.setText("Pause")
-        self._reload_leads()
-        self._refresh_stats()
-        self._refresh_campaigns()
-        self._publish_state()
+        page = self.pages.currentIndex()
+        if page == 0:
+            self._reload_leads()
+            self._leads_dirty = False
+        else:
+            self._leads_dirty = True
+        if page == 3:
+            self._refresh_stats()
+            self._stats_dirty = False
+        else:
+            self._stats_dirty = True
+        with self._one_reading():
+            # It repaints the controls itself, off the same reading.
+            self._refresh_campaigns()
+            self._publish_state()
 
     # ── Sending: the activity log ────────────────────────────────────────────
 
@@ -6497,9 +6774,19 @@ class OutreachScreen(QWidget):
         panel nobody scrolls: the line being waited for is the one on screen.
         It is the wrong end for the one moment somebody *is* scrolling — a run
         that logs a line a second used to walk whatever they were reading one
-        row further down every second. Moving the bar by the height of the line
-        that arrived keeps that line where it was; at the top, which is where
-        the panel sits unless it has been scrolled, nothing moves at all.
+        row further down every second. Moving the bar down by the line that
+        arrived keeps that line where it was; at the top, which is where the
+        panel sits unless it has been scrolled, nothing moves at all.
+
+        **By the line, in the units this scrollbar is counting in.** It used to
+        add the row's *height in pixels* to a bar the list keeps in *items* —
+        `QAbstractItemView.ScrollPerItem` is the default and this list never
+        changed it — so one arriving line scrolled the reader nineteen lines
+        instead of one. Measured on a 200-line log: parked halfway, at "line
+        107", ten new lines took the reader to "line 014" with the bar pinned to
+        its maximum. That is the log scrolling away from the person reading it,
+        which is the exact failure this method was written to prevent, done by
+        the line that was supposed to prevent it.
         """
         level = _text_of(level)
         if level == "error":
@@ -6518,9 +6805,20 @@ class OutreachScreen(QWidget):
         held = bar.value()
         self._push_log(line, level, _int_of(message_id))
         if held > 0:
-            first = self.log_list.item(0)
-            bar.setValue(held + (self.log_list.visualItemRect(first).height()
-                                 if first is not None else 0))
+            bar.setValue(held + self._log_step())
+
+    def _log_step(self) -> int:
+        """How far the bar moves for one line arriving above the reader.
+
+        One item where the list scrolls per item, and one row's height where it
+        scrolls per pixel — asked of the list rather than assumed, because the
+        two answers differ by a factor of the row height and picking the wrong
+        one is what sent the reader to the bottom of the log.
+        """
+        if self.log_list.verticalScrollMode() == QAbstractItemView.ScrollPerItem:
+            return 1
+        first = self.log_list.item(0)
+        return self.log_list.visualItemRect(first).height() if first is not None else 0
 
     def _repaint_log(self) -> None:
         """Put every line the screen holds into a console that has none.
@@ -6577,16 +6875,28 @@ class OutreachScreen(QWidget):
     # ── Sending: accounts and countdown ──────────────────────────────────────
 
     def _refresh_accounts(self) -> None:
-        t = components.active_theme()
-        _clear_layout(self.accounts_holder)
+        """The Accounts card, repainted from the numbers rather than rebuilt.
+
+        This runs once per message a run sends — `_on_stats_signal` calls it —
+        and it used to destroy every widget in the card and build them again:
+        a QWidget, two layouts, an `_ElidedLabel`, a body label and a progress
+        bar per account, each of which is polished against the style sheet on
+        the way in. Measured over a dry run of 500 with two accounts, that was
+        **4.51ms a call** and it was called twice a message, which is most of
+        why a burst of signals froze the window for 624ms at a stretch.
+
+        The addresses are what decides whether a rebuild is owed. They change
+        when the user adds or removes an account in Settings and at no other
+        time, so the cards are built once and the three things that move —
+        the counter's words, its tone and the bar — are set on them. 0.05ms.
+        """
         accounts = self._accounts()
+        emails = tuple(_text_of(a.get("email")) for a in accounts)
+        if emails != tuple(self._account_cards):
+            self._build_account_cards(emails)
         if not accounts:
-            self.accounts_holder.addWidget(components.hint(
-                "No Gmail account yet. Add one in Settings — outreach needs an "
-                "address and a Google App Password to send from."))
             return
 
-        zone = self.settings.get("send_timezone")
         # The same warm-up origin the send loop uses. Without it an account with
         # no `warmup_started` would be shown its first-day cap on day nine of the
         # campaign, and the counter would read as stuck.
@@ -6595,27 +6905,21 @@ class OutreachScreen(QWidget):
 
         for account in accounts:
             email = _text_of(account.get("email"))
-            used = _db.sent_today(self.conn, email, zone)
+            card = self._account_cards.get(email)
+            if card is None:
+                continue
+            counter, bar = card
+            used = self._sent_today(email)
             rehearsed = self._rehearsed.get(email.strip().lower(), 0)
             cap = max(1, _campaign.account_daily_cap(account, self.settings, ramp_start=ramp))
             out = email.strip().lower() in benched
 
-            holder = QWidget()
-            row = _rows(holder, margin="0", spacing="1", t=t)
-            head = _cols(margin="0", spacing="2", t=t)
-            address = _ElidedLabel(email)
-            head.addWidget(address, stretch=1)
-
             # Two separate numbers, never one sum: a rehearsal has spent none of
             # this account's real quota and the card must not imply that it has.
-            counter = components.body_label(
-                "%d / %d today" % (used, cap),
-                tone="danger" if out or used >= cap else "secondary")
-            counter.setWordWrap(False)
+            words = "%d / %d today" % (used, cap)
             tip = "Daily cap for this account, warm-up included"
             if rehearsed:
-                counter.setText("%d rehearsed  ·  %d / %d today"
-                                % (rehearsed, used, cap))
+                words = "%d rehearsed  ·  %d / %d today" % (rehearsed, used, cap)
                 tip += ".  %s rehearsed in this dry run — no real quota spent." \
                     % _plural(rehearsed, "message")
             if out:
@@ -6623,15 +6927,23 @@ class OutreachScreen(QWidget):
                 # card's worst reading: "3 / 40 today" says there is plenty of
                 # room on an address the server has already refused, which is
                 # exactly the screen looking healthy while the queue is dead.
-                counter.setText("stopped for today")
+                words = "stopped for today"
                 tip = ("The server refused this account today — an app password "
                        "or a quota — so the run will not use it again until "
                        "midnight. Fix it in Settings and start again.")
+            # Red on the same test `_account_room` sorts on, which is the test
+            # the send loop applies. Two separate numbers is the contract for
+            # the *words*; whether this account has room left today is one
+            # question, and a dry run that has spent the day answers it the
+            # same way a live one does. Day-bounded, so a run that crossed
+            # midnight does not colour a fresh day's card with last night's.
+            components.set_tone(
+                counter,
+                "danger" if out or used + self._rehearsed_today(email) >= cap
+                else "secondary")
+            counter.setText(words)
             counter.setToolTip(tip)
-            head.addWidget(counter)
-            row.addLayout(head)
 
-            bar = _thin_bar(t)
             bar.setRange(0, cap)
             # The rehearsal moves the bar because the bar is what the user
             # watches while the run goes; `used` is what governs the cap. A
@@ -6639,8 +6951,30 @@ class OutreachScreen(QWidget):
             # what it measures is how much of this account is available and the
             # answer is none of it.
             bar.setValue(cap if out else min(used + rehearsed, cap))
+
+    def _build_account_cards(self, emails: tuple) -> None:
+        """One card per address, built when the set of addresses changes."""
+        t = components.active_theme()
+        _clear_layout(self.accounts_holder)
+        self._account_cards = {}
+        if not emails:
+            self.accounts_holder.addWidget(components.hint(
+                "No account yet. Add one in Settings — outreach needs an "
+                "address and an app password to send from."))
+            return
+        for email in emails:
+            holder = QWidget()
+            row = _rows(holder, margin="0", spacing="1", t=t)
+            head = _cols(margin="0", spacing="2", t=t)
+            head.addWidget(_ElidedLabel(email), stretch=1)
+            counter = components.body_label("", tone="secondary")
+            counter.setWordWrap(False)
+            head.addWidget(counter)
+            row.addLayout(head)
+            bar = _thin_bar(t)
             row.addWidget(bar)
             self.accounts_holder.addWidget(holder)
+            self._account_cards[email] = (counter, bar)
 
     def _next_due_ts(self) -> float:
         """When this campaign's next queued message is due. 0.0 if none.
@@ -6655,10 +6989,14 @@ class OutreachScreen(QWidget):
         """
         if not self._campaign_id:
             return 0.0
-        horizon = time.time() + 366 * _DAY_SEC
-        rows = _db.due_messages(self.conn, horizon, limit=1,
-                                campaign_id=self._campaign_id)
-        return _float_of(rows[0].get("scheduled_at")) if rows else 0.0
+
+        def read():
+            horizon = time.time() + 366 * _DAY_SEC
+            rows = _db.due_messages(self.conn, horizon, limit=1,
+                                    campaign_id=self._campaign_id)
+            return _float_of(rows[0].get("scheduled_at")) if rows else 0.0
+
+        return self._once("due", read)
 
     def _on_tick(self) -> None:
         """The clock on the right of the progress line, once a second.
@@ -6668,11 +7006,27 @@ class OutreachScreen(QWidget):
         user has no way to distinguish from a broken one. The two that used to
         say nothing are the two the brief asked about: a run that is stopping,
         and a queue with nothing due at all.
+
+        The clock and the status line under it are painted from **one** reading
+        of the store, which is what stops them disagreeing. Before that they
+        were two: the clock asked when the next message was due, then
+        `_refresh_send_controls` asked again along with the caps, the ledger and
+        the campaign row — eleven queries a second over three accounts, four of
+        them a question already answered. The waste was the smaller half. A run
+        held by a cap has a due time in the past, so the clock read "Sending
+        now" over the status line's "Holding — every account is capped": two
+        sentences about the same instant, three lines apart, contradicting each
+        other once a second.
         """
         if self.pages.currentIndex() != 2 and not self._sending:
             return
+        with self._one_reading():
+            self._paint_clock(time.time())
+            self._refresh_send_controls()
+
+    def _paint_clock(self, now: float) -> None:
+        """The countdown, naming what the queue is actually waiting on."""
         due = self._next_due_ts()
-        now = time.time()
         if self._sending and self._stopping:
             self.next_send_label.setText("Stopping…")
         elif not due:
@@ -6684,17 +7038,120 @@ class OutreachScreen(QWidget):
             self.next_send_label.setText("Next send in %s · %s"
                                          % (_countdown(due - now), _clock(due)))
         elif self._sending:
-            self.next_send_label.setText("Sending now")
+            # Overdue and the loop is awake, which is not the same as moving.
+            # `_held_until` is the instant the thing actually holding it clears,
+            # and while there is one this label has to name it rather than say
+            # "Sending now" over a queue that has not moved for an hour — the
+            # same contradiction `_send_health` exists to stop, on the one
+            # widget on this tab whose whole job is to say when.
+            held = self._held_until(now)
+            self.next_send_label.setText(
+                "Held · next in %s · %s" % (_countdown(held - now), _clock(held))
+                if held > now else "Sending now")
         else:
             self.next_send_label.setText("Overdue since %s" % _clock(due))
-        self._refresh_send_controls()
+
+    def _held_until(self, now: float) -> float:
+        """When the running queue can next move, or 0 if nothing is holding it.
+
+        The three holds `_send_health` names, in the order the send loop hits
+        them: outside the window, no account with room in the day, and no
+        account with room in the hour.
+        """
+        if not _campaign.in_send_window(now, self.settings):
+            return _campaign.next_window_open(now, self.settings)
+        free = self._account_room()[0]
+        if not free:
+            return self._day_frees(now)
+        hourly = self._hourly_hold(free, now)
+        return now + hourly if hourly > 0 else 0.0
+
+    def _day_frees(self, now: float) -> float:
+        """When a spent or benched account is allowed to send again.
+
+        Midnight, and then the window on top of it. Both of the things that
+        take an account out for the day — its cap and the run benching it after
+        a refusal — are keyed on the calendar day, so neither moves before
+        local midnight; and midnight is not itself a sendable instant on a
+        nine-to-five window, so the answer is the window's first opening from
+        there. Answering with `next_window_open(now)` gave `now` on a
+        round-the-clock window, and the clock printed "Sending now" over a
+        queue whose account had nothing left until tomorrow.
+        """
+        try:
+            zone = _campaign._zone(self.settings)
+            midnight = _campaign._at(_campaign._local_date(now, zone), 24, zone)
+            return max(midnight,
+                       _campaign.next_window_open(midnight, self.settings))
+        except Exception:
+            return _campaign.next_window_open(now, self.settings)
+
+    # ── One reading of the store per repaint ─────────────────────────────────
+
+    @contextlib.contextmanager
+    def _one_reading(self):
+        """Ask the store each question once for the whole of this repaint.
+
+        The Sending tab paints six widgets off five facts — the queue's counts,
+        the next due time, the warm-up origin, what each account has spent, and
+        the campaign's status — and every one of them used to be fetched by
+        whichever label wanted it. A single tick asked for the campaign row
+        twice, `sent_today` twice per account and the due-message view twice:
+        eleven queries a second at rest.
+
+        Cost is the smaller reason. The larger one is that two labels painted
+        from two readings of a store a send loop is writing to *can* disagree,
+        and on this tab they did: the clock and the status line are three lines
+        apart and each had its own answer for "when does this move".
+
+        Nested opens are the outer one's, so a handler already holding a reading
+        can call anything below without a second store round trip. The memo
+        lives for exactly this block and never past it: nothing here is a cache
+        of the database, it is one consistent view of it.
+        """
+        if self._reading is not None:
+            yield
+            return
+        self._reading = {}
+        try:
+            yield
+        finally:
+            self._reading = None
+
+    def _once(self, key, work):
+        """`work()`, answered once per open reading and passed on afterwards.
+
+        Keyed on the campaign as well as the question. Almost every answer here
+        is about one campaign, and `_refresh_campaigns` can move `_campaign_id`
+        from inside a reading — it repopulates the picker and takes the id back
+        off it — so a memo keyed on the question alone would hand the new
+        campaign the old one's queue counts and warm-up day.
+        """
+        cache = self._reading
+        if cache is None:
+            return work()
+        slot = (self._campaign_id, key)
+        if slot not in cache:
+            cache[slot] = work()
+        return cache[slot]
+
+    def _seed(self, key, value) -> None:
+        """Put an answer the caller already has into the open reading."""
+        if self._reading is not None:
+            self._reading[(self._campaign_id, key)] = value
+
+    def _sent_today(self, email: str) -> int:
+        """What this account has spent today, once per repaint."""
+        return self._once(("sent_today", email.strip().lower()), lambda: _db.sent_today(
+            self.conn, email, self.settings.get("send_timezone")))
 
     # ── Stats ────────────────────────────────────────────────────────────────
 
     def _stats(self) -> dict:
         if not self._campaign_id:
             return {}
-        return _db.campaign_stats(self.conn, self._campaign_id)
+        return self._once("stats", lambda: _db.campaign_stats(self.conn,
+                                                              self._campaign_id))
 
     def _refresh_stats(self) -> None:
         self._paint_stats(self._stats())
@@ -7001,14 +7458,20 @@ class OutreachScreen(QWidget):
             # `_form_letter_warning`.
             self._refresh_lead_actions()
         elif index == 2:
-            self._refresh_accounts()
-            self._refresh_send_controls()
+            # One reading for the card and the status line, which is what stops
+            # the Accounts counters and "no account has room left" disagreeing
+            # on the tab the user has just opened to compare them.
+            with self._one_reading():
+                self._refresh_accounts()
+                self._refresh_send_controls()
         elif index == 3:
-            if self._stats_dirty:
-                self._refresh_stats()
-                self._stats_dirty = False
-            else:
-                self._refresh_stats()
+            # Unconditional, and the flag is cleared rather than consulted. Both
+            # arms of the branch that used to be here called `_refresh_stats`,
+            # so the flag decided nothing and read as though it did; and the
+            # page is a dashboard somebody has just opened to read, where a
+            # number one tab-change stale is worse than the 10ms it costs.
+            self._refresh_stats()
+            self._stats_dirty = False
 
     def _toast(self, message: str, *, tone: str = "info", action=None,
                on_action=None):

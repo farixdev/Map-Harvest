@@ -23,6 +23,15 @@ keeps the whole catalogue testable from handwritten fixtures. `audit_site()` is 
 thin network wrapper that reuses the HTML `core.enrich.harvest_site` already
 fetched whenever it is handed any, because downloading the same six pages twice
 per lead is the difference between a scrape that finishes and one that does not.
+
+`pages` is a crawl and not a page, and the findings worth most are the ones that
+say so: a button headed Book Online whose page turns out to be a contact form, a
+quote form fourteen fields deep two clicks in, a services page listing twelve
+things with one form under all of them, a price list published as a PDF nobody
+has rebuilt since 2019. Every one of those reads HTML that was already fetched
+and already parsed — the form blocks `_lead_forms` walks, the list items
+`_listed_services` reads, the links `_signals` is looping over anyway — so depth
+here costs no request and no second pass over the crawl.
 """
 
 from __future__ import annotations
@@ -130,6 +139,26 @@ GAP_CATALOGUE: dict[str, dict] = {
         "subject_phrase": "how quotes get handled",
         "services": _svc("AI lead scoring", "AI decision/triage systems"),
     },
+    # These two and the two further down are the first findings in this table
+    # that cannot be read off a home page. A quote form fourteen fields deep is
+    # two clicks in; a services list with nothing under it is on the services
+    # page; a price list nobody has reopened since 2019 is behind a download
+    # link; a shop with nowhere to leave an address is a fact about every page
+    # at once. All four read HTML `harvest_site` had already fetched.
+    #
+    # Titles here are short for a reason that is not taste: `core.whatsapp`
+    # renders one into a sixty-word message with four words of margin, and a
+    # nine-word title spent the margin and then the budget.
+    "long_intake_form": {
+        "title": "a long form before an enquiry", "severity": 2,
+        "subject_phrase": "the enquiry form",
+        "services": _svc("AI lead qualification", "lead categorization"),
+    },
+    "services_no_route": {
+        "title": "one form under every service", "severity": 2,
+        "subject_phrase": "the services list",
+        "services": _svc("lead categorization", "lead assignment"),
+    },
     "no_analytics": {
         "title": "nothing measuring the site", "severity": 2,
         "subject_phrase": "measuring the site",
@@ -154,10 +183,28 @@ GAP_CATALOGUE: dict[str, dict] = {
         # real ones are the order workflow item and its parent line.
         "services": _svc("purchase/order workflows", "Business Process Automation"),
     },
+    # A shop is two findings, not one. The other is what happens to the basket
+    # nobody finished: with no address anywhere on the site there is nothing to
+    # send, and the sale is simply gone.
+    "cart_no_recovery": {
+        "title": "nothing brings a full cart back", "severity": 2,
+        "subject_phrase": "shoppers who leave a cart",
+        "services": _svc("email campaigns", "automatic follow-ups"),
+    },
     "pdf_forms": {
         "title": "paperwork handed out as PDFs", "severity": 2,
         "subject_phrase": "the PDF forms",
         "services": _svc("Document Automation", "PDF/document data extraction"),
+    },
+    # Not the same finding as `price_opaque`, and the two can never both fire:
+    # this business does publish its prices, in a file it last rebuilt years
+    # ago. Which is why a linked price list silences `price_opaque` — "not a
+    # rate, a range or a starting figure" is a false sentence to a reader whose
+    # own home page links one.
+    "dated_document": {
+        "title": "prices published as an old PDF", "severity": 2,
+        "subject_phrase": "the downloadable price list",
+        "services": _svc("automatic document generation", "PDF/document data extraction"),
     },
     "multi_location": {
         "title": "several locations, one inbox", "severity": 2,
@@ -268,6 +315,12 @@ _CMS_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
                 'content="joomla')),
     ("drupal", ("drupal.settings", "/sites/default/files", "drupal-settings-json",
                 'content="drupal')),
+    # A Framer site matched nothing here and came back "custom", which is the
+    # one answer this table has that is never wrong and never useful: it is the
+    # word for a hand-built site, and it went to the model about a page the
+    # owner assembled by dragging boxes.
+    ("framer", ("framerusercontent.com", "data-framer-name", "framerstatic.com",
+                'content="framer', "__framer__")),
 )
 
 # This table is read twice and the second read is the one that bites: a shop is
@@ -378,6 +431,12 @@ _ANALYTICS_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("usermaven", ("t.usermaven.com",)),
     ("wix_analytics", ("tag-manager-client", "wix-analytics")),
     ("shopify_analytics", ("shopifycloud/web-pixels-manager", "trekkie.storefront")),
+    # An AMP page never writes a gtag call: the whole point of the format is
+    # that a component does it, and the vendor's own name is inside a JSON
+    # block this table cannot see. Every marker above missed it, so a restaurant
+    # measuring every visit was told nobody counted last month's.
+    ("amp_analytics", ("<amp-analytics", "amp-analytics-0.1.js",
+                       "amp-pixel", "amp-ad-exit")),
 )
 
 # Eleven vendors were missing here and every one of them draws a box in the
@@ -972,6 +1031,37 @@ _PDF_FORM_RE = re.compile(
     r"quote request|estimate request)(?![a-z])")
 _SLUG_RE = re.compile(r"[\-_+%/.]+")
 
+# A document handed out instead of a price on a page. Deliberately not
+# "catalogue": a uniform catalogue is a list of what a trade supplier stocks,
+# and reading one as a rate card would silence `price_opaque` on exactly the
+# sites that gap was written for. Only the nouns that mean "what it costs", in
+# the languages this crawl meets.
+_PRICE_DOC_RE = re.compile(
+    r"(?i)(?<![a-z])(?:price ?lists?|pricelists?|price guide|price sheet|rate card|"
+    r"rates|tariffs?|tarifs?|fee schedule|fees|menu|preisliste|preise|"
+    r"precios|tarifas|tarieven|prijslijst)(?![a-z])")
+# 20xx only. A version number that happens to have four digits is not a year,
+# and next year's price list is this year's news.
+_DOC_YEAR_RE = re.compile(r"(?<!\d)(20[0-4]\d)(?!\d)")
+# Two years, because one is a business that reprints every January and has not
+# got round to it. Two price seasons back is a document nobody has reopened.
+STALE_DOCUMENT_YEARS = 2
+
+# A form is long once it asks for ten separate things. Nine is a quote request
+# for a roof — address, area, when — and ten is the point where a stranger with
+# a question closes the tab. Measured on questions, not on `<input>` tags: see
+# `_form_fields`.
+LONG_FORM_FIELDS = 10
+# And a services list is long once the site is selling eight distinct things
+# through one form. Below that, "which service is this about" is a sentence the
+# person reading the inbox does not have to ask.
+MANY_SERVICES = 8
+
+# Where a job application is sent when there is no form to send it through.
+_JOB_MAIL_RE = re.compile(
+    r"(?i)jobs?|careers?|recruit|vacanc|hiring|resume|cv@|bewerbung|"
+    r"emploi|empleo|personal@|hr@")
+
 # Verbs a link label opens with before it gets to the name of the thing.
 _DOC_LEAD_RE = re.compile(
     r"(?i)^(?:download|get|view|open|print|complete|fill\s+(?:in|out))\b\s*(?:the|our|your|a)?\s*")
@@ -1116,7 +1206,8 @@ class _Page:
     headings nobody asks for never pays for them.
     """
 
-    __slots__ = ("url", "path", "html", "low", "text", "links", "_heads", "_listed")
+    __slots__ = ("url", "path", "html", "low", "text", "links", "_heads", "_listed",
+                 "_listed_linked", "_forms")
 
     def __init__(self, url: str, html: str) -> None:
         self.url = url
@@ -1128,6 +1219,8 @@ class _Page:
                       for href, label in _A_RE.findall(self.html)]
         self._heads = None
         self._listed = None
+        self._listed_linked = 0
+        self._forms = None
 
     @property
     def heads(self) -> list:
@@ -1136,6 +1229,19 @@ class _Page:
             self._heads = [(level, _clean_text(body))
                            for level, body in _HEAD_RE.findall(self.html)]
         return self._heads
+
+    @property
+    def forms(self) -> list:
+        """Every `<form>` block on the page, found once.
+
+        `.*?` across a page of markup is the most expensive pattern in this
+        module, and two rules want the same blocks: one counts the forms and
+        one measures the longest. Running it twice per page doubled that cost
+        for a list already sitting in memory.
+        """
+        if self._forms is None:
+            self._forms = _FORM_RE.findall(self.html)
+        return self._forms
 
 
 # A marker that opens with a host label — `force.com`, `resy.com`, `clarity.ms`.
@@ -1490,13 +1596,76 @@ def _lead_forms(page) -> int:
     its contact form had no CRM behind it, and the true finding, that nothing on
     the site asks for a name, was suppressed by the same box.
     """
-    blocks = _FORM_RE.findall(page.html)
+    blocks = page.forms
     if blocks:
         return sum(1 for block in blocks if _is_contact_form(block))
     # Some builders never close the <form>, so fall back to the whole page.
     if _FORM_OPEN_RE.search(page.html) and _is_contact_form(page.html):
         return len(_FORM_OPEN_RE.findall(page.html))
     return 0
+
+
+# What a visitor actually has to answer, as opposed to what a builder puts in a
+# <form>. Hidden fields, the submit button and the nonce are the form talking to
+# the server; a row of radio buttons sharing one name is one question asked
+# once; and a honeypot is a field the visitor is never shown and a bot fills in.
+# Counting raw <input> tags reads a four-question contact form as an eleven-part
+# interrogation on any builder that ships a nonce and two hidden ids, which is
+# most of them, and the gap below is a sentence about how much the reader is
+# asking of a stranger.
+_FIELD_RE = re.compile(r"(?is)<(input|select|textarea)\b([^>]*)>")
+_FIELD_SKIP_TYPES = frozenset({"hidden", "submit", "button", "image", "reset", "search"})
+_HONEYPOT_RE = re.compile(r"(?i)honey|hpot|_hp\b|\bhp_|botfield|nickname|leaveblank|"
+                          r"leave_blank|antispam|spamtrap")
+_HIDDEN_STYLE_RE = re.compile(r"(?i)display\s*:\s*none|visibility\s*:\s*hidden")
+
+# Spelt out, because a digit in the bracket of a live email is crawler state
+# wearing a sentence. Past twenty the exact number stops being the point.
+_COUNT_WORDS: dict[int, str] = {
+    8: "eight", 9: "nine", 10: "ten", 11: "eleven", 12: "twelve", 13: "thirteen",
+    14: "fourteen", 15: "fifteen", 16: "sixteen", 17: "seventeen", 18: "eighteen",
+    19: "nineteen", 20: "twenty",
+}
+
+
+def _count_word(total: int) -> str:
+    return _COUNT_WORDS.get(int(total), "more than twenty")
+
+
+def _form_fields(block: str) -> int:
+    """How many separate things `block` asks a visitor to answer."""
+    groups: set[str] = set()
+    total = 0
+    for tag, attrs_text in _FIELD_RE.findall(block):
+        attrs = _attrs("<" + tag + " " + attrs_text + ">")
+        kind = str(attrs.get("type") or "").strip().lower()
+        if tag.lower() == "input" and kind in _FIELD_SKIP_TYPES:
+            continue
+        name = str(attrs.get("name") or attrs.get("id") or "").strip()
+        if _HONEYPOT_RE.search(name) or _HIDDEN_STYLE_RE.search(str(attrs.get("style") or "")):
+            continue
+        if kind in ("radio", "checkbox"):
+            key = name.lower() or ("%s#%d" % (kind, total))
+            if key in groups:
+                continue
+            groups.add(key)
+        total += 1
+    return total
+
+
+def _longest_form(pages) -> int:
+    """The most questions any one lead form on the site asks.
+
+    Reads `page.forms`, which `_lead_forms` has already built for every page in
+    the crawl, so this pass costs the fields of a handful of small blocks and
+    not a second `<form>...</form>` scan over the whole site.
+    """
+    longest = 0
+    for page in pages:
+        for block in page.forms:
+            if _is_contact_form(block):
+                longest = max(longest, _form_fields(block))
+    return longest
 
 
 # ── Technology ──
@@ -1622,6 +1791,33 @@ def _booking_control(href: str, label: str) -> bool:
         if set(words[max(0, index - 2):index]) & _BOOKING_LEADS:
             return True
     return False
+
+
+# Anything a visitor could pick a time out of. Read only to *disprove* a
+# booking system, so the list is deliberately loose and every entry that is also
+# an ordinary English word — "calendar", "availability" — costs a finding rather
+# than buying a false one: a page that merely mentions availability keeps the
+# benefit of the doubt and the gap stays quiet.
+_CALENDAR_MARKERS: tuple[str, ...] = (
+    "datepicker", "date-picker", "flatpickr", "fullcalendar", "timeslot",
+    "time-slot", "timekit", "calendar", "availability", "verfügbarkeit",
+    "disponibilit", "beschikbaar", "<iframe",
+)
+_DATE_INPUT_RE = re.compile(
+    r"""(?is)<input\b[^>]*type\s*=\s*["']?(?:date|time|datetime-local)""")
+
+
+def _shows_a_calendar(page) -> bool:
+    """Could a visitor choose a time on this page, by any means at all?
+
+    Deliberately does not re-scan for a booking vendor: the only caller asks
+    this when `tech["booking"]` is empty, and `tech` was read over the whole
+    crawl, this page included. Running the eighty-vendor table again here was
+    a hundred and seventy string searches for an answer already on the table.
+    """
+    if _DATE_INPUT_RE.search(page.html):
+        return True
+    return _any_hit(page.low, _CALENDAR_MARKERS)
 
 
 # ── Prices ──
@@ -1825,7 +2021,19 @@ def _signals(pages, tech: dict, base_url: str, load_ms: int,
     # over the contact form on every site that has no booking at all, and
     # reading it as proof of one deleted the finding those sites exist to
     # produce. Prose survives only as an anchor label, where it is a control.
-    has_booking = bool(tech["booking"]) or booking_link
+    # And a link is a booking system only until the crawl opens the page behind
+    # it. A page the site itself names for booking, carrying no vendor, no
+    # calendar and no time to pick, is a contact form with a hopeful label on
+    # it — and the business it belongs to is precisely the one this gap was
+    # written for, which until now was the one business it could never fire on.
+    #
+    # Judged only when that page is in the crawl. A link out to somebody else's
+    # calendar is never second-guessed from here.
+    booking_pages = [p for p in pages if _booking_control(p.url, "")]
+    booking_is_a_form = bool(booking_pages) and not tech["booking"] and not any(
+        _shows_a_calendar(p) for p in booking_pages)
+    has_booking = bool(tech["booking"]) or (booking_link and not booking_is_a_form)
+    facts["booking_is_a_form"] = bool(booking_link and booking_is_a_form)
     if tech["booking"]:
         facts["booking_vendor"] = tech["booking"]
 
@@ -1850,6 +2058,11 @@ def _signals(pages, tech: dict, base_url: str, load_ms: int,
     has_quote_form = bool(quote_phrase) and contact_form
     if quote_phrase:
         facts["quote_phrase"] = quote_phrase
+
+    # How much the longest form on the site asks of a stranger. A home page
+    # cannot answer this: the fourteen-field intake form is two clicks in, on
+    # the page the visitor reaches after deciding to get in touch.
+    facts["form_fields"] = _longest_form(pages) if contact_form else 0
 
     # ── content ──
     # Word-level matching, because "Newsletter" is not a news section.
@@ -1876,15 +2089,35 @@ def _signals(pages, tech: dict, base_url: str, load_ms: int,
     careers = careers or any(_CAREER_LINK_RE.search(p.path) for p in pages)
     careers = careers or any(h in _CAREER_HEADINGS for h in headings)
     careers = careers or bool(_says(flat, _HIRING_PHRASES))
+    # Where the CVs go when the vacancy has no form under it. The gap is the
+    # same one either way; the sentence is better when it can say what the
+    # reader will see on their own careers page.
+    facts["careers_mailbox"] = careers and any(
+        href.startswith("mailto:") and (_JOB_MAIL_RE.search(href) or _JOB_MAIL_RE.search(label))
+        for href, label in hrefs)
 
     pdf_form = ""
+    # One pass over the downloads for two findings: paperwork to fill in, and a
+    # price list the business publishes instead of printing a rate on a page.
+    # The second is why `price_opaque` can no longer fire here — "not a rate on
+    # any page" is a false sentence to a reader whose home page links one.
+    price_document = False
+    price_doc_year = 0
     for href, label in hrefs:
         if ".pdf" not in href:
             continue
-        if _PDF_FORM_RE.search(_SLUG_RE.sub(" ", href)) or _PDF_FORM_RE.search(label):
+        slug = _SLUG_RE.sub(" ", href)
+        if not pdf_form and (_PDF_FORM_RE.search(slug) or _PDF_FORM_RE.search(label)):
             pdf_form = href
             facts["pdf_form"] = _document_name(label, href)
-            break
+        if not (_PRICE_DOC_RE.search(slug) or _PRICE_DOC_RE.search(label)):
+            continue
+        price_document = True
+        for year in _DOC_YEAR_RE.findall(slug) + _DOC_YEAR_RE.findall(label):
+            if int(year) <= today.year - STALE_DOCUMENT_YEARS:
+                price_doc_year = max(price_doc_year, int(year))
+    facts["price_document"] = price_document
+    facts["price_doc_year"] = price_doc_year
 
     pricing_link = any("/pricing" in href or "/prices" in href or "/rates" in href
                        or label in ("pricing", "prices", "our prices", "rates")
@@ -1967,7 +2200,27 @@ def _signals(pages, tech: dict, base_url: str, load_ms: int,
     # twelve labels short enough for a brief. `_bookable` reads that filtered
     # list, so a trade whose work never made the cut — a driving school, a tattoo
     # studio — looked like a business that arranges no times at all.
-    facts["service_listing"] = [item for page in pages for item in _listed_services(page)]
+    listing = [item for page in pages for item in _listed_services(page)]
+    facts["service_listing"] = listing
+    # Twelve things to buy and nothing under any of them but one general form.
+    # `_listed_services` counted the items that are links on the same pass, and
+    # a nav giving each service its own page counts as a route too: either way
+    # an enquiry about one service can arrive as an enquiry about that service.
+    #
+    # Both halves are asked only when the answer can matter: a regex over every
+    # href on the crawl is real work, and on a site listing four services
+    # nothing reads the result.
+    facts["listed_services"] = len(listing)
+    facts["services_routed"] = len(listing) >= MANY_SERVICES and bool(
+        sum(page._listed_linked for page in pages)
+        or any(_SERVICE_PATH_RE.search(href) for href, _label in hrefs))
+    # A checkout with nowhere on the site to leave an address. Deliberately not
+    # "no abandoned-cart email": nothing here can see what a shop sends after
+    # the fact. What it can see is that there is nothing to send it to.
+    # Trivially true where there is no shop, which is where nothing reads it and
+    # where the scan below would be paid for an answer nobody wants.
+    facts["shop_email_route"] = not tech["ecommerce"] or bool(
+        newsletter or _EMAIL_FIELD_RE.search(html_all))
     return signals, facts
 
 
@@ -1979,10 +2232,16 @@ def _listed_services(page) -> list[str]:
 
     Cached on the page: `_signals` reads the raw list to decide whether the
     business books times, and `_services` reads it again to build the brief.
+
+    `page._listed_linked` is counted on the same pass. A services list where
+    every item is a link and one where none of them is are the same list of
+    words and two different businesses to write to, and the difference is
+    visible only here, where the `<li>` still has its markup.
     """
     if page._listed is not None:
         return page._listed
     out: list[str] = []
+    linked = 0
     for heading in _HEAD_RE.finditer(page.html):
         if heading.group(1) == "1":
             continue
@@ -1996,8 +2255,12 @@ def _listed_services(page) -> list[str]:
             tail = tail[:nxt.start()]
         listing = _LIST_RE.search(tail)
         if listing:
-            out.extend(_clean_text(item) for item in _LI_RE.findall(listing.group(1)))
+            for item in _LI_RE.findall(listing.group(1)):
+                out.append(_clean_text(item))
+                if _A_RE.search(item):
+                    linked += 1
     page._listed = out
+    page._listed_linked = linked
     return out
 
 
@@ -2128,7 +2391,12 @@ def _gaps(tech: dict, signals: dict, facts: dict) -> list[dict]:
 
     if (not signals["has_online_booking"] and signals["has_contact_form"]
             and books_times):
+        # The site has a Book button and the page behind it is a form. Say that,
+        # rather than the sentence for a site with no button at all — the reader
+        # of the first one is about to look at their own Book page and agree.
         fired.append(_gap("no_online_booking",
+                          "clicking through to book opens a form and waits for somebody "
+                          "to answer" if facts.get("booking_is_a_form") else
                           "asking for a time means filling in the form and waiting "
                           "for someone to answer"))
     if not tech["crm"] and signals["has_contact_form"]:
@@ -2169,20 +2437,39 @@ def _gaps(tech: dict, signals: dict, facts: dict) -> list[dict]:
         fired.append(_gap("quote_by_form",
                           f'"{facts.get("quote_phrase", "request a quote")}" on the site '
                           "ends in a form somebody has to read"))
+    if signals["has_contact_form"] and facts.get("form_fields", 0) >= LONG_FORM_FIELDS:
+        fired.append(_gap("long_intake_form",
+                          f"the form asks for {_count_word(facts['form_fields'])} separate "
+                          "things before anybody can press send"))
+    if (signals["has_contact_form"] and not facts.get("services_routed")
+            and facts.get("listed_services", 0) >= MANY_SERVICES):
+        fired.append(_gap("services_no_route",
+                          f"{_count_word(facts['listed_services'])} services are listed and "
+                          "every enquiry about them lands in the same place"))
     if not tech["analytics"]:
         fired.append(_gap("no_analytics",
                           "no analytics on any page, so last month's visits went uncounted"))
     if signals["has_careers"]:
         fired.append(_gap("careers_manual",
+                          "the job advert points at an inbox, so every CV arrives as an "
+                          "email to be read" if facts.get("careers_mailbox") else
                           "the site is advertising jobs, so CVs are arriving to be read and sorted"))
     if tech["ecommerce"]:
         fired.append(_gap("ecommerce_manual",
                           "there is a shop on the site, so every order needs picking, "
                           "invoicing and chasing"))
+    if tech["ecommerce"] and not facts.get("shop_email_route"):
+        fired.append(_gap("cart_no_recovery",
+                          "there is a checkout on the site but nowhere at all for a shopper "
+                          "to leave an email"))
     if signals["has_pdf_forms"]:
         fired.append(_gap("pdf_forms",
                           f"{facts.get('pdf_form') or 'the paperwork'} is a PDF to print, "
                           "fill in and send back"))
+    if facts.get("price_doc_year"):
+        fired.append(_gap("dated_document",
+                          "the price list customers download was put together in "
+                          f"{facts['price_doc_year']}"))
     if signals["has_multiple_locations"]:
         fired.append(_gap("multi_location",
                           "every address on the site takes its own calls and answers "
@@ -2213,7 +2500,12 @@ def _gaps(tech: dict, signals: dict, facts: dict) -> list[dict]:
     if not signals["has_schema"]:
         fired.append(_gap("no_schema",
                           "Google gets no hours, no prices and no reviews from the pages"))
-    if not signals["has_pricing"] and not tech["ecommerce"]:
+    # A linked price list silences this one for the same reason a storefront
+    # does: the business publishes what it charges, and being told it publishes
+    # nothing is a sentence its owner can disprove from their own home page.
+    # What is true about that business is `dated_document`, above.
+    if (not signals["has_pricing"] and not tech["ecommerce"]
+            and not facts.get("price_document")):
         fired.append(_gap("price_opaque",
                           "not a rate, a range or a starting figure on any page, so every "
                           "enquiry has to ask"))

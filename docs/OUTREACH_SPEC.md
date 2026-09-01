@@ -340,7 +340,23 @@ Detect these; `services` on each gap must name **Auto Army services verbatim**
 | `slow_site` | `signals.slow` | 1 | Business Process Automation |
 | `no_mobile` | `not mobile_viewport` | 2 | Business Process Automation |
 | `no_schema` | `not has_schema` | 1 | SEO automation |
-| `price_opaque` | `not has_pricing` and ecommerce is empty | 1 | AI lead qualification |
+| `price_opaque` | `not has_pricing`, ecommerce is empty, and no price list is linked for download | 1 | AI lead qualification |
+
+Four more are found only by reading the whole crawl rather than the home page.
+Each reuses HTML `harvest_site` already fetched — no extra request, and no extra
+pass over the crawl:
+
+| code | fires when | severity | services |
+|---|---|---|---|
+| `long_intake_form` | a lead form asks ten or more questions (hidden fields, submit buttons, honeypots and a group of radios all excluded) | 2 | AI lead qualification, Lead categorization |
+| `services_no_route` | eight or more services listed under a services heading, none of them a link, and no per-service page anywhere | 2 | Lead categorization, Lead assignment |
+| `dated_document` | a linked PDF the site presents as a price list, menu or rate card carries a year two or more behind | 2 | Automatic document generation, PDF/document data extraction |
+| `cart_no_recovery` | `tech.ecommerce != ""` and nothing anywhere on the site asks a shopper for an email | 2 | Email campaigns, Automatic follow-ups |
+
+`no_online_booking` reads the crawl too: a link whose path or label says booking
+counts as a calendar until the crawl contains the page behind it and that page
+shows no vendor, no iframe, no date field and no calendar of its own — at which
+point the "Book Online" button is a contact form and the gap fires.
 
 `opportunity_score` = clamp to 0-100 of `sum(severity * 9 for gaps)` plus `+10` if
 reachable and `+5` if an email was found. Sort `gaps` by severity desc, then by
